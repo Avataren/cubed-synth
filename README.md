@@ -12,6 +12,9 @@ in a browser AudioWorklet and in a native audio callback.
 | `cubed-opl` | Yamaha OPL2/OPL3 FM chip (a port of ymfm's OPL path) and an Adlib Tracker II (`.a2m`) parser and player |
 | `cubed-dsp` | The synth engine: audio graph, oscillators (analog, wavetable), envelopes, LFOs, filters, chorus, delay, reverb, convolver, compressor, limiter, EQ, voices, automation and patch loading |
 | `cubed-simd` | The slice of `std::simd` the crates above use, on stable Rust |
+| `cubed-mixer` | A game audio mixer: named buses with faders, mute/solo, inserts and sends, clip voices, meters; nothing allocates while it runs. `native` adds a cpal output host; `wire` encodes its commands as bytes |
+| `cubed-worklet` | `cubed-mixer` as a wasm module for a browser AudioWorklet (raw exports, no JS glue) and its processor, `js/cubed-worklet.js` |
+| `cubed-rt-check` | Tests only: every render path checked for allocations with a counting allocator |
 
 ## Features
 
@@ -23,9 +26,13 @@ in a browser AudioWorklet and in a native audio callback.
 - `native-host` (`cubed-dsp`, on by default): the native `AudioEngine`, the
   counterpart of the wasm one.
 
-`cubed-sid`, `cubed-ahx` and `cubed-opl` build for `wasm32-unknown-unknown` as they
-are. `cubed-dsp` still needs a `getrandom` backend there (see
-<https://docs.rs/getrandom/0.3/#webassembly-support>).
+- `native` (`cubed-mixer`): `NativeHost`, the mixer on the default output device
+  through cpal.
+
+Every crate builds for `wasm32-unknown-unknown` with its default features and no JS
+glue. There `cubed-dsp` seeds its random number generators from
+`cubed_dsp::seed::set_seed`, which the host calls with entropy from its main thread
+(the `wasm` feature uses the browser's crypto instead).
 
 ## Building, testing, benchmarks
 
@@ -36,6 +43,10 @@ cargo bench -p cubed-sid --bench sid_render
 cargo bench -p cubed-opl --bench opl_render
 cargo bench -p cubed-ahx --bench ahx_render
 cargo bench -p cubed-dsp --bench patch_render
+
+# The worklet in a real browser (headless Brave or Chromium):
+cargo build -p cubed-worklet --target wasm32-unknown-unknown --release
+node crates/worklet/test/run.mjs
 ```
 
 The benches render in 128-frame blocks (an AudioWorklet quantum) and report the cost

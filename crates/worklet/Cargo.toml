@@ -1,0 +1,21 @@
+[package]
+name = "cubed-worklet"
+description = "cubed-mixer as a WebAssembly module for a browser AudioWorklet: raw exports, no JS glue, plus its AudioWorkletProcessor (js/cubed-worklet.js)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+# cdylib: the wasm module the worklet loads; rlib: so native tests can call
+# the exports.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cubed-mixer = { path = "../mixer" }
+cubed-dsp = { path = "../dsp" }
+
+[lints]
+workspace = true

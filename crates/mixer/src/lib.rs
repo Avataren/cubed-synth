@@ -15,12 +15,15 @@
 //!
 //! The `native` feature adds [`native::NativeHost`], which runs a mixer in a
 //! cpal output callback with lock-free rings to and from the game thread.
+//! [`wire`] encodes commands and events as bytes for hosts that cross a
+//! message port (the `cubed-worklet` AudioWorklet).
 
 mod clip;
 mod command;
 mod insert;
 mod mixer;
 mod smooth;
+pub mod wire;
 
 #[cfg(feature = "native")]
 pub mod native;

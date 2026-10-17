@@ -1,0 +1,67 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cubed-worklet browser test</title>
+<script type="module">
+// Renders the mixer offline through the real AudioWorkletProcessor and
+// checks the samples: a 0.25 DC clip on bus 1 (the bus at -6 dB, so 0.125),
+// then silence once it ends; and telemetry with meters and an Ended event.
+// Puts the outcome in `window.result` for test/run.mjs.
+const RATE = 48000;
+const CLIP_FRAMES = 12000;
+
+// The two commands this needs, encoded as cubed_mixer::wire does.
+function setBus(bus, gainDb) {
+  const v = new DataView(new ArrayBuffer(16));
+  v.setUint8(0, 1); v.setUint16(1, bus, true); v.setUint16(3, 0, true);
+  v.setFloat32(5, gainDb, true); v.setFloat32(9, 0, true); v.setUint8(13, 0);
+  v.setUint16(14, 0xffff, true);
+  return new Uint8Array(v.buffer);
+}
+function play(voice, clip, bus) {
+  const v = new DataView(new ArrayBuffer(41));
+  v.setUint8(0, 11); v.setBigUint64(1, BigInt(voice), true); v.setUint32(9, clip, true);
+  v.setUint16(13, bus, true); v.setFloat32(15, 1, true); v.setFloat32(19, 1, true);
+  v.setFloat32(23, 0, true); v.setUint8(27, 0); v.setUint8(28, 128); v.setUint8(29, 0);
+  v.setBigUint64(30, 0n, true);
+  return new Uint8Array(v.buffer, 0, 38);
+}
+
+async function run() {
+  const context = new OfflineAudioContext(2, RATE, RATE);
+  await context.audioWorklet.addModule('../js/cubed-worklet.js');
+  const node = new AudioWorkletNode(context, 'cubed-mixer', {
+    numberOfInputs: 0,
+    outputChannelCount: [2],
+  });
+  node.connect(context.destination);
+  const telemetry = [];
+  const ready = new Promise((resolve, reject) => {
+    node.port.onmessage = (event) => {
+      const m = event.data;
+      if (m.type === 'ready') resolve();
+      else if (m.type === 'error') reject(new Error(m.message));
+      else if (m.type === 'telemetry') telemetry.push(m);
+    };
+  });
+  const wasm = await (await fetch('../../../target/wasm32-unknown-unknown/release/cubed_worklet.wasm')).arrayBuffer();
+  node.port.postMessage({ type: 'init', wasm, maxVoices: 0, maxBuses: 0, maxClips: 0, seedLo: 1, seedHi: 0 });
+  node.port.postMessage({ type: 'clip', id: 0, sampleRate: RATE, left: new Float32Array(CLIP_FRAMES).fill(0.25) });
+  const commands = new Uint8Array([...setBus(1, -6.0206), ...play(7, 0, 1)]);
+  node.port.postMessage({ type: 'commands', bytes: commands.buffer }, [commands.buffer]);
+  await ready;
+  const buffer = await context.startRendering();
+  const left = buffer.getChannelData(0);
+  const first = left.findIndex((s) => s !== 0);
+  const during = left[first + 6000];
+  const after = left[first + CLIP_FRAMES + 500];
+  const events = telemetry.flatMap((t) => [...new Uint8Array(t.events)].length ? [new Uint8Array(t.events)] : []);
+  const bus1Peak = Math.max(...telemetry.map((t) => t.meters[5 + 1]));
+  return {
+    ok: first >= 0 && first < 256 && Math.abs(during - 0.125) < 1e-3 && after === 0 && events.length > 0 && bus1Peak > 0.12,
+    first, during, after, telemetry: telemetry.length, eventMessages: events.length,
+    endedTag: events.length ? events[0][0] : null, bus1Peak,
+  };
+}
+
+run().then((r) => { window.result = r; }, (e) => { window.result = { ok: false, error: String(e) }; });
+</script>

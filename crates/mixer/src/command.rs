@@ -177,6 +177,45 @@ pub enum Command {
     Capture(Box<Capture>),
 }
 
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::SetBus(bus, settings) => write!(f, "SetBus({bus:?}, {settings:?})"),
+            Command::RemoveBus(bus) => write!(f, "RemoveBus({bus:?})"),
+            Command::SetBusGain(bus, db) => write!(f, "SetBusGain({bus:?}, {db})"),
+            Command::SetBusPan(bus, pan) => write!(f, "SetBusPan({bus:?}, {pan})"),
+            Command::SetBusMute(bus, on) => write!(f, "SetBusMute({bus:?}, {on})"),
+            Command::SetBusSolo(bus, on) => write!(f, "SetBusSolo({bus:?}, {on})"),
+            Command::SetBusOutput(bus, to) => write!(f, "SetBusOutput({bus:?}, {to:?})"),
+            Command::SetInsert { bus, slot, insert } => write!(
+                f,
+                "SetInsert {{ bus: {bus:?}, slot: {slot}, insert: {} }}",
+                if insert.is_some() { "Some(..)" } else { "None" }
+            ),
+            Command::SetInsertBypass { bus, slot, bypass } => write!(
+                f,
+                "SetInsertBypass {{ bus: {bus:?}, slot: {slot}, bypass: {bypass} }}"
+            ),
+            Command::SetSend { bus, slot, send } => {
+                write!(
+                    f,
+                    "SetSend {{ bus: {bus:?}, slot: {slot}, send: {send:?} }}"
+                )
+            }
+            Command::AddClip(id, clip) => write!(f, "AddClip({id:?}, {} frames)", clip.frames()),
+            Command::RemoveClip(id) => write!(f, "RemoveClip({id:?})"),
+            Command::Play(play) => write!(f, "Play({play:?})"),
+            Command::SetVoiceGain(v, x) => write!(f, "SetVoiceGain({v:?}, {x})"),
+            Command::SetVoicePitch(v, x) => write!(f, "SetVoicePitch({v:?}, {x})"),
+            Command::SetVoicePan(v, x) => write!(f, "SetVoicePan({v:?}, {x})"),
+            Command::Stop(v, fade) => write!(f, "Stop({v:?}, {fade})"),
+            Command::StopBus(bus, fade) => write!(f, "StopBus({bus:?}, {fade})"),
+            Command::StopAll(fade) => write!(f, "StopAll({fade})"),
+            Command::Capture(c) => write!(f, "Capture({} frames)", c.left.len()),
+        }
+    }
+}
+
 /// Something the mixer reports back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
