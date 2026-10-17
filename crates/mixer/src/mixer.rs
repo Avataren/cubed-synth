@@ -338,6 +338,11 @@ impl Mixer {
                 }
             }
             Command::PlaySource(play) => self.play_source(play),
+            Command::SourceEvent { voice, event } => self.with_voice(voice, |v| {
+                if let Some(source) = v.voice.source_mut() {
+                    source.event(event);
+                }
+            }),
             Command::SetVoiceGain(id, gain) => self.with_voice(id, |v| {
                 *v.voice.ramp() = None;
                 v.voice.gain().set(gain.max(0.0));

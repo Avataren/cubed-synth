@@ -1,12 +1,10 @@
+use crate::traits::{Inputs, Outputs};
 use std::any::Any;
 
 use rustc_hash::FxHashMap;
 
 use super::copy_input;
-use crate::{
-    graph::ModulationSource,
-    traits::{AudioNode, PortId, StereoEffect},
-};
+use crate::traits::{AudioNode, PortId, StereoEffect};
 
 /// Simple stereo bitcrusher with sample-rate reduction.
 pub struct Bitcrusher {
@@ -108,12 +106,7 @@ impl AudioNode for Bitcrusher {
         ports
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         let left_in = inputs.get(&PortId::AudioInput0).unwrap()[0].buffer;
         let right_in = inputs.get(&PortId::AudioInput1).unwrap()[0].buffer;
 

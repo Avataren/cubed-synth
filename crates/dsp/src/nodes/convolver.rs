@@ -1,5 +1,6 @@
 // convolver.rs
 
+use crate::traits::{Inputs, Outputs};
 use fft_convolver::FFTConvolver;
 use rustc_hash::FxHashMap;
 use std::any::Any;
@@ -8,7 +9,7 @@ use std::any::Any;
 
 // Import ModulationProcessor and ModulationSource from the graph module.
 use super::copy_input;
-use crate::graph::{ModulationProcessor, ModulationSource};
+use crate::graph::ModulationProcessor;
 use crate::traits::{AudioNode, PortId, StereoEffect}; // Ensure these paths are correct
 
 /// A Convolver that uses FFTConvolver for fast convolution processing.
@@ -249,12 +250,7 @@ impl AudioNode for Convolver {
     }
 
     // --- process (Cleaned) ---
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // Removed size check log
 
         if !self.enabled || self.convolvers.is_empty() {

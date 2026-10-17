@@ -30,6 +30,7 @@ mod mixer;
 mod smooth;
 mod source;
 mod spatial;
+mod synth;
 pub mod wire;
 
 #[cfg(feature = "native")]
@@ -48,5 +49,6 @@ pub use effects::{Effect, EffectKind};
 pub use insert::{DspInsert, Insert};
 pub use mixer::{BusMeter, Mixer, MixerConfig, Stats, MAX_INSERTS, MAX_SENDS};
 pub use smooth::MIN_DB;
-pub use source::Source;
+pub use source::{Source, SourceEvent};
 pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};
+pub use synth::SynthSource;

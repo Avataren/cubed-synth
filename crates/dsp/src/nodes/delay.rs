@@ -1,10 +1,10 @@
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::f32x4;
 use std::any::Any;
 
 use rustc_hash::FxHashMap;
 
 use super::copy_input;
-use crate::graph::ModulationSource;
 use crate::traits::{AudioNode, PortId, StereoEffect};
 
 pub struct Delay {
@@ -179,12 +179,7 @@ impl AudioNode for Delay {
         ports
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // Instead of calling process_modulations we directly take the audio input from the
         // first modulation source for each port.
         // (It is assumed that each input port always provides at least one source.)

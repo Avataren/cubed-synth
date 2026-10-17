@@ -1,7 +1,7 @@
+use crate::traits::{Inputs, Outputs};
 use rustc_hash::FxHashMap;
 use std::any::Any;
 
-use crate::graph::ModulationSource;
 use crate::traits::{AudioNode, PortId, StereoEffect};
 
 // --- Helper Functions ---
@@ -135,8 +135,8 @@ impl Limiter {
     #[inline(never)]
     pub fn process_block<'a>(
         &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
+        inputs: &Inputs<'a>,
+        outputs: &mut Outputs<'_>,
         buffer_size: usize,
     ) {
         if buffer_size == 0 {
@@ -411,12 +411,7 @@ impl AudioNode for Limiter {
         ])
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         self.process_block(inputs, outputs, buffer_size);
     }
 

@@ -11,6 +11,7 @@ use crate::command::{
     BusId, BusSettings, ClipId, Command, Duck, Event, Play, PlaySource, SendSettings, SourceId,
     Start, VoiceId,
 };
+use crate::source::SourceEvent;
 use crate::spatial::{Listener, Rolloff, Spatial, SpatialMode};
 
 mod tag {
@@ -37,6 +38,7 @@ mod tag {
     pub const PLAY_SOURCE: u8 = 21;
     pub const FADE_VOICE: u8 = 22;
     pub const INSERT_PARAM: u8 = 23;
+    pub const SOURCE_EVENT: u8 = 24;
 
     pub const ENDED: u8 = 1;
     pub const STOLEN: u8 = 2;
@@ -144,6 +146,34 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             w.u8(p.priority);
             w.start(p.start);
             w.spatial(p.spatial.as_ref());
+        }
+        Command::SourceEvent { voice, event } => {
+            w.u8(tag::SOURCE_EVENT);
+            w.u64(voice.0);
+            match *event {
+                SourceEvent::NoteOn {
+                    note,
+                    velocity,
+                    duration,
+                } => {
+                    w.u8(0);
+                    w.u8(note);
+                    w.f32(velocity);
+                    w.u32(duration);
+                }
+                SourceEvent::NoteOff { note } => {
+                    w.u8(1);
+                    w.u8(note);
+                    w.f32(0.0);
+                    w.u32(0);
+                }
+                SourceEvent::AllNotesOff => {
+                    w.u8(2);
+                    w.u8(0);
+                    w.f32(0.0);
+                    w.u32(0);
+                }
+            }
         }
         Command::FadeVoice {
             voice,
@@ -498,6 +528,25 @@ impl Reader<'_> {
                 start: self.start()?,
                 spatial: self.spatial()?,
             }),
+            tag::SOURCE_EVENT => {
+                let voice = self.voice()?;
+                let kind = self.u8()?;
+                let note = self.u8()?;
+                let velocity = self.f32()?;
+                let duration = self.u32()?;
+                Command::SourceEvent {
+                    voice,
+                    event: match kind {
+                        0 => SourceEvent::NoteOn {
+                            note,
+                            velocity,
+                            duration,
+                        },
+                        1 => SourceEvent::NoteOff { note },
+                        _ => SourceEvent::AllNotesOff,
+                    },
+                }
+            }
             tag::FADE_VOICE => Command::FadeVoice {
                 voice: self.voice()?,
                 gain: self.f32()?,
@@ -584,6 +633,22 @@ mod tests {
                 voice,
                 gain: 0.75,
                 frames: 96_000,
+            },
+            Command::SourceEvent {
+                voice,
+                event: SourceEvent::NoteOn {
+                    note: 64,
+                    velocity: 0.5,
+                    duration: 24_000,
+                },
+            },
+            Command::SourceEvent {
+                voice,
+                event: SourceEvent::NoteOff { note: 64 },
+            },
+            Command::SourceEvent {
+                voice,
+                event: SourceEvent::AllNotesOff,
             },
             Command::RemoveBus(bus),
             Command::SetBusGain(bus, -3.0),

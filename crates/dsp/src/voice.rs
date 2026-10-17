@@ -185,18 +185,14 @@ impl Voice {
 
         // Since the macro modulation isn't coming from a regular node,
         // we supply a reserved NodeId (for example, NodeId(usize::MAX)) as the source.
-        self.graph
-            .input_connections
-            .entry(target_node)
-            .or_default()
-            .push((
-                target_port,
-                buffer_idx,
-                amount,
-                NodeId::default(), // Sentinel value for macro modulations (no source node)
-                modulation_type,
-                modulation_transform,
-            ));
+        self.graph.add_macro_connection(
+            buffer_idx,
+            target_node,
+            target_port,
+            amount,
+            modulation_type,
+            modulation_transform,
+        );
 
         Ok(())
     }

@@ -30,7 +30,7 @@
 //     fn process(
 //         &mut self,
 //         inputs: &FxHashMap<PortId, &[f32]>,
-//         outputs: &mut FxHashMap<PortId, &mut [f32]>,
+//         outputs: &mut Outputs<'_>,
 //         _buffer_size: usize,
 //     ) {
 //         // Copy gate to output for test

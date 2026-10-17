@@ -1,3 +1,4 @@
+use crate::traits::{Inputs, Outputs};
 use rustc_hash::FxHashMap;
 use std::any::Any;
 // Keep for potential output writing optimization
@@ -6,7 +7,7 @@ use wasm_bindgen::prelude::wasm_bindgen;
 // use web_sys::console; // Uncomment for debugging
 
 // Import necessary types
-use crate::graph::{ModulationProcessor, ModulationSource};
+use crate::graph::ModulationProcessor;
 use crate::traits::{AudioNode, PortId};
 use crate::utils::curves::get_curved_value;
 use serde::{Deserialize, Serialize};
@@ -405,12 +406,7 @@ impl AudioNode for Envelope {
         .collect()
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // --- 0) Early exit and Buffer Preparation ---
         if !self.config.active {
             // Use config active flag now
@@ -449,7 +445,7 @@ impl AudioNode for Envelope {
             // Accumulate modulation into shared scratch buffers
             Self::accumulate_modulations_inplace(
                 buffer_size,
-                attack_mod_sources.map(|v| v.as_slice()),
+                attack_mod_sources,
                 &mut self.mod_scratch_add,
                 &mut self.mod_scratch_mult,
             );

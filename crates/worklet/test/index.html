@@ -99,10 +99,33 @@ async function song() {
   return { ok, rms, replies, voices: last.voices, rejected: last.rejected };
 }
 
+function sourceEvent(voice, kind, note, velocity, duration) {
+  const v = new DataView(new ArrayBuffer(23));
+  v.setUint8(0, 24); v.setBigUint64(1, BigInt(voice), true); v.setUint8(9, kind);
+  v.setUint8(10, note); v.setFloat32(11, velocity, true); v.setUint32(15, duration, true);
+  return new Uint8Array(v.buffer, 0, 19);
+}
+
+// A DAW patch as a synth voice, played by a note event.
+async function synth() {
+  const bytes = await (await fetch('../../dsp/tests/real_patch.json')).arrayBuffer();
+  const context = new OfflineAudioContext(2, RATE, RATE);
+  const replies = [];
+  const { node, ready } = await mixerNode(context, (m) => { if (m.type === 'song') replies.push(m); });
+  node.port.postMessage({ type: 'synth', source: 0, bytes, oneShot: false }, [bytes]);
+  const commands = new Uint8Array([...setBus(2, 0), ...playSource(1, 0, 2), ...sourceEvent(1, 0, 60, 1, 0)]);
+  node.port.postMessage({ type: 'commands', bytes: commands.buffer }, [commands.buffer]);
+  await ready;
+  const left = (await context.startRendering()).getChannelData(0);
+  const rms = Math.sqrt(left.reduce((sum, s) => sum + s * s, 0) / left.length);
+  return { ok: replies.length === 1 && replies[0].ok && rms > 0.01, rms, replies };
+}
+
 async function run() {
   const clips = await clip();
   const songs = await song();
-  return { ok: clips.ok && songs.ok, clips, songs };
+  const synths = await synth();
+  return { ok: clips.ok && songs.ok && synths.ok, clips, songs, synths };
 }
 
 run().then((r) => { window.result = r; }, (e) => { window.result = { ok: false, error: String(e) }; });

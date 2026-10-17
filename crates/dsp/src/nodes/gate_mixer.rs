@@ -1,3 +1,4 @@
+use crate::traits::{Inputs, Outputs};
 use rustc_hash::FxHashMap;
 
 use crate::graph::ModulationSource;
@@ -17,21 +18,13 @@ impl GateMixer {
         Self {}
     }
 
-    fn process_modulations(
+    /// The first source's buffer, when it covers the block.
+    fn gate<'a>(
+        maybe_sources: Option<&'a [ModulationSource]>,
         buffer_size: usize,
-        maybe_sources: Option<&Vec<ModulationSource>>,
-        default: f32,
-    ) -> Vec<f32> {
-        if let Some(sources) = maybe_sources {
-            let buf = &sources[0].buffer;
-            if buf.len() >= buffer_size {
-                buf[..buffer_size].to_vec()
-            } else {
-                vec![default; buffer_size]
-            }
-        } else {
-            vec![default; buffer_size]
-        }
+    ) -> Option<&'a [f32]> {
+        let buffer = maybe_sources?.first()?.buffer;
+        (buffer.len() >= buffer_size).then(|| &buffer[..buffer_size])
     }
 }
 
@@ -45,20 +38,17 @@ impl AudioNode for GateMixer {
         ports
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // If an input is missing, default to 1.0 (neutral for multiplication).
-        let global_gate =
-            Self::process_modulations(buffer_size, inputs.get(&PortId::GlobalGate), 1.0);
-        let arp_gate = Self::process_modulations(buffer_size, inputs.get(&PortId::ArpGate), 1.0);
+        // A missing gate counts as open (1.0, neutral for the product).
+        let global_gate = Self::gate(inputs.get(&PortId::GlobalGate), buffer_size);
+        let arp_gate = Self::gate(inputs.get(&PortId::ArpGate), buffer_size);
 
         if let Some(out_buffer) = outputs.get_mut(&PortId::CombinedGate) {
             for i in 0..buffer_size {
-                out_buffer[i] = global_gate[i] * arp_gate[i];
+                let g = global_gate.map_or(1.0, |b| b[i]);
+                let a = arp_gate.map_or(1.0, |b| b[i]);
+                out_buffer[i] = g * a;
             }
         }
     }

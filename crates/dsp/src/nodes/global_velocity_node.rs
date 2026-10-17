@@ -1,8 +1,8 @@
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::num::SimdFloat;
 use cubed_simd::Simd;
 use std::any::Any;
 
-use crate::graph::ModulationSource;
 use crate::impulse_generator::fill_seed;
 use crate::{AudioNode, PortId};
 use rustc_hash::FxHashMap;
@@ -21,6 +21,8 @@ pub struct GlobalVelocityNode {
     current_random_value: f32,
     /// Holds the previous gate value to detect rising edges.
     prev_gate_value: f32,
+    /// The block's summed gate, kept so the audio thread never allocates it.
+    gate_buffer: Vec<f32>,
 }
 
 impl GlobalVelocityNode {
@@ -47,6 +49,7 @@ impl GlobalVelocityNode {
             // Initialize with the first random number.
             current_random_value: 0.0,
             prev_gate_value: 0.0,
+            gate_buffer: vec![0.0; buffer_size],
         }
     }
 
@@ -127,18 +130,15 @@ impl AudioNode for GlobalVelocityNode {
         ports
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         let output = outputs
             .get_mut(&PortId::AudioOutput0)
             .expect("Expected AudioOutput0 output port");
 
         // Build the gate buffer from all gate sources.
-        let mut gate_buffer = vec![0.0; buffer_size];
+        let mut gate_buffer = std::mem::take(&mut self.gate_buffer);
+        gate_buffer.clear();
+        gate_buffer.resize(buffer_size, 0.0);
         if let Some(sources) = inputs.get(&PortId::GlobalGate) {
             for source in sources {
                 for (dest, &src) in gate_buffer.iter_mut().zip(source.buffer.iter()) {
@@ -174,6 +174,7 @@ impl AudioNode for GlobalVelocityNode {
         if seg_start < buffer_size {
             self.process_segment(seg_start, buffer_size, exp, output);
         }
+        self.gate_buffer = gate_buffer;
     }
 
     fn reset(&mut self) {}

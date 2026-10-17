@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 /// AudioGraph is a flexible audio processing system that manages interconnected audio nodes and their buffer routing.
 ///
@@ -64,7 +64,7 @@ use crate::{
     graph::ModulationType,
     nodes::{GateMixer, GlobalFrequencyNode, GlobalVelocityNode},
 };
-use crate::{AudioNode, MacroManager, PortId};
+use crate::{AudioNode, Inputs, MacroManager, Outputs, PortId};
 
 pub struct AudioGraph {
     pub(crate) nodes: FxHashMap<NodeId, Box<dyn AudioNode>>,
@@ -87,6 +87,17 @@ pub struct AudioGraph {
         )>,
     >,
     pub(crate) temp_buffer_indices: Vec<usize>,
+    /// What each node in processing order reads and writes, worked out when
+    /// the graph changes so a block only follows it.
+    plan: Vec<NodePlan>,
+    /// The graph changed since `plan` was made.
+    plan_dirty: bool,
+    /// The sources handed to nodes, kept between blocks (empty) so building
+    /// them never allocates.
+    source_scratch: Vec<ModulationSource<'static>>,
+    /// This block's macro values and each macro's span in them.
+    macro_values: Vec<f32>,
+    macro_spans: Vec<std::ops::Range<usize>>,
     pub(crate) global_frequency_node: Option<NodeId>,
     pub(crate) global_glide_node: Option<NodeId>,
     pub(crate) global_velocity_node: Option<NodeId>,
@@ -109,6 +120,11 @@ impl AudioGraph {
             gate_buffer_idx,
             input_connections: FxHashMap::default(),
             temp_buffer_indices: Vec::new(),
+            plan: Vec::new(),
+            plan_dirty: true,
+            source_scratch: Vec::new(),
+            macro_values: Vec::new(),
+            macro_spans: Vec::new(),
             global_frequency_node: None,
             global_glide_node: None,
             global_velocity_node: None,
@@ -147,6 +163,8 @@ impl AudioGraph {
         self.processing_order.clear();
         self.node_buffers.clear();
         self.temp_buffer_indices.clear();
+        self.plan.clear();
+        self.plan_dirty = true;
 
         // Reset global node references and output node.
         self.global_frequency_node = None;
@@ -320,6 +338,32 @@ impl AudioGraph {
                 self.input_connections.remove(&target_node);
             }
         }
+        self.rebuild_plan();
+    }
+
+    /// Routes a macro's value buffer into `target_port` of `target_node`.
+    pub fn add_macro_connection(
+        &mut self,
+        buffer_idx: usize,
+        target_node: NodeId,
+        target_port: PortId,
+        amount: f32,
+        modulation_type: ModulationType,
+        modulation_transform: ModulationTransformation,
+    ) {
+        self.input_connections
+            .entry(target_node)
+            .or_default()
+            .push((
+                target_port,
+                buffer_idx,
+                amount,
+                // No source node: a macro.
+                NodeId::default(),
+                modulation_type,
+                modulation_transform,
+            ));
+        self.rebuild_plan();
     }
 
     pub fn debug_connections(&self) -> Vec<(ConnectionKey, Connection)> {
@@ -398,6 +442,7 @@ impl AudioGraph {
         //     )
         //     .into(),
         // );
+        self.rebuild_plan();
     }
 
     /// Removes a connection based on an entire Connection struct.
@@ -590,6 +635,9 @@ impl AudioGraph {
                 }
             }
         }
+        // Changes come from the host thread (a patch loading): plan now, so
+        // the audio thread never has to.
+        self.rebuild_plan();
     }
 
     pub fn set_gate(&mut self, gate: &[f32]) {
@@ -648,155 +696,67 @@ impl AudioGraph {
         output_left: &mut [f32],
         output_right: &mut [f32],
     ) {
-        let macro_data = macro_manager.map(|m| m.prepare_macro_data(&self.buffer_pool));
+        if self.plan_dirty {
+            self.rebuild_plan();
+        }
+        let macros = macro_manager.filter(|m| m.has_active_macros());
+        if let Some(manager) = macros {
+            manager.copy_values(
+                &self.buffer_pool,
+                &mut self.macro_values,
+                &mut self.macro_spans,
+            );
+        }
 
         for &buffer_idx in self.node_buffers.values() {
             self.buffer_pool.clear(buffer_idx);
         }
 
-        // Use FxFxHashMap if you added the dependency and want the potential speedup
-        type InputsMap<'a> = FxHashMap<PortId, Vec<ModulationSource<'a>>>;
-        type OutputsMap<'a> = FxHashMap<PortId, &'a mut [f32]>;
-
-        let mut required_input_indices = FxHashSet::default();
-        let mut input_indices: Vec<usize> = Vec::new();
-        let mut output_indices: Vec<usize> = Vec::new();
-        'node_loop: for &node_id in &self.processing_order {
-            // Drop any borrows from the previous iteration before touching the buffer pool.
-            required_input_indices.clear();
-            input_indices.clear();
-            output_indices.clear();
-
-            // Added optional loop label
-            let node = match self.nodes.get(&node_id) {
-                Some(n) => n,
-                None => continue,
+        // Every slice below comes from these buffers, which do not move while
+        // the block renders. A node's inputs and outputs are distinct buffers
+        // (`NodePlan::conflict`), so its shared and mutable slices never alias.
+        let buffers = self.buffer_pool.buffers.as_mut_ptr();
+        let mut sources: Vec<ModulationSource<'_>> = std::mem::take(&mut self.source_scratch);
+        for plan in &self.plan {
+            let Some(node) = self.nodes.get_mut(&plan.id) else {
+                continue;
             };
-
             if !node.should_process() {
-                let node_ports = node.get_ports();
-                for (port, is_output) in node_ports.iter() {
-                    if *is_output {
-                        if let Some(buffer_idx) = self.node_buffers.get(&(node_id, *port)) {
-                            self.buffer_pool.clear(*buffer_idx);
-                        }
-                    }
+                for &(_, buffer_idx) in &plan.outputs {
+                    self.buffer_pool.clear(buffer_idx);
                 }
                 continue;
             }
-
-            let node_ports = node.get_ports().clone();
-
-            // --- Gather Input and Output Buffer Indices ---
-            // Collect required input indices
-            if node_ports.contains_key(&PortId::GlobalGate) {
-                required_input_indices.insert(self.gate_buffer_idx);
+            if plan.conflict {
+                continue;
             }
-            if let Some(connections) = self.input_connections.get(&node_id) {
-                for &(_port, source_idx, _amount, _src_node, _mod_type, _mod_transform) in
-                    connections
-                {
-                    required_input_indices.insert(source_idx);
-                }
+            sources.clear();
+            for source in &plan.sources {
+                // SAFETY: an index the plan took from this graph's buffers.
+                let buffer = unsafe { (*buffers.add(source.buffer)).as_slice() };
+                sources.push(ModulationSource {
+                    buffer,
+                    amount: source.amount,
+                    mod_type: source.mod_type,
+                    transformation: source.transformation,
+                });
             }
-
-            // Collect output buffer indices
-            let mut output_indices_map: FxHashMap<PortId, usize> = FxHashMap::default();
-            for (&port, &is_output) in node_ports.iter() {
-                if is_output {
-                    if let Some(&idx) = self.node_buffers.get(&(node_id, port)) {
-                        output_indices_map.insert(port, idx);
-                    }
-                }
+            let mut inputs = Inputs::new();
+            for (port, range) in &plan.ports {
+                inputs.insert(*port, &sources[range.clone()]);
             }
-
-            input_indices.extend(required_input_indices.iter().copied());
-            output_indices.extend(output_indices_map.values().copied());
-
-            // --- Get Buffers with Zero-Copy ---
-            // Get both input (immutable) and output (mutable) buffers in a single call
-            let (input_buffers, output_buffers) = match self
-                .buffer_pool
-                .get_mixed_buffers(&input_indices, &output_indices)
-            {
-                Ok((inputs, outputs)) => (inputs, outputs),
-                Err(e) => {
-                    log_error(&format!(
-                        "Error getting buffers for node {:?}: {}",
-                        node_id, e
-                    ));
-                    continue 'node_loop;
-                }
-            };
-
-            // Build input map with buffer slices (zero-copy)
-            let mut input_slices: FxHashMap<usize, &[f32]> = FxHashMap::default();
-            for (idx, slice) in input_buffers {
-                input_slices.insert(idx, slice);
+            let mut outputs = Outputs::new();
+            for &(port, buffer_idx) in &plan.outputs {
+                // SAFETY: as above; no input of this node is an output of it.
+                let buffer = unsafe { (*buffers.add(buffer_idx)).as_mut_slice() };
+                outputs.insert(port, buffer);
             }
-
-            let mut inputs: InputsMap = FxHashMap::default();
-
-            // Global Gate
-            if node_ports.contains_key(&PortId::GlobalGate) {
-                if let Some(&slice) = input_slices.get(&self.gate_buffer_idx) {
-                    inputs
-                        .entry(PortId::GlobalGate)
-                        .or_default()
-                        .push(ModulationSource {
-                            buffer: slice, // Zero-copy: use slice reference directly
-                            amount: 1.0,
-                            mod_type: ModulationType::Additive,
-                            transformation: ModulationTransformation::None,
-                        });
-                }
+            node.process(&inputs, &mut outputs, self.buffer_size);
+            if let (Some(manager), false) = (macros, outputs.is_empty()) {
+                manager.apply_modulation(0, &self.macro_values, &self.macro_spans, &mut outputs);
             }
-
-            // Connection Inputs
-            if let Some(connections) = self.input_connections.get(&node_id) {
-                for &(port, source_idx, amount, _src_node, mod_type, mod_transform) in connections {
-                    if let Some(&slice) = input_slices.get(&source_idx) {
-                        inputs.entry(port).or_default().push(ModulationSource {
-                            buffer: slice, // Zero-copy: use slice reference directly
-                            amount,
-                            mod_type,
-                            transformation: mod_transform,
-                        });
-                    }
-                }
-            }
-
-            // Build output map
-            let mut outputs: OutputsMap = FxHashMap::default();
-            for (buffer_idx, buffer_slice) in output_buffers {
-                if let Some((port, _)) = output_indices_map
-                    .iter()
-                    .find(|(_, &idx)| idx == buffer_idx)
-                {
-                    outputs.insert(*port, buffer_slice);
-                }
-            }
-
-            // --- Process Node ---
-            if !outputs.is_empty() {
-                if let Some(node_mut) = self.nodes.get_mut(&node_id) {
-                    node_mut.process(&inputs, &mut outputs, self.buffer_size);
-
-                    // --- Apply Macro Modulation ---
-                    if let (Some(mgr), Some(ref data)) = (macro_manager, &macro_data) {
-                        if mgr.has_active_macros() {
-                            mgr.apply_modulation(0, data, &mut outputs);
-                        }
-                    }
-                }
-            } else {
-                // Node has no outputs, just process it (might have side effects?)
-                let mut empty_outputs: OutputsMap = FxHashMap::default();
-                if let Some(node_mut) = self.nodes.get_mut(&node_id) {
-                    node_mut.process(&inputs, &mut empty_outputs, self.buffer_size);
-                }
-            }
-        } // End node processing loop ('node_loop)
+        }
+        self.source_scratch = recycle(sources);
 
         // --- Final Output ---
         if let Some(output_node_id) = self.output_node {
@@ -859,6 +819,120 @@ impl AudioGraph {
             output_right.fill(0.0);
         }
     } // End process_audio_with_macros
+}
+
+impl AudioGraph {
+    /// Works out, for every node in processing order, its output buffers and
+    /// the sources reaching its inputs, as the block renderer reads them:
+    /// the global gate first for a node that takes it, then the connections
+    /// in the order they were made, grouped by port.
+    fn rebuild_plan(&mut self) {
+        self.plan.clear();
+        for &id in &self.processing_order {
+            let Some(node) = self.nodes.get(&id) else {
+                continue;
+            };
+            let ports = node.get_ports();
+            let mut outputs: Vec<(PortId, usize)> = ports
+                .iter()
+                .filter(|(_, &is_output)| is_output)
+                .filter_map(|(&port, _)| self.node_buffers.get(&(id, port)).map(|&b| (port, b)))
+                .collect();
+            outputs.sort_by_key(|(port, _)| port.index());
+
+            let mut by_port: Vec<(PortId, Vec<PlannedSource>)> = Vec::new();
+            let mut add = |port: PortId, source: PlannedSource| match by_port
+                .iter_mut()
+                .find(|(p, _)| *p == port)
+            {
+                Some((_, list)) => list.push(source),
+                None => by_port.push((port, vec![source])),
+            };
+            if ports.contains_key(&PortId::GlobalGate) {
+                add(
+                    PortId::GlobalGate,
+                    PlannedSource {
+                        buffer: self.gate_buffer_idx,
+                        amount: 1.0,
+                        mod_type: ModulationType::Additive,
+                        transformation: ModulationTransformation::None,
+                    },
+                );
+            }
+            for &(port, buffer, amount, _from, mod_type, transformation) in
+                self.input_connections.get(&id).into_iter().flatten()
+            {
+                add(
+                    port,
+                    PlannedSource {
+                        buffer,
+                        amount,
+                        mod_type,
+                        transformation,
+                    },
+                );
+            }
+
+            let mut sources = Vec::new();
+            let mut fed = Vec::new();
+            for (port, list) in by_port {
+                let start = sources.len();
+                sources.extend(list);
+                fed.push((port, start..sources.len()));
+            }
+            let conflict = sources
+                .iter()
+                .any(|s| outputs.iter().any(|&(_, b)| b == s.buffer));
+            if conflict {
+                log_error(&format!(
+                    "node {id:?} reads one of its own output buffers; it is skipped"
+                ));
+            }
+            self.plan.push(NodePlan {
+                id,
+                outputs,
+                sources,
+                ports: fed,
+                conflict,
+            });
+        }
+        // Room for the most sources any node takes, so a block never grows it.
+        let most = self.plan.iter().map(|p| p.sources.len()).max().unwrap_or(0);
+        self.source_scratch.reserve(most);
+        self.plan_dirty = false;
+    }
+}
+
+/// One node's part of a block, worked out ahead.
+struct NodePlan {
+    id: NodeId,
+    /// Its output ports and their buffers.
+    outputs: Vec<(PortId, usize)>,
+    /// Every source reaching it, grouped by input port.
+    sources: Vec<PlannedSource>,
+    /// Each fed input port and its range in `sources`.
+    ports: Vec<(PortId, std::ops::Range<usize>)>,
+    /// One of its inputs is one of its own output buffers: it cannot be
+    /// handed both, so it is skipped.
+    conflict: bool,
+}
+
+struct PlannedSource {
+    buffer: usize,
+    amount: f32,
+    mod_type: ModulationType,
+    transformation: ModulationTransformation,
+}
+
+/// The emptied scratch, with its allocation, ready for the next block.
+fn recycle(mut sources: Vec<ModulationSource<'_>>) -> Vec<ModulationSource<'static>> {
+    sources.clear();
+    // Same layout in and out, so std collects in place: no new allocation
+    // (cubed-rt-check's synth_engine checks it).
+    sources
+        .into_iter()
+        .map(|_| -> ModulationSource<'static> { unreachable!("the scratch was cleared") })
+        .collect()
 }
 
 impl Drop for AudioGraph {

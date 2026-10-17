@@ -1,3 +1,4 @@
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::num::SimdFloat;
 use cubed_simd::Simd;
 use rustc_hash::FxHashMap;
@@ -12,7 +13,7 @@ const MAX_FEEDBACK: f32 = 0.98;
 const MIN_MIX: f32 = 0.0;
 const MAX_MIX: f32 = 1.0;
 
-use crate::graph::ModulationSource; // Assuming these paths are correct for your project
+// Assuming these paths are correct for your project
 use crate::traits::{AudioNode, PortId, StereoEffect};
 
 const SIMD_WIDTH: usize = 4; // web wasm guaranteed supported
@@ -475,8 +476,8 @@ impl Chorus {
     #[inline(never)]
     pub fn process_block(
         &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
+        inputs: &Inputs<'_>,
+        outputs: &mut Outputs<'_>,
         buffer_size: usize,
     ) {
         if buffer_size == 0 {
@@ -886,12 +887,7 @@ impl AudioNode for Chorus {
         ])
     }
 
-    fn process(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process(&mut self, inputs: &Inputs<'_>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         self.process_block(inputs, outputs, buffer_size);
     }
 

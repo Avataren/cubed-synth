@@ -1,3 +1,4 @@
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::Simd;
 use rustc_hash::FxHashMap;
 use rustfft::num_traits::Float;
@@ -11,7 +12,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::console;
 
 use super::morph_wavetable::{WavetableMorphCollection, WavetableSynthBank};
-use crate::graph::{ModulationProcessor, ModulationSource};
+use crate::graph::ModulationProcessor;
 use crate::{AudioNode, PortId};
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +133,8 @@ pub struct WavetableOscillator {
     scratch_wavetable_index: Vec<f32>,
     scratch_detune_mod: Vec<f32>,
     global_freq_buffer: Vec<f32>,
+    /// The single-voice path's mono block, kept between blocks.
+    mono_buffer: Vec<f32>,
 }
 
 impl ModulationProcessor for WavetableOscillator {}
@@ -203,6 +206,7 @@ impl WavetableOscillator {
             scratch_wavetable_index: vec![initial_wt_index; initial_capacity],
             scratch_detune_mod: vec![0.0; initial_capacity],
             global_freq_buffer: vec![initial_frequency; initial_capacity],
+            mono_buffer: vec![0.0; initial_capacity],
         };
 
         osc.update_voice_unison_values(initial_spread);
@@ -435,8 +439,8 @@ impl WavetableOscillator {
 
     pub fn process<'a>(
         &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
+        inputs: &Inputs<'a>,
+        outputs: &mut Outputs<'_>,
         buffer_size: usize,
     ) {
         // inactive → clear and return
@@ -486,7 +490,7 @@ impl WavetableOscillator {
             if let Some(srcs) = inputs.get(&port).filter(|s| !s.is_empty()) {
                 Self::accumulate_modulations_inplace(
                     buffer_size,
-                    Some(srcs.as_slice()),
+                    Some(srcs),
                     &mut self.mod_scratch_add,
                     &mut self.mod_scratch_mult,
                 );
@@ -545,7 +549,7 @@ impl WavetableOscillator {
             if !freqs.is_empty() {
                 Self::accumulate_modulations_inplace(
                     buffer_size,
-                    Some(freqs.as_slice()),
+                    Some(freqs),
                     &mut self.mod_scratch_add,
                     &mut self.mod_scratch_mult,
                 );
@@ -608,7 +612,9 @@ impl WavetableOscillator {
             self.update_voice_unison_values(self.smoothed_spread);
         }
 
-        let gate_buf = self.gate_buffer[..buffer_size].to_vec();
+        // Taken for the block (the per-voice paths borrow `self` mutably) and
+        // put back at the end, so nothing is allocated.
+        let gate_buf = std::mem::take(&mut self.gate_buffer);
 
         // Precompute constants & fetch collection
         // Gracefully handle missing wavetable (output silence until it's loaded)
@@ -624,6 +630,7 @@ impl WavetableOscillator {
                     if let Some(buf) = outputs.get_mut(&PortId::AudioOutput1) {
                         buf[..buffer_size].fill(0.0);
                     }
+                    self.gate_buffer = gate_buf;
                     return;
                 }
             }
@@ -653,7 +660,9 @@ impl WavetableOscillator {
         // Hot‑path
         if self.unison_voices == 1 {
             // For single voice, use a temporary buffer then copy to both channels
-            let mut temp_buffer = vec![0.0f32; buffer_size];
+            let mut temp_buffer = std::mem::take(&mut self.mono_buffer);
+            temp_buffer.clear();
+            temp_buffer.resize(buffer_size, 0.0);
             self.process_simd_single_voice(
                 &mut temp_buffer,
                 buffer_size,
@@ -663,7 +672,7 @@ impl WavetableOscillator {
                 two_pi_recip,
                 feedback_divisor,
                 base_detune_factor,
-                &gate_buf,
+                &gate_buf[..buffer_size],
                 &collection,
             );
             // Copy mono to both stereo channels
@@ -673,12 +682,13 @@ impl WavetableOscillator {
             if let Some(buf) = outputs.get_mut(&PortId::AudioOutput1) {
                 buf[..buffer_size].copy_from_slice(&temp_buffer);
             }
+            self.mono_buffer = temp_buffer;
         } else {
             // Multi-voice: pan voices across stereo field
             let total_voices = self.unison_voices as f32;
 
             for i in 0..buffer_size {
-                self.check_gate(self.gate_buffer[i]);
+                self.check_gate(gate_buf[i]);
 
                 let cf = self.scratch_freq[i];
                 let pm = self.scratch_phase_mod[i];
@@ -734,6 +744,7 @@ impl WavetableOscillator {
                 }
             }
         }
+        self.gate_buffer = gate_buf;
     }
 
     pub fn reset(&mut self) {
@@ -812,12 +823,7 @@ impl AudioNode for WavetableOscillator {
         .collect()
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // call our internal process()
         self.process(inputs, outputs, buffer_size);
     }

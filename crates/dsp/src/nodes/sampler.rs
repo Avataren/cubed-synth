@@ -1,5 +1,6 @@
-use crate::graph::{ModulationSource, ModulationType};
+use crate::graph::ModulationType;
 use crate::traits::{AudioNode, PortId};
+use crate::traits::{Inputs, Outputs};
 use rustc_hash::FxHashMap;
 use std::any::Any;
 use std::cell::RefCell;
@@ -139,6 +140,8 @@ pub struct Sampler {
     scratch_freq_mult: Vec<f32>,
     scratch_gain_add: Vec<f32>,
     scratch_gain_mult: Vec<f32>,
+    /// This block's modulation, kept between blocks so it never allocates.
+    mods: SamplerMods,
 }
 
 impl Sampler {
@@ -165,6 +168,7 @@ impl Sampler {
             scratch_freq_mult: vec![1.0; 128],
             scratch_gain_add: vec![0.0; 128],
             scratch_gain_mult: vec![1.0; 128],
+            mods: SamplerMods::with_size(128),
         }
     }
 
@@ -271,37 +275,75 @@ impl Sampler {
         resize_if_needed(&mut self.scratch_gain_add, 0.0);
         resize_if_needed(&mut self.scratch_gain_mult, 1.0);
     }
+}
 
-    fn collect_modulation(
-        &mut self,
-        port: PortId,
-        sources: &FxHashMap<PortId, Vec<ModulationSource>>,
-        size: usize,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let add_buf = &mut self.mod_scratch_add[..size];
-        let mult_buf = &mut self.mod_scratch_mult[..size];
-        add_buf.fill(0.0);
-        mult_buf.fill(1.0);
+/// The modulation reaching a sampler in one block: an added and a multiplied
+/// part per port (the pan and the offset only use the added one).
+#[derive(Default)]
+struct SamplerMods {
+    freq_add: Vec<f32>,
+    freq_mult: Vec<f32>,
+    gain_add: Vec<f32>,
+    gain_mult: Vec<f32>,
+    pan_add: Vec<f32>,
+    offset_add: Vec<f32>,
+    unused_mult: Vec<f32>,
+}
 
-        if let Some(mods) = sources.get(&port) {
-            for modulation_source in mods {
-                let amount = modulation_source.amount;
-                let mod_type = modulation_source.mod_type;
-                for i in 0..size {
-                    let value = modulation_source.buffer.get(i).copied().unwrap_or(0.0);
-                    match mod_type {
-                        ModulationType::Additive => {
-                            add_buf[i] += value * amount;
-                        }
-                        ModulationType::VCA | ModulationType::Bipolar => {
-                            mult_buf[i] *= 1.0 + value * amount;
-                        }
+impl SamplerMods {
+    fn with_size(size: usize) -> SamplerMods {
+        let mut mods = SamplerMods::default();
+        mods.ensure(size);
+        mods
+    }
+
+    fn ensure(&mut self, size: usize) {
+        for buf in [
+            &mut self.freq_add,
+            &mut self.freq_mult,
+            &mut self.gain_add,
+            &mut self.gain_mult,
+            &mut self.pan_add,
+            &mut self.offset_add,
+            &mut self.unused_mult,
+        ] {
+            if buf.len() < size {
+                buf.resize(size, 0.0);
+            }
+        }
+    }
+}
+
+/// Sums the sources reaching `port` into `add` (additive ones) and `mult`
+/// (the others, as factors of 1 + value x amount).
+fn collect_modulation(
+    port: PortId,
+    sources: &Inputs<'_>,
+    size: usize,
+    add: &mut [f32],
+    mult: &mut [f32],
+) {
+    let add_buf = &mut add[..size];
+    let mult_buf = &mut mult[..size];
+    add_buf.fill(0.0);
+    mult_buf.fill(1.0);
+
+    if let Some(mods) = sources.get(&port) {
+        for modulation_source in mods {
+            let amount = modulation_source.amount;
+            let mod_type = modulation_source.mod_type;
+            for i in 0..size {
+                let value = modulation_source.buffer.get(i).copied().unwrap_or(0.0);
+                match mod_type {
+                    ModulationType::Additive => {
+                        add_buf[i] += value * amount;
+                    }
+                    ModulationType::VCA | ModulationType::Bipolar => {
+                        mult_buf[i] *= 1.0 + value * amount;
                     }
                 }
             }
         }
-
-        (add_buf.to_vec(), mult_buf.to_vec())
     }
 }
 
@@ -319,12 +361,7 @@ impl AudioNode for Sampler {
         ports
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         if !self.active {
             return;
         }
@@ -345,27 +382,62 @@ impl AudioNode for Sampler {
             }
         }
 
+        let mut mods = std::mem::take(&mut self.mods);
+        mods.ensure(buffer_size);
+        let n = buffer_size;
+
         // Collect frequency modulation
-        let (freq_add, freq_mult) =
-            self.collect_modulation(PortId::FrequencyMod, inputs, buffer_size);
+        collect_modulation(
+            PortId::FrequencyMod,
+            inputs,
+            n,
+            &mut mods.freq_add,
+            &mut mods.freq_mult,
+        );
 
         // Collect gain modulation
-        let (gain_add, gain_mult) = self.collect_modulation(PortId::GainMod, inputs, buffer_size);
+        collect_modulation(
+            PortId::GainMod,
+            inputs,
+            n,
+            &mut mods.gain_add,
+            &mut mods.gain_mult,
+        );
 
         // Collect stereo pan modulation (driven by macros for MOD imports).
         // Expected domain: 0..1 where 0 = left, 0.5 = center, 1 = right.
         let has_pan_mod = inputs
             .get(&PortId::StereoPan)
             .is_some_and(|sources| !sources.is_empty());
-        let (pan_add, _pan_mult) = self.collect_modulation(PortId::StereoPan, inputs, buffer_size);
+        collect_modulation(
+            PortId::StereoPan,
+            inputs,
+            n,
+            &mut mods.pan_add,
+            &mut mods.unused_mult,
+        );
 
         // Collect sample offset modulation (driven by macros for MOD imports).
         // Expected domain: 0..1 where 0 = start, 1 = end of sample.
         let has_offset_mod = inputs
             .get(&PortId::SampleOffset)
             .is_some_and(|sources| !sources.is_empty());
-        let (offset_add, _offset_mult) =
-            self.collect_modulation(PortId::SampleOffset, inputs, buffer_size);
+        collect_modulation(
+            PortId::SampleOffset,
+            inputs,
+            n,
+            &mut mods.offset_add,
+            &mut mods.unused_mult,
+        );
+        let SamplerMods {
+            freq_add,
+            freq_mult,
+            gain_add,
+            gain_mult,
+            pan_add,
+            offset_add,
+            ..
+        } = &mods;
 
         // Calculate playback rate based on frequency
         // Frequency is in Hz, need to convert to playback rate
@@ -394,6 +466,7 @@ impl AudioNode for Sampler {
                     }
                 }
             }
+            self.mods = mods;
             return;
         }
 
@@ -521,6 +594,7 @@ impl AudioNode for Sampler {
                 buf[..buffer_size].copy_from_slice(&self.scratch_freq_mult[..buffer_size]);
             }
         }
+        self.mods = mods;
     }
 
     fn reset(&mut self) {
@@ -560,6 +634,7 @@ impl AudioNode for Sampler {
 mod tests {
     use super::*;
     use crate::graph::ModulationSource;
+    use crate::PortMap;
 
     #[test]
     fn sampler_with_default_sample_produces_output() {
@@ -577,16 +652,16 @@ mod tests {
         sampler.set_sample_data(sample_data);
 
         // Prepare empty modulation/gate inputs.
-        let inputs: FxHashMap<PortId, Vec<ModulationSource<'static>>> = FxHashMap::default();
+        let inputs: PortMap<Vec<ModulationSource<'static>>> = PortMap::default();
 
         // Prepare output buffers.
         let mut left = vec![0.0_f32; 64];
         let mut right = vec![0.0_f32; 64];
-        let mut outputs: FxHashMap<PortId, &mut [f32]> = FxHashMap::default();
+        let mut outputs: Outputs<'_> = Outputs::default();
         outputs.insert(PortId::AudioOutput0, &mut left[..]);
         outputs.insert(PortId::AudioOutput1, &mut right[..]);
 
-        sampler.process(&inputs, &mut outputs, 64);
+        sampler.process(&inputs.as_inputs(), &mut outputs, 64);
 
         // With a constant non-zero sample and gate defaulting to 1.0,
         // the oversampled sampler should produce non-zero output.

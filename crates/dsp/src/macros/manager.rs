@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use crate::traits::Outputs;
 
 use super::types::{ModulationMacro, ModulationTarget};
 use crate::graph::{AudioBufferPool, ModulationType};
@@ -11,13 +11,6 @@ pub struct MacroManager {
     buffer_size: usize,
     /// Preallocated scratch buffer to avoid per‐block allocation in update_macro.
     scratch_buffer: Vec<f32>,
-}
-
-pub struct MacroData {
-    // For each macro, store its targets and a copy of its entire buffer for this block.
-    // macros[i].0 = vector of targets, macros[i].1 = the macro’s buffer values.
-    macros: Vec<(Vec<ModulationTarget>, Vec<f32>)>,
-    buffer_size: usize,
 }
 
 impl MacroManager {
@@ -130,17 +123,20 @@ impl MacroManager {
     }
 
     /// Prepare all macro data for this block by copying it once from the buffer_pool.
-    pub fn prepare_macro_data(&self, buffer_pool: &AudioBufferPool) -> MacroData {
-        let mut macros_data = Vec::with_capacity(self.macros.len());
+    /// Copies every macro's values for this block into `values`, recording
+    /// each macro's span, reusing the storage of the last block.
+    pub fn copy_values(
+        &self,
+        buffer_pool: &AudioBufferPool,
+        values: &mut Vec<f32>,
+        spans: &mut Vec<std::ops::Range<usize>>,
+    ) {
+        values.clear();
+        spans.clear();
         for m in &self.macros {
-            let buffer_idx = m.get_value_buffer_idx();
-            let buffer = buffer_pool.copy_out(buffer_idx).to_vec();
-            let targets = m.get_targets().to_vec();
-            macros_data.push((targets, buffer));
-        }
-        MacroData {
-            macros: macros_data,
-            buffer_size: self.buffer_size,
+            let start = values.len();
+            values.extend_from_slice(buffer_pool.copy_out(m.get_value_buffer_idx()));
+            spans.push(start..values.len());
         }
     }
 
@@ -148,10 +144,11 @@ impl MacroManager {
     pub fn apply_modulation(
         &self,
         offset: usize,
-        macro_data: &MacroData,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
+        values: &[f32],
+        spans: &[std::ops::Range<usize>],
+        outputs: &mut Outputs<'_>,
     ) {
-        let block_size = macro_data.buffer_size;
+        let block_size = self.buffer_size;
         if offset >= block_size {
             return;
         }
@@ -160,7 +157,8 @@ impl MacroManager {
         for i in (offset..block_size).step_by(4) {
             let chunk_size = (block_size - i).min(4);
             // For each macro...
-            for (targets, buffer) in &macro_data.macros {
+            for (m, span) in self.macros.iter().zip(spans) {
+                let (targets, buffer) = (m.get_targets(), &values[span.clone()]);
                 if targets.is_empty() || i >= buffer.len() {
                     continue;
                 }

@@ -156,8 +156,8 @@
 
 //     fn process<'a>(
 //         &mut self,
-//         inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-//         outputs: &mut FxHashMap<PortId, &mut [f32]>,
+//         inputs: &Inputs<'a>,
+//         outputs: &mut Outputs<'_>,
 //         buffer_size: usize,
 //     ) {
 //         // Retrieve input buffers.
@@ -266,8 +266,8 @@
 
 //     fn process<'a>(
 //         &mut self,
-//         inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-//         outputs: &mut FxHashMap<PortId, &mut [f32]>,
+//         inputs: &Inputs<'a>,
+//         outputs: &mut Outputs<'_>,
 //         buffer_size: usize,
 //     ) {
 //         let left_in = inputs.get(&PortId::AudioInput0).unwrap()[0]

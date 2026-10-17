@@ -1,3 +1,4 @@
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::Simd;
 use std::any::Any;
 
@@ -235,7 +236,7 @@ impl ArpeggiatorGenerator {
     fn process_modulations(
         &self,
         buffer_size: usize,
-        maybe_sources: Option<&Vec<ModulationSource>>,
+        maybe_sources: Option<&[ModulationSource]>,
         default: f32,
     ) -> Vec<f32> {
         if let Some(sources) = maybe_sources {
@@ -251,7 +252,7 @@ impl ArpeggiatorGenerator {
     }
 
     /// Process the arpeggiator in modes that use SIMD block processing.
-    fn process_simd(&mut self, outputs: &mut FxHashMap<PortId, &mut [f32]>, buffer_size: usize) {
+    fn process_simd(&mut self, outputs: &mut Outputs<'_>, buffer_size: usize) {
         let output = outputs
             .get_mut(&PortId::AudioOutput0)
             .expect("Expected AudioOutput0 output port");
@@ -316,8 +317,8 @@ impl ArpeggiatorGenerator {
 
     fn process_trigger_mode<'a>(
         &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
+        inputs: &Inputs<'a>,
+        outputs: &mut Outputs<'_>,
         buffer_size: usize,
     ) {
         let output = outputs
@@ -377,8 +378,8 @@ impl ArpeggiatorGenerator {
     /// if the step is skipped, the gate output remains low (0.0) for the entire duration.
     fn process_with_optional_gate<'a>(
         &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
+        inputs: &Inputs<'a>,
+        outputs: &mut Outputs<'_>,
         buffer_size: usize,
     ) {
         // Process modulation output according to mode.
@@ -431,12 +432,7 @@ impl AudioNode for ArpeggiatorGenerator {
         ports
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         self.process_with_optional_gate(inputs, outputs, buffer_size);
     }
 

@@ -13,9 +13,12 @@
 //    subsong, looped}  prepares source slot `source` for a PlaySource command
 //   {type: 'effect', bus, slot, kind (EffectKind index; -1 empties the slot),
 //    params: Float32Array}
+//   {type: 'synth', source, bytes: ArrayBuffer (the patch JSON, UTF-8), oneShot}
+//    prepares source slot `source` with a synth patch, played by
+//    SourceEvent commands
 // To the page:
 //   {type: 'ready'}
-//   {type: 'song', source, ok, error?}  after each 'song' message
+//   {type: 'song', source, ok, error?}  after each 'song' or 'synth' message
 //   {type: 'telemetry', frame, voices, rejected, badBatches,
 //    events: ArrayBuffer (wire events), meters: Float32Array (5 per bus)}
 //   {type: 'error', message}
@@ -98,6 +101,17 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         const reply = { type: 'song', source: message.source, ok };
         if (!ok) {
           // No TextDecoder in a worklet scope; the reason is ASCII.
+          const why = new Uint8Array(x.memory.buffer, x.cw_error(), x.cw_error_len());
+          reply.error = String.fromCharCode(...why);
+        }
+        this.port.postMessage(reply);
+      } else if (message.type === 'synth') {
+        const bytes = new Uint8Array(message.bytes);
+        const at = x.cw_file_buffer(bytes.length);
+        new Uint8Array(x.memory.buffer, at, bytes.length).set(bytes);
+        const ok = x.cw_prepare_synth(message.source >>> 0, message.oneShot ? 1 : 0) === 1;
+        const reply = { type: 'song', source: message.source, ok };
+        if (!ok) {
           const why = new Uint8Array(x.memory.buffer, x.cw_error(), x.cw_error_len());
           reply.error = String.fromCharCode(...why);
         }

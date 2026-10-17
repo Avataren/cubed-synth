@@ -1,5 +1,6 @@
-use crate::graph::{ModulationProcessor, ModulationSource};
+use crate::graph::ModulationProcessor;
 use crate::traits::{AudioNode, PortId};
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::num::SimdFloat;
 use cubed_simd::StdFloat;
 use cubed_simd::{f32x4, Simd};
@@ -367,8 +368,8 @@ impl NoiseGenerator {
     /// Core block-processing entry.
     pub fn process_block<'a>(
         &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
+        inputs: &Inputs<'a>,
+        outputs: &mut Outputs<'_>,
         buffer_size: usize,
     ) {
         if !self.enabled {
@@ -391,8 +392,8 @@ impl NoiseGenerator {
         self.ensure_scratch(buffer_size);
 
         // 1) Accumulate modulation
-        let cs = inputs.get(&PortId::CutoffMod).map(|v| v.as_slice());
-        let gs = inputs.get(&PortId::GainMod).map(|v| v.as_slice());
+        let cs = inputs.get(&PortId::CutoffMod);
+        let gs = inputs.get(&PortId::GainMod);
 
         Self::accumulate_modulations_inplace(
             buffer_size,
@@ -529,12 +530,7 @@ impl AudioNode for NoiseGenerator {
         .collect()
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         self.process_block(inputs, outputs, buffer_size);
     }
 
@@ -567,7 +563,9 @@ impl AudioNode for NoiseGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::ModulationSource;
     use crate::traits::AudioNode;
+    use crate::PortMap;
     const SR: f32 = 44_100.0;
     const BS: usize = 1024;
     const LOOPS: usize = 50;
@@ -582,12 +580,12 @@ mod tests {
             enabled: true,
         });
         let mut buf = vec![0.0f32; BS];
-        let inputs = FxHashMap::default();
+        let inputs: PortMap<Vec<ModulationSource>> = PortMap::default();
         let mut peak: f32 = 0.0;
         for _ in 0..LOOPS {
-            let mut outs: FxHashMap<PortId, &mut [f32]> = FxHashMap::default();
+            let mut outs: Outputs<'_> = Outputs::default();
             outs.insert(PortId::AudioOutput0, &mut buf);
-            gen.process(&inputs, &mut outs, BS);
+            gen.process(&inputs.as_inputs(), &mut outs, BS);
             for &s in &buf {
                 peak = peak.max(s.abs())
             }

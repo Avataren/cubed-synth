@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::clip::Clip;
 use crate::insert::Insert;
-use crate::source::Source;
+use crate::source::{Source, SourceEvent};
 use crate::spatial::{Listener, Spatial};
 
 /// A bus slot. The host names its buses and maps the names to slots; slot 0
@@ -246,6 +246,11 @@ pub enum Command {
     /// Plays the prepared source; the slot is empty afterwards.
     PlaySource(PlaySource),
     SetVoiceGain(VoiceId, f32),
+    /// Hands an event (a note) to the source playing on the voice.
+    SourceEvent {
+        voice: VoiceId,
+        event: SourceEvent,
+    },
     /// Glides the voice's gain to `gain` over `frames` (a fade-in or a
     /// crossfade); `SetVoiceGain` cancels it.
     FadeVoice {
@@ -315,6 +320,7 @@ impl std::fmt::Debug for Command {
             Command::Play(play) => write!(f, "Play({play:?})"),
             Command::PrepareSource(id, _) => write!(f, "PrepareSource({id:?}, ..)"),
             Command::PlaySource(play) => write!(f, "PlaySource({play:?})"),
+            Command::SourceEvent { voice, event } => write!(f, "SourceEvent({voice:?}, {event:?})"),
             Command::FadeVoice {
                 voice,
                 gain,

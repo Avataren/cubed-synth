@@ -23,6 +23,7 @@
 //!
 //! -----
 
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::Simd;
 use rustc_hash::FxHashMap;
 use rustfft::num_traits::Float;
@@ -35,7 +36,7 @@ use wasm_bindgen::prelude::*;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 use web_sys::console;
 
-use crate::graph::{ModulationProcessor, ModulationSource};
+use crate::graph::ModulationProcessor;
 use crate::{AudioNode, PortId};
 
 use super::{Waveform, WavetableBank};
@@ -535,12 +536,7 @@ impl AudioNode for AnalogOscillator {
         .collect()
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // inactive? → clear & return
         if !self.active {
             if let Some(o) = outputs.get_mut(&PortId::AudioOutput0) {
@@ -583,7 +579,7 @@ impl AudioNode for AnalogOscillator {
                 if !srcs.is_empty() {
                     Self::accumulate_modulations_inplace(
                         buffer_size,
-                        Some(srcs.as_slice()),
+                        Some(srcs),
                         &mut self.mod_add,
                         &mut self.mod_mul,
                     );
@@ -633,7 +629,7 @@ impl AudioNode for AnalogOscillator {
                 if !fm.is_empty() {
                     Self::accumulate_modulations_inplace(
                         buffer_size,
-                        Some(fm.as_slice()),
+                        Some(fm),
                         &mut self.mod_add,
                         &mut self.mod_mul,
                     );

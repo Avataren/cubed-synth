@@ -1,3 +1,4 @@
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::Simd;
 use cubed_simd::StdFloat;
 use std::any::Any;
@@ -5,7 +6,7 @@ use std::any::Any;
 use rustc_hash::FxHashMap;
 
 // Import necessary types
-use crate::graph::{ModulationProcessor, ModulationSource};
+use crate::graph::ModulationProcessor;
 use crate::{AudioNode, PortId};
 
 /// GlobalFrequencyNode encapsulates the base frequency buffer and applies a detune factor.
@@ -98,12 +99,7 @@ impl AudioNode for GlobalFrequencyNode {
         .collect()
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // --- 0) Buffer Prep ---
         self.ensure_scratch_buffers(buffer_size);
 
@@ -118,7 +114,7 @@ impl AudioNode for GlobalFrequencyNode {
             // Accumulate modulation into shared scratch buffers
             Self::accumulate_modulations_inplace(
                 buffer_size,
-                detune_mod_sources.map(|v| v.as_slice()),
+                detune_mod_sources,
                 &mut self.mod_scratch_add, // Holds additive part (semitones)
                 &mut self.mod_scratch_mult, // Holds multiplicative part (factor)
             );

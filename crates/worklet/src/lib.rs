@@ -11,7 +11,8 @@
 //! 3. Clips arrive as PCM: write it at `cw_clip_buffer(frames, channels)`
 //!    (and `cw_clip_right()` for stereo), then `cw_add_clip`. Songs arrive
 //!    as files: write one at `cw_file_buffer(len)`, then `cw_prepare_song`
-//!    makes it a prepared source for a `PlaySource` command. Effects arrive
+//!    makes it a prepared source for a `PlaySource` command; a synth patch
+//!    (the DAW's JSON) the same way with `cw_prepare_synth`. Effects arrive
 //!    as a kind and parameters: write them at `cw_effect_params()`, then
 //!    `cw_set_effect`.
 //! 4. Each render quantum, `cw_process(frames)` renders into `cw_left()` and
@@ -28,6 +29,7 @@ use std::sync::Arc;
 use cubed_mixer::effects::MAX_PARAMS;
 use cubed_mixer::{
     wire, BusId, Clip, ClipId, Command, Effect, EffectKind, Mixer, MixerConfig, Returned,
+    SynthSource,
 };
 
 /// The Web Audio render quantum.
@@ -284,6 +286,41 @@ fn prepare_song(
 #[cfg(not(feature = "songs"))]
 fn prepare_song(_: &mut State, _: u32, _: u32, _: usize, _: bool) -> Result<(), String> {
     Err("this build of cubed-worklet plays no songs".into())
+}
+
+/// Builds the synth patch written at `cw_file_buffer` (the DAW's patch JSON,
+/// UTF-8) as prepared source `source`; `one_shot` 1 ends its voice once its
+/// notes have died away. Returns 1 on success; on failure 0, with the reason
+/// at `cw_error`.
+#[no_mangle]
+pub extern "C" fn cw_prepare_synth(source: u32, one_shot: u32) -> u32 {
+    let s = state();
+    s.released.clear();
+    s.error.clear();
+    let result = std::str::from_utf8(&s.file)
+        .map_err(|e| format!("the patch is not UTF-8: {e}"))
+        .and_then(|json| SynthSource::from_patch(json, s.mixer.config().sample_rate));
+    match result {
+        Ok(synth) => {
+            let synth = if one_shot != 0 {
+                synth.one_shot()
+            } else {
+                synth
+            };
+            s.mixer.apply(Command::PrepareSource(
+                cubed_mixer::SourceId(source),
+                Box::new(synth),
+            ));
+            1
+        }
+        Err(why) => {
+            s.error.extend(
+                why.chars()
+                    .map(|c| if c.is_ascii() { c as u8 } else { b'?' }),
+            );
+            0
+        }
+    }
 }
 
 /// The reason the last `cw_prepare_song` failed (`cw_error_len` bytes).

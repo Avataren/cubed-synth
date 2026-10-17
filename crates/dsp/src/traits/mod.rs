@@ -5,7 +5,9 @@ use std::any::Any;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::graph::ModulationSource;
+mod ports;
+
+pub use ports::{Inputs, Outputs, PortMap, PORT_COUNT};
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -151,12 +153,9 @@ impl PortId {
 pub trait AudioNode: Any {
     fn get_ports(&self) -> FxHashMap<PortId, bool>;
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>, // Zero-copy: borrowed slices
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    );
+    /// Renders one block: reads what reaches each input port and writes
+    /// each output port it has. Runs on the audio thread: no allocation.
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize);
 
     fn reset(&mut self);
 

@@ -1,6 +1,6 @@
 use super::copy_input;
-use crate::graph::ModulationSource;
 use crate::traits::{AudioNode, PortId, StereoEffect};
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::f32x4;
 use cubed_simd::num::SimdFloat;
 use rustc_hash::FxHashMap;
@@ -364,12 +364,7 @@ impl AudioNode for Freeverb {
         ports
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // Retrieve input buffers; if absent, use a zero buffer.
         let left_in = inputs
             .get(&PortId::AudioInput0)
@@ -439,7 +434,7 @@ mod tests {
     use super::*;
     use crate::graph::{ModulationSource, ModulationTransformation, ModulationType};
     use crate::traits::{AudioNode, PortId};
-    use rustc_hash::FxHashMap;
+    use crate::PortMap;
 
     /// Test Freeverb when only the dry signal is active.
     #[test]
@@ -464,7 +459,7 @@ mod tests {
         let mut output_right = vec![0.0; buffer_size];
 
         // Build input modulation sources.
-        let mut inputs = FxHashMap::default();
+        let mut inputs: PortMap<Vec<ModulationSource>> = PortMap::default();
         inputs.insert(
             PortId::AudioInput0,
             vec![ModulationSource {
@@ -486,12 +481,12 @@ mod tests {
 
         // Create outputs map inside a scoped block so that the mutable borrows don't last longer than needed.
         {
-            let mut outputs = FxHashMap::default();
+            let mut outputs = Outputs::default();
             outputs.insert(PortId::AudioOutput0, output_left.as_mut_slice());
             outputs.insert(PortId::AudioOutput1, output_right.as_mut_slice());
 
             // Process one block.
-            freeverb.process(&inputs, &mut outputs, buffer_size);
+            freeverb.process(&inputs.as_inputs(), &mut outputs, buffer_size);
         }
 
         // With wet=0 and dry=1, the processed output should equal the input exactly.
@@ -534,7 +529,7 @@ mod tests {
         let mut output_left = vec![0.0; buffer_size];
         let mut output_right = vec![0.0; buffer_size];
 
-        let mut inputs = FxHashMap::default();
+        let mut inputs: PortMap<Vec<ModulationSource>> = PortMap::default();
         inputs.insert(
             PortId::AudioInput0,
             vec![ModulationSource {
@@ -561,10 +556,10 @@ mod tests {
         // For each processing block, create a fresh outputs map so the mutable borrow is limited.
         for _ in 0..num_blocks {
             {
-                let mut outputs = FxHashMap::default();
+                let mut outputs = Outputs::default();
                 outputs.insert(PortId::AudioOutput0, output_left.as_mut_slice());
                 outputs.insert(PortId::AudioOutput1, output_right.as_mut_slice());
-                freeverb.process(&inputs, &mut outputs, buffer_size);
+                freeverb.process(&inputs.as_inputs(), &mut outputs, buffer_size);
             }
             // Now it is safe to borrow the output buffers immutably.
             accumulated_left.extend_from_slice(&output_left);

@@ -1,8 +1,8 @@
+use crate::traits::{Inputs, Outputs};
 use rustc_hash::FxHashMap;
 use std::any::Any;
 
 use super::copy_input;
-use crate::graph::ModulationSource;
 use crate::traits::{AudioNode, PortId, StereoEffect};
 
 /// Simple stereo compressor with peak detection and wet/dry mix.
@@ -132,12 +132,7 @@ impl AudioNode for Compressor {
         ports
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         if !self.should_process() {
             if let Some(out_left) = outputs.get_mut(&PortId::AudioOutput0) {
                 out_left[..buffer_size].fill(0.0);

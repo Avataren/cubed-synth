@@ -1,3 +1,4 @@
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::num::SimdFloat;
 use cubed_simd::{Simd, StdFloat};
 use std::any::Any; // Import Simd explicitly, StdFloat for sqrt
@@ -5,7 +6,7 @@ use std::any::Any; // Import Simd explicitly, StdFloat for sqrt
 use rustc_hash::FxHashMap;
 
 // Import necessary types
-use crate::graph::{ModulationProcessor, ModulationSource};
+use crate::graph::ModulationProcessor;
 use crate::traits::{AudioNode, PortId};
 
 /// A simple stereo mixer node with gain and panning control.
@@ -99,8 +100,8 @@ impl AudioNode for Mixer {
 
     fn process<'a>(
         &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>, // Still takes mutable FxHashMap
+        inputs: &Inputs<'a>,
+        outputs: &mut Outputs<'_>, // Still takes mutable FxHashMap
         buffer_size: usize,
     ) {
         // --- 0) Early exit and Buffer Preparation ---
@@ -148,7 +149,7 @@ impl AudioNode for Mixer {
             if sources.is_some_and(|s| !s.is_empty()) {
                 Self::accumulate_modulations_inplace(
                     buffer_size,
-                    sources.map(|v| v.as_slice()),
+                    sources,
                     &mut self.mod_scratch_add,
                     &mut self.mod_scratch_mult,
                 );

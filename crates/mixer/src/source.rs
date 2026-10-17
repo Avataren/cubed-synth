@@ -13,6 +13,28 @@ pub trait Source: Send {
     /// source has finished: what it wrote this time still plays, and it is
     /// not called again.
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) -> bool;
+
+    /// Takes an event the host sent the voice (`Command::SourceEvent`), such
+    /// as a note for a synth. Sources that play by themselves ignore them.
+    fn event(&mut self, event: SourceEvent) {
+        let _ = event;
+    }
+}
+
+/// Something the host tells a playing source.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SourceEvent {
+    /// Starts MIDI note `note` (69 is A4) at `velocity` (0-1); with a
+    /// `duration` in frames it releases by itself after that long.
+    NoteOn {
+        note: u8,
+        velocity: f32,
+        duration: u32,
+    },
+    NoteOff {
+        note: u8,
+    },
+    AllNotesOff,
 }
 
 /// A playing source.
@@ -100,6 +122,16 @@ impl SourceVoice {
             right[i] += sr[i] * (r0 + step_r * i as f32);
         }
         alive && !fade_frames.is_some_and(|f| f <= n)
+    }
+}
+
+impl Voice {
+    /// The source playing on this voice, if it is one.
+    pub(crate) fn source_mut(&mut self) -> Option<&mut (dyn Source + 'static)> {
+        match self {
+            Voice::Source(v) => v.source.as_deref_mut(),
+            Voice::Clip(_) => None,
+        }
     }
 }
 

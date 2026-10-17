@@ -1,10 +1,10 @@
+use crate::traits::{Inputs, Outputs};
 use cubed_simd::f32x4;
 use std::any::Any;
 
 use rustc_hash::FxHashMap;
 
 use super::copy_input;
-use crate::graph::ModulationSource;
 use crate::traits::{AudioNode, PortId, StereoEffect};
 
 /// A saturation node implementing soft clipping using tanh.
@@ -105,12 +105,7 @@ impl AudioNode for Saturation {
         ports
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // Extract the input buffers from the first modulation source for each channel.
         let left_in = inputs.get(&PortId::AudioInput0).unwrap()[0].buffer;
         let right_in = inputs.get(&PortId::AudioInput1).unwrap()[0].buffer;

@@ -10,8 +10,7 @@ use cubed_dsp::graph::{ModulationSource, ModulationTransformation, ModulationTyp
 use cubed_dsp::nodes::{
     Bitcrusher, Chorus, Compressor, Convolver, Delay, Freeverb, Limiter, Saturation,
 };
-use cubed_dsp::{AudioNode, PortId};
-use rustc_hash::FxHashMap;
+use cubed_dsp::{AudioNode, Outputs, PortId, PortMap};
 
 const RATE: f32 = 48_000.0;
 const FRAMES: usize = 32_768;
@@ -106,16 +105,16 @@ fn render_ports(node: &mut dyn AudioNode, left: &[f32], right: &[f32]) -> (Vec<f
             mod_type: ModulationType::Additive,
             transformation: ModulationTransformation::None,
         };
-        let mut inputs = FxHashMap::default();
+        let mut inputs = PortMap::default();
         inputs.insert(PortId::AudioInput0, vec![source(&left[start..start + len])]);
         inputs.insert(
             PortId::AudioInput1,
             vec![source(&right[start..start + len])],
         );
-        let mut outputs = FxHashMap::default();
+        let mut outputs = Outputs::default();
         outputs.insert(PortId::AudioOutput0, &mut out_left[start..start + len]);
         outputs.insert(PortId::AudioOutput1, &mut out_right[start..start + len]);
-        node.process(&inputs, &mut outputs, len);
+        node.process(&inputs.as_inputs(), &mut outputs, len);
     });
     (out_left, out_right)
 }

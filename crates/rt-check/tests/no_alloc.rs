@@ -21,6 +21,7 @@ use cubed_mixer::{
     Mixer, MixerConfig, Play, PlaySource, SendSettings, SourceId, Spatial, SpatialMode, Start,
     VoiceId,
 };
+use cubed_mixer::{SourceEvent, SynthSource};
 use cubed_opl::a2::player::A2Player;
 use cubed_rt_check::{allocations_during, trace_allocations, CountingAllocator};
 use cubed_sid::stream::SidChipPlayer;
@@ -130,14 +131,8 @@ fn a2m_player() {
 /// The DAW's synth engine: 8 voices of an FM-into-subtractive patch (two
 /// oscillators, 4-voice unison, a 24 dB low-pass, two envelopes; the
 /// `patch_render` bench's) through chorus, delay and reverb, with notes
-/// starting and stopping. The native engine cannot load `real_patch.json`,
-/// whose sampler it does not support, so the patch is built here.
-///
-/// Ignored until the graph is reworked: `AudioGraph::process_audio_with_macros`
-/// builds hash maps and `Vec`s for every node of every voice, about 1,700
-/// allocations and frees per block here. `cargo test -- --ignored` runs it.
+/// starting and stopping.
 #[test]
-#[ignore = "AudioGraph allocates per node per block; see the doc comment"]
 fn synth_engine() {
     const VOICES: usize = 8;
     let mut engine = synth_patch(VOICES).expect("patch builds");
@@ -152,6 +147,30 @@ fn synth_engine() {
                 0.0
             };
             let hz = 110.0 * 2f32.powf(voice as f32 / 4.0);
+            frame.set_voice_values(voice, gate, hz, 1.0, 1.0);
+        }
+        engine.process_with_frame(&frame, 1.0, &mut left, &mut right);
+    });
+}
+
+/// A patch saved by the DAW (an analog and a wavetable oscillator, a
+/// sampler, an LFO, a filter, an envelope), loaded from its JSON, with notes
+/// starting and stopping on its 8 voices.
+#[test]
+fn daw_patch() {
+    let mut engine = AudioEngine::new_with_block_size(RATE as f32, 8, BLOCK);
+    let json = String::from_utf8(fixture("dsp/tests/real_patch.json")).unwrap();
+    let voices = engine.init_with_patch(&json).expect("the patch loads");
+    let mut frame = AutomationFrame::with_dimensions(voices, 4, BLOCK);
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    assert_no_alloc("DAW patch", 5, |block| {
+        for voice in 0..voices {
+            let gate = if (block / 41 + voice) % 2 == 0 {
+                1.0
+            } else {
+                0.0
+            };
+            let hz = 130.0 * 2f32.powf(voice as f32 / 5.0);
             frame.set_voice_values(voice, gate, hz, 1.0, 1.0);
         }
         engine.process_with_frame(&frame, 1.0, &mut left, &mut right);
@@ -489,4 +508,53 @@ fn mixer_stream() {
     }
     mixer.take_returned(drop);
     feeder.join().unwrap();
+}
+
+/// The DAW patch as a mixer voice, counted from its first block (the
+/// patch is loaded off the audio thread), with notes arriving as events:
+/// chords on and off, more notes than voices, and one-shots with durations.
+#[test]
+fn mixer_synth() {
+    let rate = RATE as f32;
+    let json = String::from_utf8(fixture("dsp/tests/real_patch.json")).unwrap();
+    let synth = SynthSource::from_patch(&json, rate).expect("the patch loads");
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        ..MixerConfig::default()
+    });
+    mixer.apply(Command::SetBus(BusId(1), BusSettings::default()));
+    mixer.apply(Command::PrepareSource(SourceId(0), Box::new(synth)));
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let events = allocations_during(|| {
+        mixer.apply(Command::PlaySource(PlaySource::new(
+            VoiceId(1),
+            SourceId(0),
+            BusId(1),
+        )));
+        for block in 0..5 * BLOCKS_PER_SECOND {
+            if block % 37 == 0 {
+                let base = 48 + (block / 37 % 12) as u8;
+                for k in [0, 4, 7] {
+                    mixer.apply(Command::SourceEvent {
+                        voice: VoiceId(1),
+                        event: SourceEvent::NoteOn {
+                            note: base + k,
+                            velocity: 0.8,
+                            duration: if k == 7 { 6_000 } else { 0 },
+                        },
+                    });
+                }
+            }
+            if block % 37 == 20 {
+                mixer.apply(Command::SourceEvent {
+                    voice: VoiceId(1),
+                    event: SourceEvent::AllNotesOff,
+                });
+            }
+            mixer.process(&mut left, &mut right);
+            mixer.drain_events(|_| {});
+        }
+    });
+    assert_eq!(events, 0, "{events} allocations or frees");
 }

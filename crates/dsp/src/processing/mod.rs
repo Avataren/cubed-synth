@@ -1,3 +1,4 @@
+use crate::traits::Outputs;
 use rustc_hash::FxHashMap;
 
 // src/processing/mod.rs
@@ -14,7 +15,7 @@ pub struct ProcessContext<'a> {
 impl<'a> ProcessContext<'a> {
     pub fn new(
         inputs: &'a FxHashMap<PortId, &[f32]>,
-        outputs: &'a mut FxHashMap<PortId, &mut [f32]>,
+        outputs: &'a mut Outputs<'_>,
         buffer_size: usize,
         default_values: &FxHashMap<PortId, f32>,
     ) -> Self {

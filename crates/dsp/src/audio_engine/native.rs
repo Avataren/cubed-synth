@@ -1,8 +1,11 @@
 use crate::audio_engine::patch::{
-    GlideState, PatchFile, PatchNode, VoiceLayout as PatchVoiceLayout,
+    AudioAsset, GlideState, LfoState, PatchFile, PatchNode, VoiceLayout as PatchVoiceLayout,
 };
 use crate::audio_engine::patch_loader::for_each_node_in_creation_order;
-use crate::audio_engine::patch_loader::parse_node_id;
+use crate::audio_engine::patch_loader::{
+    filter_type_from_i32, find_node_id, parse_audio_asset_id, parse_node_id,
+};
+use crate::audio_engine::wav_decode::{decode_wav, impulse_from_wav};
 use crate::automation::AutomationFrame;
 use crate::biquad::FilterType;
 use crate::effect_stack::EffectStack;
@@ -10,20 +13,32 @@ use crate::graph::{Connection, ModulationTransformation, ModulationType};
 use crate::impulse_generator::ImpulseResponseGenerator;
 use crate::nodes::morph_wavetable::WavetableSynthBank;
 use crate::nodes::{
-    AnalogOscillator, AnalogOscillatorStateUpdate, Bitcrusher, Chorus, Compressor, Convolver,
-    Delay, Envelope, EnvelopeConfig, FilterCollection, FilterSlope, Freeverb, GateMixer, Glide,
-    GlobalFrequencyNode, GlobalVelocityNode, Lfo, Limiter, Mixer, Saturation, Waveform,
-    WavetableBank, WavetableOscillator, WavetableOscillatorStateUpdate,
+    AnalogOscillator, AnalogOscillatorStateUpdate, ArpeggiatorGenerator, Bitcrusher, Chorus,
+    Compressor, Convolver, Delay, Envelope, EnvelopeConfig, FilterCollection, FilterSlope,
+    Freeverb, GateMixer, Glide, GlobalFrequencyNode, GlobalVelocityNode, Lfo, LfoLoopMode,
+    LfoRetriggerMode, LfoWaveform, Limiter, Mixer, NoiseGenerator, NoiseType, NoiseUpdate,
+    SampleData, Sampler, SamplerLoopMode, SamplerTriggerMode, Saturation, Waveform, WavetableBank,
+    WavetableOscillator, WavetableOscillatorStateUpdate,
 };
-//NoiseGenerator, NoiseUpdate,
 use crate::traits::{AudioNode, PortId};
 use crate::voice::Voice;
 use crate::NodeId;
+use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
+use base64::Engine as _;
 use rustc_hash::FxHashMap;
-use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 use uuid::Uuid;
 
 const DEFAULT_NUM_VOICES: usize = 8;
+
+/// A sampler's sound until a sample is loaded: half a second of a 220 Hz
+/// sine, as in the wasm engine.
+fn default_sampler_data(sample_rate: f32) -> Vec<f32> {
+    let frames = (sample_rate * 0.5).max(1.0) as usize;
+    (0..frames)
+        .map(|n| (2.0 * std::f32::consts::PI * 220.0 * n as f32 / sample_rate).sin())
+        .collect()
+}
 const MAX_TABLE_SIZE: usize = 2048;
 const DEFAULT_BLOCK_SIZE: usize = 128;
 const MACRO_COUNT: usize = 4;
@@ -47,6 +62,8 @@ pub struct AudioEngine {
     voice_right: Vec<f32>,
     effect_left: Vec<f32>,
     effect_right: Vec<f32>,
+    /// Each sampler's sample, shared by its node in every voice.
+    sampler_data: FxHashMap<NodeId, Rc<RefCell<SampleData>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +167,7 @@ impl AudioEngine {
             voice_right: vec![0.0; block_size],
             effect_left: vec![0.0; block_size],
             effect_right: vec![0.0; block_size],
+            sampler_data: FxHashMap::default(),
         };
         engine.init(sample_rate, initial_voice_count);
         engine
@@ -307,8 +325,311 @@ impl AudioEngine {
         self.build_nodes_from_canonical_voice(canonical_voice)?;
         self.connect_from_canonical_voice(canonical_voice)?;
         self.apply_patch_states(&patch, canonical_voice)?;
+        self.import_audio_assets(&patch.audio_assets)?;
 
         Ok(voice_count)
+    }
+
+    /// The patch's embedded samples and impulse responses (base64 WAVs keyed
+    /// `sample_<node id>` / `impulse_response_<effect id>`).
+    fn import_audio_assets(
+        &mut self,
+        assets: &std::collections::HashMap<String, AudioAsset>,
+    ) -> Result<(), String> {
+        for asset in assets.values() {
+            let Some((kind, node_id)) = parse_audio_asset_id(&asset.id) else {
+                eprintln!("Invalid audio asset id: {}", asset.id);
+                continue;
+            };
+            let data = BASE64_ENGINE
+                .decode(asset.base64_data.as_bytes())
+                .map_err(|e| format!("Failed to decode asset {}: {e}", asset.id))?;
+            match kind.as_str() {
+                "sample" => self.import_sample(parse_node_id(&node_id)?, &data)?,
+                "impulse_response" => {
+                    let effect = node_id.parse::<usize>().map_err(|e| {
+                        format!("Invalid impulse response effect id {node_id}: {e}")
+                    })?;
+                    self.import_wave_impulse(effect, &data)?;
+                }
+                // The wasm engine does not import wavetables from patches either.
+                "wavetable" => {}
+                other => eprintln!("Unknown audio asset type: {other}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads a WAV as the sample of a sampler node (in every voice).
+    pub fn import_sample(&mut self, sampler_id: NodeId, wav: &[u8]) -> Result<(), String> {
+        let (samples, channels, rate) = decode_wav(wav)?;
+        let data = Rc::new(RefCell::new(SampleData::new()));
+        data.borrow_mut()
+            .load_from_wav(samples, channels, rate as f32);
+        for voice in &mut self.voices {
+            let node = voice
+                .graph
+                .get_node_mut(sampler_id)
+                .ok_or("Node not found")?;
+            let sampler = node
+                .as_any_mut()
+                .downcast_mut::<Sampler>()
+                .ok_or("Node is not a Sampler")?;
+            sampler.set_sample_data(data.clone());
+        }
+        self.sampler_data.insert(sampler_id, data);
+        Ok(())
+    }
+
+    /// Replaces the convolver at `effect_id` with one of this WAV's impulse
+    /// response (mono, resampled to the engine's rate), keeping its wet level.
+    pub fn import_wave_impulse(&mut self, effect_id: usize, wav: &[u8]) -> Result<(), String> {
+        let index = effect_id
+            .checked_sub(EFFECT_NODE_ID_OFFSET)
+            .ok_or("Invalid effect id")?;
+        let effect = self
+            .effect_stack
+            .effects
+            .get_mut(index)
+            .ok_or("Effect id not found in effect stack")?;
+        let convolver = effect
+            .node
+            .as_any_mut()
+            .downcast_mut::<Convolver>()
+            .ok_or("Effect is not a Convolver")?;
+        let (partition_size, rate, wet) = (
+            convolver.partition_size,
+            convolver.sample_rate,
+            convolver.wet_level,
+        );
+        let ir = impulse_from_wav(wav, rate)?;
+        let mut new_convolver = Convolver::new(ir, partition_size, rate);
+        new_convolver.set_wet_level(wet);
+        effect.node = Box::new(new_convolver);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_sampler(
+        &mut self,
+        sampler_id: NodeId,
+        frequency: f32,
+        gain: f32,
+        loop_mode: u8,
+        loop_start: f32,
+        loop_end: f32,
+        root_note: f32,
+        trigger_mode: u8,
+        active: bool,
+    ) -> Result<(), String> {
+        let loop_mode = match loop_mode {
+            1 => SamplerLoopMode::Loop,
+            2 => SamplerLoopMode::PingPong,
+            _ => SamplerLoopMode::Off,
+        };
+        let trigger_mode = match trigger_mode {
+            0 => SamplerTriggerMode::FreeRunning,
+            2 => SamplerTriggerMode::OneShot,
+            _ => SamplerTriggerMode::Gate,
+        };
+        for voice in &mut self.voices {
+            let node = voice
+                .graph
+                .get_node_mut(sampler_id)
+                .ok_or("Node not found")?;
+            let sampler = node
+                .as_any_mut()
+                .downcast_mut::<Sampler>()
+                .ok_or("Node is not a Sampler")?;
+            sampler.set_base_frequency(frequency);
+            sampler.set_base_gain(gain);
+            sampler.set_loop_mode(loop_mode);
+            sampler.set_loop_start(loop_start);
+            sampler.set_loop_end(loop_end);
+            sampler.set_root_note(root_note);
+            sampler.set_trigger_mode(trigger_mode);
+            sampler.set_active(active);
+        }
+        Ok(())
+    }
+
+    /// Applies an LFO's patch settings in every voice.
+    pub fn update_lfo(&mut self, lfo_id: NodeId, state: &LfoState) {
+        let waveform = match state.waveform {
+            1 => LfoWaveform::Triangle,
+            2 => LfoWaveform::Square,
+            3 => LfoWaveform::Saw,
+            4 => LfoWaveform::InverseSaw,
+            _ => LfoWaveform::Sine,
+        };
+        let loop_mode = match state.loop_mode {
+            1 => LfoLoopMode::Loop,
+            2 => LfoLoopMode::PingPong,
+            _ => LfoLoopMode::Off,
+        };
+        for voice in &mut self.voices {
+            if let Some(lfo) = voice
+                .graph
+                .get_node_mut(lfo_id)
+                .and_then(|node| node.as_any_mut().downcast_mut::<Lfo>())
+            {
+                lfo.set_gain(state.gain);
+                lfo.set_phase_offset(state.phase_offset);
+                lfo.set_frequency(state.frequency);
+                lfo.set_waveform(waveform);
+                lfo.set_use_absolute(state.use_absolute);
+                lfo.set_use_normalized(state.use_normalized);
+                lfo.set_retrigger_mode(LfoRetriggerMode::from_u8(state.trigger_mode));
+                lfo.set_active(state.active);
+                lfo.set_loop_mode(loop_mode);
+                lfo.set_loop_start(state.loop_start);
+                lfo.set_loop_end(state.loop_end);
+            }
+        }
+    }
+
+    /// `cutoff` is a fraction of the sample rate, as patches store it.
+    pub fn update_noise(
+        &mut self,
+        noise_id: NodeId,
+        noise_type: NoiseType,
+        cutoff: f32,
+        gain: f32,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let sample_rate = self.sample_rate;
+        for voice in &mut self.voices {
+            let node = voice.graph.get_node_mut(noise_id).ok_or("Node not found")?;
+            let noise = node
+                .as_any_mut()
+                .downcast_mut::<NoiseGenerator>()
+                .ok_or("Node is not a NoiseGenerator")?;
+            noise.update(NoiseUpdate {
+                noise_type,
+                cutoff: cutoff * sample_rate,
+                gain,
+                enabled,
+            });
+        }
+        Ok(())
+    }
+
+    /// Velocity sensitivity and randomness, on the named node or each
+    /// voice's global velocity node.
+    pub fn update_velocity(
+        &mut self,
+        node_id: NodeId,
+        sensitivity: f32,
+        randomize: f32,
+    ) -> Result<(), String> {
+        let mut updated = false;
+        for voice in &mut self.voices {
+            let target = if voice.graph.get_node(node_id).is_some() {
+                Some(node_id)
+            } else {
+                voice.graph.global_velocity_node
+            };
+            let Some(target) = target else { continue };
+            if let Some(node) = voice.graph.get_node_mut(target) {
+                let velocity = node
+                    .as_any_mut()
+                    .downcast_mut::<GlobalVelocityNode>()
+                    .ok_or("Node is not a GlobalVelocityNode")?;
+                velocity.set_sensitivity(sensitivity);
+                velocity.set_randomize(randomize);
+                updated = true;
+            }
+        }
+        if updated {
+            Ok(())
+        } else {
+            Err("Node not found".into())
+        }
+    }
+
+    pub fn update_delay(
+        &mut self,
+        node_id: usize,
+        delay_ms: f32,
+        feedback: f32,
+        wet_mix: f32,
+        enabled: bool,
+    ) {
+        if let Some(delay) = self.effect_mut::<Delay>(node_id) {
+            delay.set_delay_ms(delay_ms);
+            delay.set_feedback(feedback);
+            delay.set_mix(wet_mix);
+            delay.set_active(enabled);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_reverb(
+        &mut self,
+        node_id: usize,
+        active: bool,
+        room_size: f32,
+        damp: f32,
+        wet: f32,
+        dry: f32,
+        width: f32,
+    ) {
+        if let Some(reverb) = self.effect_mut::<Freeverb>(node_id) {
+            reverb.set_room_size(room_size);
+            reverb.set_damp(damp);
+            reverb.set_wet(wet);
+            reverb.set_dry(dry);
+            reverb.set_width(width);
+            reverb.set_active(active);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_chorus(
+        &mut self,
+        node_id: usize,
+        active: bool,
+        base_delay_ms: f32,
+        depth_ms: f32,
+        lfo_rate_hz: f32,
+        feedback: f32,
+        feedback_filter: f32,
+        mix: f32,
+        stereo_phase_offset_deg: f32,
+    ) {
+        let sample_rate = self.sample_rate;
+        if let Some(chorus) = self.effect_mut::<Chorus>(node_id) {
+            chorus.set_base_delay_ms(base_delay_ms);
+            chorus.set_depth_ms(depth_ms);
+            chorus.set_rate_hz(lfo_rate_hz);
+            chorus.set_feedback(feedback);
+            chorus.set_mix(mix);
+            chorus.set_stereo_phase_offset_deg(stereo_phase_offset_deg);
+            chorus.set_feedback_filter_cutoff(feedback_filter * sample_rate);
+            chorus.set_active(active);
+        }
+    }
+
+    pub fn update_convolver(&mut self, node_id: usize, wet_mix: f32, enabled: bool) {
+        if let Some(convolver) = self.effect_mut::<Convolver>(node_id) {
+            convolver.set_wet_level(wet_mix);
+            convolver.set_enabled(enabled);
+        }
+    }
+
+    /// The effect-stack node with this patch id (`EFFECT_NODE_ID_OFFSET` +
+    /// its index), if it is a `T`; otherwise a warning.
+    fn effect_mut<T: 'static>(&mut self, node_id: usize) -> Option<&mut T> {
+        let index = node_id.checked_sub(EFFECT_NODE_ID_OFFSET)?;
+        let found = self
+            .effect_stack
+            .effects
+            .get_mut(index)
+            .and_then(|effect| effect.node.as_any_mut().downcast_mut::<T>());
+        if found.is_none() {
+            eprintln!("No {} at effect index {index}", std::any::type_name::<T>());
+        }
+        found
     }
 
     fn build_nodes_from_canonical_voice(
@@ -316,6 +637,7 @@ impl AudioEngine {
         canonical_voice: &PatchVoiceLayout,
     ) -> Result<(), String> {
         // Use the same creation order as wasm to ensure consistency
+        self.sampler_data.clear();
         for_each_node_in_creation_order(canonical_voice, |node_type, patch_node| {
             let id = parse_node_id(&patch_node.id)?;
 
@@ -388,9 +710,9 @@ impl AudioEngine {
     }
 
     fn create_node_from_type(
-        &self,
+        &mut self,
         node_type: &str,
-        _id: &NodeId,
+        id: &NodeId,
     ) -> Result<Box<dyn AudioNode>, String> {
         match node_type {
             "oscillator" => Ok(Box::new(AnalogOscillator::new(
@@ -417,13 +739,30 @@ impl AudioEngine {
                 glide.set_active(false);
                 Ok(Box::new(glide))
             }
-            // "noise" => Ok(Box::new(NoiseGenerator::new(self.sample_rate))),
-            // "sampler" => {
-            //     let sample_data = Rc::new(RefCell::new(SampleData::new()));
-            //     let mut sampler = Sampler::new(self.sample_rate);
-            //     sampler.set_sample_data(sample_data);
-            //     Ok(Box::new(sampler))
-            // }
+            "noise" => Ok(Box::new(NoiseGenerator::new(self.sample_rate))),
+            "sampler" => {
+                // One sample for the node in every voice; a patch's audio
+                // asset replaces this placeholder (as in the wasm engine).
+                let sample_rate = self.sample_rate;
+                let data = self
+                    .sampler_data
+                    .entry(*id)
+                    .or_insert_with(|| {
+                        let mut sample = SampleData::new();
+                        sample.load_from_wav(default_sampler_data(sample_rate), 1, sample_rate);
+                        sample.root_note = 69.0;
+                        Rc::new(RefCell::new(sample))
+                    })
+                    .clone();
+                let mut sampler = Sampler::new(self.sample_rate);
+                sampler.set_sample_data(data);
+                Ok(Box::new(sampler))
+            }
+            "arpeggiator_generator" => {
+                let mut arp = ArpeggiatorGenerator::new();
+                arp.create_test_pattern(self.sample_rate, 0.225);
+                Ok(Box::new(arp))
+            }
             _ => Err(format!("Unknown node type: {}", node_type)),
         }
     }
@@ -504,6 +843,106 @@ impl AudioEngine {
                 config.active,
             )?;
         }
+        for state in patch.synth_state.lfos.values() {
+            self.update_lfo(parse_node_id(&state.lfo_id)?, state);
+        }
+        for filter in patch.synth_state.filters.values() {
+            self.update_filters(
+                parse_node_id(&filter.id)?,
+                filter.cutoff,
+                filter.resonance,
+                filter.gain,
+                filter.key_tracking,
+                filter.comb_frequency,
+                filter.comb_dampening,
+                filter.oversampling,
+                filter_type_from_i32(filter.filter_type)?,
+                filter.filter_slope,
+            )?;
+        }
+        for sampler in patch.synth_state.samplers.values() {
+            self.update_sampler(
+                parse_node_id(&sampler.id)?,
+                sampler.frequency,
+                sampler.gain,
+                sampler.loop_mode,
+                sampler.loop_start,
+                sampler.loop_end,
+                sampler.root_note,
+                sampler.trigger_mode,
+                sampler.active,
+            )?;
+        }
+        for chorus in patch.synth_state.choruses.values() {
+            if let Ok(node_id) = chorus.id.parse::<usize>() {
+                self.update_chorus(
+                    node_id,
+                    chorus.active,
+                    chorus.base_delay_ms,
+                    chorus.depth_ms,
+                    chorus.lfo_rate_hz,
+                    chorus.feedback,
+                    chorus.feedback_filter,
+                    chorus.mix,
+                    chorus.stereo_phase_offset_deg,
+                );
+            }
+        }
+        for delay in patch.synth_state.delays.values() {
+            if let Ok(node_id) = delay.id.parse::<usize>() {
+                self.update_delay(
+                    node_id,
+                    delay.delay_ms,
+                    delay.feedback,
+                    delay.wet_mix,
+                    delay.active,
+                );
+            }
+        }
+        for reverb in patch.synth_state.reverbs.values() {
+            if let Ok(node_id) = reverb.id.parse::<usize>() {
+                self.update_reverb(
+                    node_id,
+                    reverb.active,
+                    reverb.room_size,
+                    reverb.damp,
+                    reverb.wet,
+                    reverb.dry,
+                    reverb.width,
+                );
+            }
+        }
+        for convolver in patch.synth_state.convolvers.values() {
+            if let Ok(node_id) = convolver.id.parse::<usize>() {
+                self.update_convolver(node_id, convolver.wet_mix, convolver.active);
+            }
+        }
+        if let Some(noise) = &patch.synth_state.noise {
+            if let Some(noise_id) = find_node_id(_canonical_voice, "noise") {
+                let noise_type = match noise.noise_type {
+                    1 => NoiseType::Pink,
+                    2 => NoiseType::Brownian,
+                    _ => NoiseType::White,
+                };
+                self.update_noise(
+                    parse_node_id(&noise_id)?,
+                    noise_type,
+                    noise.cutoff,
+                    noise.gain,
+                    noise.is_enabled,
+                )?;
+            }
+        }
+        if let Some(velocity) = &patch.synth_state.velocity {
+            if let Some(velocity_id) = find_node_id(_canonical_voice, "global_velocity") {
+                self.update_velocity(
+                    parse_node_id(&velocity_id)?,
+                    velocity.sensitivity,
+                    velocity.randomize,
+                )?;
+            }
+        }
+
         for glide in patch.synth_state.glides.values() {
             let glide_id = parse_node_id(&glide.glide_id)?;
             for voice in &mut self.voices {
@@ -621,7 +1060,10 @@ impl AudioEngine {
             }
         }
 
-        let start = Instant::now();
+        // wasm32-unknown-unknown has no clock (`Instant::now` panics there,
+        // e.g. in the mixer's AudioWorklet): the CPU meter stays at 0.
+        #[cfg(not(target_arch = "wasm32"))]
+        let start = std::time::Instant::now();
 
         // Reuse preallocated buffers sized to the engine's block size.
         let block_len = self.block_size.max(1);
@@ -766,7 +1208,10 @@ impl AudioEngine {
             output_right[copy_len..].fill(0.0);
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         let elapsed_sec = start.elapsed().as_secs_f64();
+        #[cfg(target_arch = "wasm32")]
+        let elapsed_sec = 0.0;
         let quantum_sec = self.block_size as f64 / self.sample_rate as f64;
         self.cpu_time_accum += elapsed_sec;
         self.audio_time_accum += quantum_sec;

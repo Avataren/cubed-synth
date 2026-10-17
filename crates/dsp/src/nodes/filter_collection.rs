@@ -2,6 +2,7 @@
 #![allow(clippy::inline_always)]
 // #![warn(unused_variables)] // Uncomment temporarily to help find unused variables
 
+use crate::traits::{Inputs, Outputs};
 use once_cell::sync::Lazy;
 use rustc_hash::FxHashMap;
 use rustfft::num_traits::Float;
@@ -13,7 +14,7 @@ use wasm_bindgen::prelude::wasm_bindgen;
 
 // Import necessary items from other modules (adjust paths as needed)
 use crate::biquad::{Biquad, CascadedBiquad, Filter, FilterType};
-use crate::graph::{ModulationProcessor, ModulationSource};
+use crate::graph::ModulationProcessor;
 use crate::traits::{AudioNode, PortId};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -803,12 +804,7 @@ impl AudioNode for FilterCollection {
         .collect()
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         if !self.enabled {
             if let Some(output_buffer) = outputs.get_mut(&PortId::AudioOutput0) {
                 output_buffer[..buffer_size].fill(0.0);
@@ -848,7 +844,7 @@ impl AudioNode for FilterCollection {
             if sources.is_some_and(|s| !s.is_empty()) {
                 Self::accumulate_modulations_inplace(
                     buffer_size,
-                    sources.map(|v| v.as_slice()),
+                    sources,
                     &mut self.mod_scratch_add,
                     &mut self.mod_scratch_mult,
                 );
@@ -1023,7 +1019,9 @@ impl AudioNode for FilterCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::ModulationSource;
     use crate::graph::{ModulationTransformation, ModulationType};
+    use crate::PortMap;
     // Removed the Lerp trait definition - no longer needed
 
     const TEST_SAMPLE_RATE: f32 = 48000.0;
@@ -1178,7 +1176,7 @@ mod tests {
 
         let buffer_size = 512;
         let mut output_buffer = vec![0.0; buffer_size];
-        let mut outputs = FxHashMap::default();
+        let mut outputs = Outputs::default();
         outputs.insert(PortId::AudioOutput0, output_buffer.as_mut_slice());
 
         let audio_input_data = vec![0.0; buffer_size];
@@ -1188,11 +1186,11 @@ mod tests {
             mod_type: ModulationType::Additive,
             transformation: ModulationTransformation::None,
         };
-        let mut inputs = FxHashMap::default();
+        let mut inputs: PortMap<Vec<ModulationSource>> = PortMap::default();
         inputs.insert(PortId::AudioInput0, vec![audio_source()]);
 
         for _ in 0..5 {
-            fc.process(&inputs, &mut outputs, buffer_size);
+            fc.process(&inputs.as_inputs(), &mut outputs, buffer_size);
         }
 
         let is_finite = output_buffer.iter().all(|&x| x.is_finite());
@@ -1237,8 +1235,8 @@ mod tests {
 
         let mut output_low = vec![0.0; buffer_size];
         let mut output_high = vec![0.0; buffer_size];
-        let mut outputs_low = FxHashMap::default();
-        let mut outputs_high = FxHashMap::default();
+        let mut outputs_low = Outputs::default();
+        let mut outputs_high = Outputs::default();
         outputs_low.insert(PortId::AudioOutput0, output_low.as_mut_slice());
         outputs_high.insert(PortId::AudioOutput0, output_high.as_mut_slice());
 
@@ -1248,11 +1246,11 @@ mod tests {
             mod_type: ModulationType::Additive,
             transformation: ModulationTransformation::None,
         };
-        let mut inputs = FxHashMap::default();
+        let mut inputs: PortMap<Vec<ModulationSource>> = PortMap::default();
         inputs.insert(PortId::AudioInput0, vec![make_audio_source()]);
 
-        fc_low_drive.process(&inputs, &mut outputs_low, buffer_size);
-        fc_high_drive.process(&inputs, &mut outputs_high, buffer_size);
+        fc_low_drive.process(&inputs.as_inputs(), &mut outputs_low, buffer_size);
+        fc_high_drive.process(&inputs.as_inputs(), &mut outputs_high, buffer_size);
 
         let rms_low = (output_low.iter().map(|x| x * x).sum::<f32>() / buffer_size as f32).sqrt();
         let rms_high = (output_high.iter().map(|x| x * x).sum::<f32>() / buffer_size as f32).sqrt();
@@ -1408,8 +1406,8 @@ mod tests {
 
         let mut output_clean = vec![0.0; buffer_size];
         let mut output_driven = vec![0.0; buffer_size];
-        let mut outputs_clean = FxHashMap::default();
-        let mut outputs_driven = FxHashMap::default();
+        let mut outputs_clean = Outputs::default();
+        let mut outputs_driven = Outputs::default();
         outputs_clean.insert(PortId::AudioOutput0, output_clean.as_mut_slice());
         outputs_driven.insert(PortId::AudioOutput0, output_driven.as_mut_slice());
 
@@ -1419,14 +1417,14 @@ mod tests {
             mod_type: ModulationType::Additive,
             transformation: ModulationTransformation::None,
         };
-        let mut inputs = FxHashMap::default();
+        let mut inputs: PortMap<Vec<ModulationSource>> = PortMap::default();
         inputs.insert(PortId::AudioInput0, vec![make_audio_source()]);
 
-        fc_clean.process(&inputs, &mut outputs_clean, buffer_size);
+        fc_clean.process(&inputs.as_inputs(), &mut outputs_clean, buffer_size);
 
         // Reset inputs for driven version
         inputs.insert(PortId::AudioInput0, vec![make_audio_source()]);
-        fc_driven.process(&inputs, &mut outputs_driven, buffer_size);
+        fc_driven.process(&inputs.as_inputs(), &mut outputs_driven, buffer_size);
 
         // Calculate RMS and peak values
         let rms_clean =
@@ -1482,7 +1480,7 @@ mod tests {
         input_buffer[0] = 1.0;
 
         let mut output_buffer = vec![0.0; buffer_size];
-        let mut outputs = FxHashMap::default();
+        let mut outputs = Outputs::default();
         outputs.insert(PortId::AudioOutput0, output_buffer.as_mut_slice());
 
         let audio_source = ModulationSource {
@@ -1491,10 +1489,10 @@ mod tests {
             mod_type: ModulationType::Additive,
             transformation: ModulationTransformation::None,
         };
-        let mut inputs = FxHashMap::default();
+        let mut inputs: PortMap<Vec<ModulationSource>> = PortMap::default();
         inputs.insert(PortId::AudioInput0, vec![audio_source]);
 
-        fc.process(&inputs, &mut outputs, buffer_size);
+        fc.process(&inputs.as_inputs(), &mut outputs, buffer_size);
 
         // Check for sustained oscillation after initial impulse
         let first_samples = &output_buffer[0..10];

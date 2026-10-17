@@ -15,13 +15,13 @@ pub trait ModulationProcessor {
     fn process_modulations(
         &self,
         buffer_size: usize,
-        sources: Option<&Vec<ModulationSource>>,
+        sources: Option<&[ModulationSource]>,
         initial_value: f32,
         // Temporary buffers needed for the inplace accumulation
         add_buf: &mut Vec<f32>,
         mult_buf: &mut Vec<f32>,
     ) -> Vec<f32> {
-        let sources_slice = sources.map(|v| v.as_slice());
+        let sources_slice = sources;
 
         // Ensure temp buffers are large enough
         if add_buf.len() < buffer_size {

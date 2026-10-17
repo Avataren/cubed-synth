@@ -1,8 +1,6 @@
-use rustc_hash::FxHashMap;
-
 use crate::{
     graph::{ModulationSource, ModulationTransformation, ModulationType},
-    AudioNode, PortId,
+    AudioNode, Inputs, Outputs, PortId,
 };
 
 pub struct Effect {
@@ -123,11 +121,12 @@ impl EffectStack {
             mod_type: ModulationType::Additive,
             transformation: ModulationTransformation::None,
         };
-        let mut inputs = FxHashMap::with_capacity_and_hasher(2, Default::default());
-        inputs.insert(PortId::AudioInput0, vec![source(&work_left[..])]);
-        inputs.insert(PortId::AudioInput1, vec![source(&work_right[..])]);
+        let sources = [source(&work_left[..]), source(&work_right[..])];
+        let mut inputs = Inputs::new();
+        inputs.insert(PortId::AudioInput0, &sources[..1]);
+        inputs.insert(PortId::AudioInput1, &sources[1..]);
 
-        let mut outputs = FxHashMap::with_capacity_and_hasher(2, Default::default());
+        let mut outputs = Outputs::new();
         outputs.insert(PortId::AudioOutput0, left);
         outputs.insert(PortId::AudioOutput1, right);
 

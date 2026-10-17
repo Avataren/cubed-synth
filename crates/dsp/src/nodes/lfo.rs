@@ -1,4 +1,5 @@
 // --- IMPORTS and other parts remain the same ---
+use crate::traits::{Inputs, Outputs};
 use std::any::Any;
 use std::sync::OnceLock;
 
@@ -6,7 +7,7 @@ use rustc_hash::FxHashMap;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::wasm_bindgen;
 
-use crate::graph::{ModulationProcessor, ModulationSource};
+use crate::graph::ModulationProcessor;
 use crate::traits::{AudioNode, PortId};
 use serde::{Deserialize, Serialize};
 
@@ -577,12 +578,7 @@ impl AudioNode for Lfo {
         .collect()
     }
 
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
+    fn process<'a>(&mut self, inputs: &Inputs<'a>, outputs: &mut Outputs<'_>, buffer_size: usize) {
         // --- 0) Early exit and Buffer Preparation ---
         if !self.active {
             if let Some(output_buffer) = outputs.get_mut(&PortId::AudioOutput0) {
@@ -626,7 +622,7 @@ impl AudioNode for Lfo {
                 self.mod_scratch_mult[..buffer_size].fill(default_mult);
                 Self::accumulate_modulations_inplace(
                     buffer_size,
-                    sources.map(|v| v.as_slice()),
+                    sources,
                     &mut self.mod_scratch_add,
                     &mut self.mod_scratch_mult,
                 );
