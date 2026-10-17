@@ -1,0 +1,27 @@
+[package]
+name = "cubed-mixer"
+description = "A game audio mixer: named buses with inserts and sends, clip voices, and hosts for native output and the browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Output to the default audio device through cpal, with lock-free rings
+# between the game thread and the audio callback (`native::NativeHost`).
+native = ["dep:cpal", "dep:rtrb"]
+
+[dependencies]
+cubed-dsp = { path = "../dsp" }
+cpal = { version = "0.18", optional = true }
+rtrb = { version = "0.3", optional = true }
+
+[lints]
+workspace = true
+
+[[example]]
+name = "native_status"
+required-features = ["native"]

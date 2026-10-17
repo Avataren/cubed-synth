@@ -12,6 +12,7 @@ publish = false
 [dev-dependencies]
 cubed-ahx = { path = "../ahx" }
 cubed-dsp = { path = "../dsp" }
+cubed-mixer = { path = "../mixer" }
 cubed-opl = { path = "../opl" }
 cubed-sid = { path = "../sid" }
 

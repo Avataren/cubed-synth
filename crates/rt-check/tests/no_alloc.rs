@@ -15,6 +15,10 @@ use cubed_dsp::nodes::{
     Freeverb, Limiter, Saturation, Waveform,
 };
 use cubed_dsp::{AutomationFrame, PortId};
+use cubed_mixer::{
+    BusId, BusSettings, Clip, ClipId, Command, DspInsert, Mixer, MixerConfig, Play, SendSettings,
+    Start, VoiceId,
+};
 use cubed_opl::a2::player::A2Player;
 use cubed_rt_check::{allocations_during, trace_allocations, CountingAllocator};
 use cubed_sid::stream::SidChipPlayer;
@@ -246,5 +250,78 @@ fn effect_stack() {
             *s = 0.5 * (std::f32::consts::TAU * 220.0 * t).sin();
         }
         stack.process_audio(&input, &input, &mut left, &mut right);
+    });
+}
+
+/// The game mixer: six buses, a reverb on a return fed by sends, 48 voices
+/// of looping and one-shot clips, and every block a few plays, stops, fader
+/// moves and pan changes applied as commands.
+#[test]
+fn mixer() {
+    let rate = RATE as f32;
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        ..MixerConfig::default()
+    });
+    let reverb = BusId(6);
+    for bus in 1..=6 {
+        mixer.apply(Command::SetBus(BusId(bus), BusSettings::default()));
+    }
+    let mut verb = DspInsert::new(Freeverb::new(rate, 0.9, 0.5, 1.0, 0.0, 1.0));
+    verb.node_mut().set_active(true);
+    mixer.apply(Command::SetInsert {
+        bus: reverb,
+        slot: 0,
+        insert: Some(Box::new(verb)),
+    });
+    for bus in 1..=3 {
+        mixer.apply(Command::SetSend {
+            bus: BusId(bus),
+            slot: 0,
+            send: Some(SendSettings {
+                to: reverb,
+                level_db: -12.0,
+                pre_fader: false,
+            }),
+        });
+    }
+    for clip in 0..4u32 {
+        let frames = 2_000 + clip as usize * 7_000;
+        let samples = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
+        let pcm = if clip % 2 == 0 {
+            Clip::mono(22_050.0 + clip as f32 * 9_000.0, samples)
+        } else {
+            Clip::stereo(44_100.0, samples, vec![0.1; frames])
+        };
+        mixer.apply(Command::AddClip(ClipId(clip), std::sync::Arc::new(pcm)));
+    }
+
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let mut next_voice = 0u64;
+    assert_no_alloc("Mixer", 10, |block| {
+        for _ in 0..2 {
+            next_voice += 1;
+            let v = next_voice;
+            mixer.apply(Command::Play(Play {
+                pitch: 0.5 + (v % 7) as f32 * 0.25,
+                pan: (v % 5) as f32 * 0.5 - 1.0,
+                looped: v.is_multiple_of(3),
+                start: Start::AtFrame(mixer.frame() + v % 200),
+                ..Play::new(
+                    VoiceId(v),
+                    ClipId((v % 4) as u32),
+                    BusId(1 + (v % 5) as u16),
+                )
+            }));
+            if v > 40 {
+                mixer.apply(Command::Stop(VoiceId(v - 40), 2_000));
+            }
+        }
+        let bus = BusId(1 + (block % 5) as u16);
+        mixer.apply(Command::SetBusGain(bus, -((block % 24) as f32)));
+        mixer.apply(Command::SetBusPan(bus, ((block % 9) as f32 - 4.0) / 4.0));
+        mixer.process(&mut left, &mut right);
+        mixer.drain_events(|_| {});
+        mixer.take_returned(drop);
     });
 }
