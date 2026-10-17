@@ -9,6 +9,12 @@ pub trait Insert: Send {
 
     /// Clears delay lines and envelopes, e.g. when the insert is re-enabled.
     fn reset(&mut self) {}
+
+    /// Changes parameter `index` (see `effects::EffectKind::params`); an
+    /// insert without parameters ignores it.
+    fn set_param(&mut self, index: usize, value: f32) {
+        let _ = (index, value);
+    }
 }
 
 /// One of `cubed-dsp`'s effect nodes (reverb, delay, chorus, compressor,

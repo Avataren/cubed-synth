@@ -13,6 +13,11 @@ repository.workspace = true
 # the exports.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["songs"]
+# AHX/HVL, A2M and SID songs (`cw_prepare_song`), about 0.5 MB of wasm.
+songs = ["cubed-mixer/songs"]
+
 [dependencies]
 cubed-mixer = { path = "../mixer" }
 cubed-dsp = { path = "../dsp" }

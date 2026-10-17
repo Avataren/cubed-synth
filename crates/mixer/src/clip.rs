@@ -1,6 +1,6 @@
 //! Decoded sounds and the voices that play them.
 
-use crate::smooth::{apply_ramp, balance, Smoothed};
+use crate::smooth::{apply_ramp, balance, fade_step, start_fade, step_ramp, GainRamp, Smoothed};
 use crate::spatial::{equal_power, Hearing, Spatial, SpatialVoice};
 
 /// A decoded sound: mono or stereo PCM at its own sample rate. Voices
@@ -120,6 +120,8 @@ pub(crate) struct ClipVoice {
     pub(crate) looped: bool,
     /// The fade-out of a stop: frames left and the fade's full length.
     fade: Option<(u32, u32)>,
+    /// A long gain change in progress.
+    pub(crate) ramp: Option<GainRamp>,
     /// Where the voice is heard from; `None` plays it as it is.
     pub(crate) spatial: Option<SpatialVoice>,
 }
@@ -144,6 +146,7 @@ impl ClipVoice {
             pan: Smoothed::new(pan.clamp(-1.0, 1.0)),
             looped,
             fade: None,
+            ramp: None,
             spatial: spatial.map(|(params, frame)| SpatialVoice::new(params, frame)),
         }
     }
@@ -155,11 +158,7 @@ impl ClipVoice {
     /// Fades out over `frames` (0 = at once) and then ends. A second stop
     /// only ever shortens the fade.
     pub(crate) fn stop(&mut self, frames: u32) {
-        let frames = frames.max(1);
-        match self.fade {
-            Some((left, _)) if left <= frames => {}
-            _ => self.fade = Some((frames, frames)),
-        }
+        start_fade(&mut self.fade, frames);
     }
 
     /// Adds the voice's next `left.len()` frames into the buffers. Returns
@@ -178,8 +177,9 @@ impl ClipVoice {
         if frames == 0.0 {
             return false;
         }
+        step_ramp(&mut self.gain, &mut self.ramp, n);
         // A stop's fade is exact to the sample: it may end partway through.
-        let (fade_start, fade_end, fade_frames) = self.advance_fade(n);
+        let (fade_start, fade_end, fade_frames) = fade_step(&mut self.fade, n);
         let audible = fade_frames.unwrap_or(n).min(n);
         if self.spatial.is_some() {
             return self.render_spatial(
@@ -306,25 +306,6 @@ impl ClipVoice {
         }
         self.position = position;
         !(fade_ended || ended)
-    }
-
-    /// The fade's level at the start of an `n`-frame block and where its
-    /// line would be at the block's end (below zero if it ends sooner), and
-    /// the frames it has left.
-    fn advance_fade(&mut self, n: usize) -> (f32, f32, Option<usize>) {
-        match &mut self.fade {
-            None => (1.0, 1.0, None),
-            Some((left, total)) => {
-                let frames = *left as usize;
-                let total = *total as f32;
-                *left = left.saturating_sub(n as u32);
-                (
-                    frames as f32 / total,
-                    (frames as f32 - n as f32) / total,
-                    Some(frames),
-                )
-            }
-        }
     }
 }
 

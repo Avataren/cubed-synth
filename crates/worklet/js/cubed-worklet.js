@@ -9,8 +9,13 @@
 //   {type: 'init', wasm: ArrayBuffer, maxVoices, maxBuses, maxClips, seedLo, seedHi}
 //   {type: 'commands', bytes: ArrayBuffer}  cubed_mixer::wire commands
 //   {type: 'clip', id, sampleRate, left: Float32Array, right?: Float32Array}
+//   {type: 'song', source, format (0 AHX/HVL, 1 A2M, 2 SID), bytes: ArrayBuffer,
+//    subsong, looped}  prepares source slot `source` for a PlaySource command
+//   {type: 'effect', bus, slot, kind (EffectKind index; -1 empties the slot),
+//    params: Float32Array}
 // To the page:
 //   {type: 'ready'}
+//   {type: 'song', source, ok, error?}  after each 'song' message
 //   {type: 'telemetry', frame, voices, rejected, badBatches,
 //    events: ArrayBuffer (wire events), meters: Float32Array (5 per bus)}
 //   {type: 'error', message}
@@ -80,6 +85,30 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
           new Float32Array(x.memory.buffer, x.cw_clip_right(), frames).set(right.subarray(0, frames));
         }
         x.cw_add_clip(message.id >>> 0, message.sampleRate, frames, channels);
+      } else if (message.type === 'song') {
+        const bytes = new Uint8Array(message.bytes);
+        const at = x.cw_file_buffer(bytes.length);
+        new Uint8Array(x.memory.buffer, at, bytes.length).set(bytes);
+        const ok = x.cw_prepare_song(
+          message.source >>> 0,
+          message.format >>> 0,
+          (message.subsong ?? 0) >>> 0,
+          message.looped === false ? 0 : 1,
+        ) === 1;
+        const reply = { type: 'song', source: message.source, ok };
+        if (!ok) {
+          // No TextDecoder in a worklet scope; the reason is ASCII.
+          const why = new Uint8Array(x.memory.buffer, x.cw_error(), x.cw_error_len());
+          reply.error = String.fromCharCode(...why);
+        }
+        this.port.postMessage(reply);
+      } else if (message.type === 'effect') {
+        const params = message.params ?? new Float32Array(0);
+        const room = new Float32Array(x.memory.buffer, x.cw_effect_params(), 6);
+        room.fill(0);
+        room.set(params.subarray(0, 6));
+        const kind = message.kind >= 0 ? message.kind >>> 0 : 0xffffffff;
+        x.cw_set_effect(message.bus >>> 0, message.slot >>> 0, kind);
       }
     } catch (error) {
       this.port.postMessage({ type: 'error', message: String(error) });

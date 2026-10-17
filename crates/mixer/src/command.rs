@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::clip::Clip;
 use crate::insert::Insert;
+use crate::source::Source;
 use crate::spatial::{Listener, Spatial};
 
 /// A bus slot. The host names its buses and maps the names to slots; slot 0
@@ -18,6 +19,10 @@ impl BusId {
 /// A clip slot, below `MixerConfig::max_clips`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClipId(pub u32);
+
+/// A prepared-source slot, below `MixerConfig::max_sources`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SourceId(pub u32);
 
 /// A voice, named by the host when it starts one. Ids should not repeat
 /// while a voice with that id may still be playing.
@@ -38,6 +43,8 @@ pub struct BusSettings {
     /// The most voices that play on the bus at once; a new one beyond it
     /// steals the bus's lowest-priority, oldest voice.
     pub voice_limit: u16,
+    /// Turns the bus down while another bus is loud.
+    pub duck: Option<Duck>,
 }
 
 impl Default for BusSettings {
@@ -49,6 +56,33 @@ impl Default for BusSettings {
             mute: false,
             solo: false,
             voice_limit: u16::MAX,
+            duck: None,
+        }
+    }
+}
+
+/// Ducking: a bus goes down by `depth_db` while its key bus's output peaks
+/// above `threshold_db` (music under effects or dialogue).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Duck {
+    /// The bus whose level ducks this one (after its fader).
+    pub key: BusId,
+    /// How far down, in dB (positive).
+    pub depth_db: f32,
+    pub threshold_db: f32,
+    /// How fast it goes down, and comes back once the key is quiet.
+    pub attack_ms: f32,
+    pub release_ms: f32,
+}
+
+impl Duck {
+    pub fn new(key: BusId, depth_db: f32) -> Duck {
+        Duck {
+            key,
+            depth_db,
+            threshold_db: -40.0,
+            attack_ms: 20.0,
+            release_ms: 400.0,
         }
     }
 }
@@ -109,6 +143,36 @@ impl Play {
     }
 }
 
+/// A prepared source to play (see `Command::PrepareSource`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaySource {
+    pub voice: VoiceId,
+    pub source: SourceId,
+    pub bus: BusId,
+    /// Linear gain.
+    pub gain: f32,
+    /// Balance, -1 (left) to 1 (right).
+    pub pan: f32,
+    pub priority: u8,
+    pub start: Start,
+    pub spatial: Option<Spatial>,
+}
+
+impl PlaySource {
+    pub fn new(voice: VoiceId, source: SourceId, bus: BusId) -> PlaySource {
+        PlaySource {
+            voice,
+            source,
+            bus,
+            gain: 1.0,
+            pan: 0.0,
+            priority: 128,
+            start: Start::Now,
+            spatial: None,
+        }
+    }
+}
+
 /// A recording of the master output, filled block by block until full and
 /// then handed back as [`Returned::Capture`].
 #[derive(Debug)]
@@ -156,6 +220,13 @@ pub enum Command {
         slot: u8,
         bypass: bool,
     },
+    /// Changes a parameter of the insert in `slot` (`Insert::set_param`).
+    SetInsertParam {
+        bus: BusId,
+        slot: u8,
+        param: u8,
+        value: f32,
+    },
     /// Sets send `slot` of the bus (`None` removes it).
     SetSend {
         bus: BusId,
@@ -168,7 +239,20 @@ pub enum Command {
     /// Stops the clip's voices and lets it go.
     RemoveClip(ClipId),
     Play(Play),
+    /// Puts a source in a slot for `PlaySource` (a source already there is
+    /// handed back). Sources are objects, so the host builds them where the
+    /// mixer runs (the worklet in its message handler) and plays them by id.
+    PrepareSource(SourceId, Box<dyn Source>),
+    /// Plays the prepared source; the slot is empty afterwards.
+    PlaySource(PlaySource),
     SetVoiceGain(VoiceId, f32),
+    /// Glides the voice's gain to `gain` over `frames` (a fade-in or a
+    /// crossfade); `SetVoiceGain` cancels it.
+    FadeVoice {
+        voice: VoiceId,
+        gain: f32,
+        frames: u32,
+    },
     SetVoicePitch(VoiceId, f32),
     SetVoicePan(VoiceId, f32),
     /// Fades the voice out over that many frames, then ends it.
@@ -211,6 +295,15 @@ impl std::fmt::Debug for Command {
                 f,
                 "SetInsertBypass {{ bus: {bus:?}, slot: {slot}, bypass: {bypass} }}"
             ),
+            Command::SetInsertParam {
+                bus,
+                slot,
+                param,
+                value,
+            } => write!(
+                f,
+                "SetInsertParam {{ bus: {bus:?}, slot: {slot}, param: {param}, value: {value} }}"
+            ),
             Command::SetSend { bus, slot, send } => {
                 write!(
                     f,
@@ -220,6 +313,13 @@ impl std::fmt::Debug for Command {
             Command::AddClip(id, clip) => write!(f, "AddClip({id:?}, {} frames)", clip.frames()),
             Command::RemoveClip(id) => write!(f, "RemoveClip({id:?})"),
             Command::Play(play) => write!(f, "Play({play:?})"),
+            Command::PrepareSource(id, _) => write!(f, "PrepareSource({id:?}, ..)"),
+            Command::PlaySource(play) => write!(f, "PlaySource({play:?})"),
+            Command::FadeVoice {
+                voice,
+                gain,
+                frames,
+            } => write!(f, "FadeVoice({voice:?}, {gain}, {frames})"),
             Command::SetVoiceGain(v, x) => write!(f, "SetVoiceGain({v:?}, {x})"),
             Command::SetVoicePitch(v, x) => write!(f, "SetVoicePitch({v:?}, {x})"),
             Command::SetVoicePan(v, x) => write!(f, "SetVoicePan({v:?}, {x})"),
@@ -241,13 +341,13 @@ impl std::fmt::Debug for Command {
 /// Something the mixer reports back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// The voice finished: its clip ran out, a stop's fade ended, or its
-    /// clip or bus went away.
+    /// The voice finished: its clip or source ran out, a stop's fade ended,
+    /// or its clip or bus went away.
     Ended(VoiceId),
     /// The voice was cut to make room for a higher-priority one.
     Stolen(VoiceId),
     /// The voice did not start: its bus was full of higher-priority voices,
-    /// or its clip or bus does not exist.
+    /// or its clip, source or bus does not exist.
     Rejected(VoiceId),
 }
 
@@ -256,6 +356,8 @@ pub enum Event {
 pub enum Returned {
     Clip(Arc<Clip>),
     Insert(Box<dyn Insert>),
+    /// A source whose voice ended (or that never played).
+    Source(Box<dyn Source>),
     /// A finished (or cancelled) recording.
     Capture(Box<Capture>),
 }

@@ -5,16 +5,17 @@
 // Renders the mixer offline through the real AudioWorkletProcessor and
 // checks the samples: a 0.25 DC clip on bus 1 (the bus at -6 dB, so 0.125),
 // then silence once it ends; and telemetry with meters and an Ended event.
+// Then an AHX song sent as a file, played through a low-pass effect.
 // Puts the outcome in `window.result` for test/run.mjs.
 const RATE = 48000;
 const CLIP_FRAMES = 12000;
 
-// The two commands this needs, encoded as cubed_mixer::wire does.
+// The commands this needs, encoded as cubed_mixer::wire does.
 function setBus(bus, gainDb) {
-  const v = new DataView(new ArrayBuffer(16));
+  const v = new DataView(new ArrayBuffer(17));
   v.setUint8(0, 1); v.setUint16(1, bus, true); v.setUint16(3, 0, true);
   v.setFloat32(5, gainDb, true); v.setFloat32(9, 0, true); v.setUint8(13, 0);
-  v.setUint16(14, 0xffff, true);
+  v.setUint16(14, 0xffff, true); v.setUint8(16, 0); // no ducking
   return new Uint8Array(v.buffer);
 }
 function play(voice, clip, bus) {
@@ -25,26 +26,38 @@ function play(voice, clip, bus) {
   v.setBigUint64(30, 0n, true); v.setUint8(38, 0); // not spatial
   return new Uint8Array(v.buffer, 0, 39);
 }
+function playSource(voice, source, bus) {
+  const v = new DataView(new ArrayBuffer(34));
+  v.setUint8(0, 21); v.setBigUint64(1, BigInt(voice), true); v.setUint32(9, source, true);
+  v.setUint16(13, bus, true); v.setFloat32(15, 1, true); v.setFloat32(19, 0, true);
+  v.setUint8(23, 128); v.setUint8(24, 0); v.setBigUint64(25, 0n, true); v.setUint8(33, 0);
+  return new Uint8Array(v.buffer);
+}
 
-async function run() {
-  const context = new OfflineAudioContext(2, RATE, RATE);
+async function mixerNode(context, onMessage) {
   await context.audioWorklet.addModule('../js/cubed-worklet.js');
   const node = new AudioWorkletNode(context, 'cubed-mixer', {
     numberOfInputs: 0,
     outputChannelCount: [2],
   });
   node.connect(context.destination);
-  const telemetry = [];
   const ready = new Promise((resolve, reject) => {
     node.port.onmessage = (event) => {
       const m = event.data;
       if (m.type === 'ready') resolve();
       else if (m.type === 'error') reject(new Error(m.message));
-      else if (m.type === 'telemetry') telemetry.push(m);
+      else onMessage(m);
     };
   });
   const wasm = await (await fetch('../../../target/wasm32-unknown-unknown/release/cubed_worklet.wasm')).arrayBuffer();
   node.port.postMessage({ type: 'init', wasm, maxVoices: 0, maxBuses: 0, maxClips: 0, seedLo: 1, seedHi: 0 });
+  return { node, ready };
+}
+
+async function clip() {
+  const context = new OfflineAudioContext(2, RATE, RATE);
+  const telemetry = [];
+  const { node, ready } = await mixerNode(context, (m) => { if (m.type === 'telemetry') telemetry.push(m); });
   node.port.postMessage({ type: 'clip', id: 0, sampleRate: RATE, left: new Float32Array(CLIP_FRAMES).fill(0.25) });
   const commands = new Uint8Array([...setBus(1, -6.0206), ...play(7, 0, 1)]);
   node.port.postMessage({ type: 'commands', bytes: commands.buffer }, [commands.buffer]);
@@ -61,6 +74,35 @@ async function run() {
     first, during, after, telemetry: telemetry.length, eventMessages: events.length,
     endedTag: events.length ? events[0][0] : null, bus1Peak,
   };
+}
+
+async function song() {
+  // Fetched first: an offline render takes messages sent before 'ready'.
+  const bytes = await (await fetch('../../ahx/tests/fixtures/songs/a_new_beginning.ahx')).arrayBuffer();
+  const context = new OfflineAudioContext(2, RATE, RATE);
+  const replies = [];
+  const telemetry = [];
+  const { node, ready } = await mixerNode(context, (m) => {
+    if (m.type === 'song') replies.push(m);
+    else if (m.type === 'telemetry') telemetry.push(m);
+  });
+  node.port.postMessage({ type: 'song', source: 0, format: 0, bytes, subsong: 0, looped: true }, [bytes]);
+  node.port.postMessage({ type: 'song', source: 1, format: 7, bytes: new ArrayBuffer(4) });
+  node.port.postMessage({ type: 'effect', bus: 2, slot: 0, kind: 2, params: new Float32Array([800, 0.707]) });
+  const commands = new Uint8Array([...setBus(2, 0), ...playSource(1, 0, 2)]);
+  node.port.postMessage({ type: 'commands', bytes: commands.buffer }, [commands.buffer]);
+  await ready;
+  const left = (await context.startRendering()).getChannelData(0);
+  const rms = Math.sqrt(left.reduce((sum, s) => sum + s * s, 0) / left.length);
+  const ok = replies.length === 2 && replies[0].ok && !replies[1].ok && rms > 0.01;
+  const last = telemetry[telemetry.length - 1] ?? {};
+  return { ok, rms, replies, voices: last.voices, rejected: last.rejected };
+}
+
+async function run() {
+  const clips = await clip();
+  const songs = await song();
+  return { ok: clips.ok && songs.ok, clips, songs };
 }
 
 run().then((r) => { window.result = r; }, (e) => { window.result = { ok: false, error: String(e) }; });

@@ -35,6 +35,10 @@ impl Smoothed {
         self.target = value;
     }
 
+    pub(crate) fn target(&self) -> f32 {
+        self.target
+    }
+
     #[cfg(test)]
     pub(crate) fn is_settled(&self) -> bool {
         self.current == self.target
@@ -51,6 +55,67 @@ impl Smoothed {
             next
         };
         (start, self.current)
+    }
+}
+
+/// A long gain change (a fade-in or a crossfade): the target the voice's gain
+/// glides to moves in a straight line over `frames_left`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GainRamp {
+    target: f32,
+    frames_left: u32,
+}
+
+impl GainRamp {
+    pub(crate) fn new(target: f32, frames: u32) -> GainRamp {
+        GainRamp {
+            target: target.max(0.0),
+            frames_left: frames,
+        }
+    }
+}
+
+/// Moves `gain`'s target one block of `n` frames along the ramp.
+pub(crate) fn step_ramp(gain: &mut Smoothed, ramp: &mut Option<GainRamp>, n: usize) {
+    let Some(r) = ramp else {
+        return;
+    };
+    if r.frames_left as usize <= n {
+        gain.set(r.target);
+        *ramp = None;
+    } else {
+        let current = gain.target();
+        let t = n as f32 / r.frames_left as f32;
+        gain.set(current + (r.target - current) * t);
+        r.frames_left -= n as u32;
+    }
+}
+
+/// Starts (or shortens) a stop's fade-out of `frames` frames.
+pub(crate) fn start_fade(fade: &mut Option<(u32, u32)>, frames: u32) {
+    let frames = frames.max(1);
+    match fade {
+        Some((left, _)) if *left <= frames => {}
+        _ => *fade = Some((frames, frames)),
+    }
+}
+
+/// A stop fade's level at the start of an `n`-frame block and where its line
+/// would be at the block's end (below zero if it ends sooner), and the frames
+/// it has left.
+pub(crate) fn fade_step(fade: &mut Option<(u32, u32)>, n: usize) -> (f32, f32, Option<usize>) {
+    match fade {
+        None => (1.0, 1.0, None),
+        Some((left, total)) => {
+            let frames = *left as usize;
+            let total = *total as f32;
+            *left = left.saturating_sub(n as u32);
+            (
+                frames as f32 / total,
+                (frames as f32 - n as f32) / total,
+                Some(frames),
+            )
+        }
     }
 }
 

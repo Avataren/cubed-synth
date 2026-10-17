@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use crate::clip::{Clip, ClipVoice};
 use crate::command::{
-    BusId, BusSettings, Capture, ClipId, Command, Event, Play, Returned, SendSettings, Start,
-    VoiceId,
+    BusId, BusSettings, Capture, ClipId, Command, Event, Play, PlaySource, Returned, SendSettings,
+    SourceId, Start, VoiceId,
 };
 use crate::insert::Insert;
-use crate::smooth::{balance, block_coeff, db_to_gain, Smoothed};
+use crate::smooth::{balance, block_coeff, db_to_gain, GainRamp, Smoothed};
+use crate::source::{Source, SourceVoice, Voice};
 use crate::spatial::{add_scaled, Hearing, Listener, SpatialVoice};
 
 /// Insert slots per bus.
@@ -33,6 +34,8 @@ pub struct MixerConfig {
     pub max_voices: usize,
     pub max_buses: usize,
     pub max_clips: usize,
+    /// Prepared-source slots (`Command::PrepareSource`).
+    pub max_sources: usize,
     /// Events kept between `drain_events` calls; more are dropped and counted.
     pub max_events: usize,
     /// Released objects kept between `take_returned` calls; more are freed
@@ -48,6 +51,7 @@ impl Default for MixerConfig {
             max_voices: 128,
             max_buses: 32,
             max_clips: 4096,
+            max_sources: 16,
             max_events: 512,
             max_returned: 256,
         }
@@ -104,6 +108,12 @@ struct Bus {
     meter: BusMeter,
     /// Mean squares behind `meter.rms`.
     mean_square: [f32; 2],
+    /// The last block's peak after the fader, for buses this one ducks.
+    level: f32,
+    /// How far ducking has the bus down at the end of this block and at its
+    /// start (linear, 1 = not at all).
+    duck_gain: f32,
+    duck_start: f32,
 }
 
 impl Bus {
@@ -122,6 +132,9 @@ impl Bus {
             silent_frames: 0,
             meter: BusMeter::default(),
             mean_square: [0.0; 2],
+            level: 0.0,
+            duck_gain: 1.0,
+            duck_start: 1.0,
         }
     }
 
@@ -149,7 +162,7 @@ struct VoiceSlot {
     /// Start order, for stealing the oldest of equal priority.
     serial: u64,
     start_frame: u64,
-    voice: ClipVoice,
+    voice: Voice,
 }
 
 /// The mixer: apply commands between blocks, render blocks with `process`.
@@ -161,9 +174,11 @@ pub struct Mixer {
     /// comes last.
     order: Vec<usize>,
     clips: Vec<Option<Arc<Clip>>>,
+    sources: Vec<Option<Box<dyn Source>>>,
     voices: Vec<Option<VoiceSlot>>,
     serial: u64,
     scratch: Vec<f32>,
+    scratch_right: Vec<f32>,
     events: Vec<Event>,
     returned: Vec<Returned>,
     capture: Option<Box<Capture>>,
@@ -198,9 +213,11 @@ impl Mixer {
             buses,
             order,
             clips: (0..config.max_clips).map(|_| None).collect(),
+            sources: (0..config.max_sources).map(|_| None).collect(),
             voices: (0..config.max_voices).map(|_| None).collect(),
             serial: 0,
             scratch: vec![0.0; config.max_block],
+            scratch_right: vec![0.0; config.max_block],
             events: Vec::with_capacity(config.max_events),
             returned: Vec::with_capacity(config.max_returned),
             capture: None,
@@ -287,6 +304,18 @@ impl Mixer {
                     _ => self.stats.rejected_commands += 1,
                 }
             }
+            Command::SetInsertParam {
+                bus,
+                slot,
+                param,
+                value,
+            } => match self
+                .used_bus(bus)
+                .and_then(|b| self.buses[b].inserts.get_mut(slot as usize))
+            {
+                Some(Some(insert)) => insert.insert.set_param(param as usize, value),
+                _ => self.stats.rejected_commands += 1,
+            },
             Command::SetSend { bus, slot, send } => self.set_send(bus, slot, send),
             Command::AddClip(id, clip) => self.add_clip(id, clip),
             Command::RemoveClip(id) => {
@@ -294,16 +323,40 @@ impl Mixer {
                     self.stats.rejected_commands += 1;
                     return;
                 };
-                self.end_voices(|v| v.voice.clip == id.0 as usize);
+                self.end_voices(|v| v.voice.clip() == Some(id.0 as usize));
                 self.give_back(Returned::Clip(old));
             }
             Command::Play(play) => self.play(play),
-            Command::SetVoiceGain(id, gain) => {
-                self.with_voice(id, |v| v.voice.gain.set(gain.max(0.0)))
+            Command::PrepareSource(id, source) => {
+                let Some(slot) = self.sources.get_mut(id.0 as usize) else {
+                    self.stats.rejected_commands += 1;
+                    self.give_back(Returned::Source(source));
+                    return;
+                };
+                if let Some(old) = slot.replace(source) {
+                    self.give_back(Returned::Source(old));
+                }
             }
+            Command::PlaySource(play) => self.play_source(play),
+            Command::SetVoiceGain(id, gain) => self.with_voice(id, |v| {
+                *v.voice.ramp() = None;
+                v.voice.gain().set(gain.max(0.0));
+            }),
+            Command::FadeVoice {
+                voice,
+                gain,
+                frames,
+            } => self.with_voice(voice, |v| {
+                if frames == 0 {
+                    *v.voice.ramp() = None;
+                    v.voice.gain().set(gain.max(0.0));
+                } else {
+                    *v.voice.ramp() = Some(GainRamp::new(gain, frames));
+                }
+            }),
             Command::SetVoicePitch(id, pitch) => self.with_voice(id, |v| v.voice.set_pitch(pitch)),
             Command::SetVoicePan(id, pan) => {
-                self.with_voice(id, |v| v.voice.pan.set(pan.clamp(-1.0, 1.0)))
+                self.with_voice(id, |v| v.voice.pan().set(pan.clamp(-1.0, 1.0)))
             }
             Command::Stop(id, fade) => self.with_voice(id, |v| v.voice.stop(fade)),
             Command::StopBus(bus, fade) => {
@@ -326,7 +379,7 @@ impl Mixer {
             }
             Command::SetVoiceSpatial(id, spatial) => {
                 let frame = self.frame;
-                self.with_voice(id, |v| match (spatial, &mut v.voice.spatial) {
+                self.with_voice(id, |v| match (spatial, v.voice.spatial()) {
                     (Some(params), Some(state)) => {
                         state.params = params;
                         state.updated_at = frame;
@@ -342,7 +395,7 @@ impl Mixer {
             } => {
                 let frame = self.frame;
                 self.with_voice(voice, |v| {
-                    if let Some(state) = &mut v.voice.spatial {
+                    if let Some(state) = v.voice.spatial() {
                         state.params.position = position;
                         state.params.velocity = velocity;
                         state.updated_at = frame;
@@ -388,7 +441,10 @@ impl Mixer {
         let old = slot.settings;
         slot.used = true;
         slot.settings = settings;
-        if !self.output_is_valid(index) || !self.rebuild_order() {
+        let duck_ok = settings
+            .duck
+            .is_none_or(|d| d.key.0 as usize != index && (d.key.0 as usize) < self.buses.len());
+        if !duck_ok || !self.output_is_valid(index) || !self.rebuild_order() {
             let slot = &mut self.buses[index];
             slot.used = was_used;
             slot.settings = old;
@@ -403,6 +459,9 @@ impl Mixer {
             slot.silent_frames = 0;
             slot.meter = BusMeter::default();
             slot.mean_square = [0.0; 2];
+            slot.level = 0.0;
+            slot.duck_gain = 1.0;
+            slot.duck_start = 1.0;
             slot.pan.snap(settings.pan.clamp(-1.0, 1.0));
         } else {
             slot.pan.set(settings.pan.clamp(-1.0, 1.0));
@@ -619,7 +678,7 @@ impl Mixer {
             return;
         }
         if let Some(old) = self.clips[index].replace(clip) {
-            self.end_voices(|v| v.voice.clip == index);
+            self.end_voices(|v| v.voice.clip() == Some(index));
             self.give_back(Returned::Clip(old));
         }
     }
@@ -635,6 +694,84 @@ impl Mixer {
             self.emit(Event::Rejected(play.voice));
             return;
         };
+        let Some(slot) = self.allocate_voice(bus, play.priority, play.voice) else {
+            return;
+        };
+        let start_frame = self.start_frame(play.start);
+        let voice = ClipVoice::new(
+            play.clip.0 as usize,
+            clip_rate,
+            self.config.sample_rate,
+            play.gain,
+            play.pitch,
+            play.pan,
+            play.looped,
+            play.spatial.map(|s| (s, start_frame)),
+        );
+        self.place_voice(
+            slot,
+            play.voice,
+            bus,
+            play.priority,
+            start_frame,
+            Voice::Clip(voice),
+        );
+    }
+
+    fn play_source(&mut self, play: PlaySource) {
+        let ready = self
+            .sources
+            .get(play.source.0 as usize)
+            .is_some_and(|s| s.is_some());
+        let (true, Some(bus)) = (ready, self.used_bus(play.bus)) else {
+            self.stats.rejected_commands += 1;
+            self.emit(Event::Rejected(play.voice));
+            return;
+        };
+        let slot = self.allocate_voice(bus, play.priority, play.voice);
+        let source = self.sources[play.source.0 as usize]
+            .take()
+            .expect("checked");
+        let Some(slot) = slot else {
+            // It was prepared for this play: let it go.
+            self.give_back(Returned::Source(source));
+            return;
+        };
+        let start_frame = self.start_frame(play.start);
+        let voice = SourceVoice::new(
+            source,
+            play.gain,
+            play.pan,
+            play.spatial.map(|s| (s, start_frame)),
+        );
+        self.place_voice(
+            slot,
+            play.voice,
+            bus,
+            play.priority,
+            start_frame,
+            Voice::Source(voice),
+        );
+    }
+
+    /// Whether a prepared source is waiting in the slot.
+    pub fn is_prepared(&self, source: SourceId) -> bool {
+        self.sources
+            .get(source.0 as usize)
+            .is_some_and(|s| s.is_some())
+    }
+
+    fn start_frame(&self, start: Start) -> u64 {
+        match start {
+            Start::Now => self.frame,
+            Start::AtFrame(frame) => frame.max(self.frame),
+        }
+    }
+
+    /// A voice slot for a new voice on `bus`: a free one, or one stolen from
+    /// a voice of no higher priority (the bus's own when it is at its
+    /// limit). `None` (and the new voice rejected) when there is none.
+    fn allocate_voice(&mut self, bus: usize, priority: u8, voice: VoiceId) -> Option<usize> {
         let limit = self.buses[bus].settings.voice_limit as usize;
         let mut on_bus = 0;
         let mut free = None;
@@ -663,40 +800,41 @@ impl Mixer {
             }
         }
         let slot = if on_bus >= limit {
-            weakest_on_bus.filter(|&(_, p, _)| p <= play.priority)
+            weakest_on_bus.filter(|&(_, p, _)| p <= priority)
         } else if free.is_some() {
             free.map(|i| (i, 0, 0))
         } else {
-            weakest.filter(|&(_, p, _)| p <= play.priority)
+            weakest.filter(|&(_, p, _)| p <= priority)
         };
         let Some((slot, _, _)) = slot else {
-            self.emit(Event::Rejected(play.voice));
-            return;
+            self.emit(Event::Rejected(voice));
+            return None;
         };
         if let Some(stolen) = self.voices[slot].take() {
-            self.emit(Event::Stolen(stolen.id));
+            let id = stolen.id;
+            retire(&mut self.returned, &mut self.stats, stolen);
+            self.emit(Event::Stolen(id));
         }
+        Some(slot)
+    }
+
+    fn place_voice(
+        &mut self,
+        slot: usize,
+        id: VoiceId,
+        bus: usize,
+        priority: u8,
+        start_frame: u64,
+        voice: Voice,
+    ) {
         self.serial += 1;
-        let start_frame = match play.start {
-            Start::Now => self.frame,
-            Start::AtFrame(frame) => frame.max(self.frame),
-        };
         self.voices[slot] = Some(VoiceSlot {
-            id: play.voice,
+            id,
             bus,
-            priority: play.priority,
+            priority,
             serial: self.serial,
             start_frame,
-            voice: ClipVoice::new(
-                play.clip.0 as usize,
-                clip_rate,
-                self.config.sample_rate,
-                play.gain,
-                play.pitch,
-                play.pan,
-                play.looped,
-                play.spatial.map(|s| (s, start_frame)),
-            ),
+            voice,
         });
     }
 
@@ -717,7 +855,9 @@ impl Mixer {
     fn end_voices(&mut self, matches: impl Fn(&VoiceSlot) -> bool) {
         for i in 0..self.voices.len() {
             if self.voices[i].as_ref().is_some_and(&matches) {
-                let id = self.voices[i].take().expect("checked").id;
+                let voice = self.voices[i].take().expect("checked");
+                let id = voice.id;
+                retire(&mut self.returned, &mut self.stats, voice);
                 self.emit(Event::Ended(id));
             }
         }
@@ -728,12 +868,7 @@ impl Mixer {
     }
 
     fn give_back(&mut self, item: Returned) {
-        if self.returned.len() < self.returned.capacity() {
-            self.returned.push(item);
-        } else {
-            self.stats.freed_on_audio_thread += 1;
-            drop(item);
-        }
+        give_back(&mut self.returned, &mut self.stats, item);
     }
 
     // --- Rendering -----------------------------------------------------
@@ -759,7 +894,9 @@ impl Mixer {
             clips,
             voices,
             scratch,
+            scratch_right,
             events,
+            returned,
             stats,
             frame,
             ..
@@ -780,32 +917,66 @@ impl Mixer {
                 playing += 1;
                 continue;
             }
-            let Some(clip) = clips.get(v.voice.clip).and_then(|c| c.as_deref()) else {
-                // Unreachable: a clip's voices end when it goes.
-                let id = v.id;
-                *slot = None;
-                push_event(events, stats, Event::Ended(id));
-                continue;
-            };
             let bus = &mut buses[v.bus];
-            let alive = v.voice.render(
-                clip,
-                &mut bus.left[offset..n],
-                &mut bus.right[offset..n],
-                &mut scratch[..n - offset],
-                coeff,
-                &hearing,
-            );
+            let alive = match &mut v.voice {
+                Voice::Clip(voice) => match clips.get(voice.clip).and_then(|c| c.as_deref()) {
+                    Some(clip) => voice.render(
+                        clip,
+                        &mut bus.left[offset..n],
+                        &mut bus.right[offset..n],
+                        &mut scratch[..n - offset],
+                        coeff,
+                        &hearing,
+                    ),
+                    // Unreachable: a clip's voices end when it goes.
+                    None => false,
+                },
+                Voice::Source(voice) => voice.render(
+                    &mut bus.left[offset..n],
+                    &mut bus.right[offset..n],
+                    (&mut scratch[..n - offset], &mut scratch_right[..n - offset]),
+                    coeff,
+                    &hearing,
+                ),
+            };
             bus.has_input = true;
             if alive {
                 playing += 1;
             } else {
-                let id = v.id;
-                *slot = None;
+                let ended = slot.take().expect("matched above");
+                let id = ended.id;
+                retire(returned, stats, ended);
                 push_event(events, stats, Event::Ended(id));
             }
         }
         stats.voices = playing;
+
+        // Ducking follows the key bus's level in the last block, so it does
+        // not depend on which of the two renders first.
+        for b in 0..buses.len() {
+            let Some(duck) = buses[b].settings.duck.filter(|_| buses[b].used) else {
+                buses[b].duck_gain = 1.0;
+                continue;
+            };
+            let key_level = buses
+                .get(duck.key.0 as usize)
+                .filter(|k| k.used)
+                .map_or(0.0, |k| k.level);
+            let target = if key_level > db_to_gain(duck.threshold_db) {
+                db_to_gain(-duck.depth_db.max(0.0))
+            } else {
+                1.0
+            };
+            let bus = &mut buses[b];
+            let ms = if target < bus.duck_gain {
+                duck.attack_ms
+            } else {
+                duck.release_ms
+            };
+            let keep = (-(n as f32) / (ms.max(0.1) * 0.001 * sample_rate)).exp();
+            bus.duck_start = bus.duck_gain;
+            bus.duck_gain = target + (bus.duck_gain - target) * keep;
+        }
 
         // Buses, each before the buses it feeds.
         let tail_frames = (TAIL_SECONDS * sample_rate) as usize;
@@ -820,6 +991,11 @@ impl Mixer {
             }
             let idle = bus.silent_frames > tail_frames;
             let (gain_start, gain_end) = bus.gain.advance(coeff);
+            let (gain_start, gain_end) = if bus.settings.duck.is_some() {
+                (gain_start * bus.duck_start, gain_end * bus.duck_gain)
+            } else {
+                (gain_start, gain_end)
+            };
             let (pan_start, pan_end) = bus.pan.advance(coeff);
             let mut send_ramps = [(0.0f32, 0.0f32); MAX_SENDS];
             for (ramp, send) in send_ramps.iter_mut().zip(bus.sends.iter_mut()) {
@@ -874,6 +1050,24 @@ impl Mixer {
             }
         }
         self.frame += n as u64;
+    }
+}
+
+fn give_back(returned: &mut Vec<Returned>, stats: &mut Stats, item: Returned) {
+    if returned.len() < returned.capacity() {
+        returned.push(item);
+    } else {
+        stats.freed_on_audio_thread += 1;
+        drop(item);
+    }
+}
+
+/// Lets go of an ended voice: a source goes back to the host.
+fn retire(returned: &mut Vec<Returned>, stats: &mut Stats, mut slot: VoiceSlot) {
+    if let Voice::Source(voice) = &mut slot.voice {
+        if let Some(source) = voice.source.take() {
+            give_back(returned, stats, Returned::Source(source));
+        }
     }
 }
 
@@ -938,6 +1132,7 @@ fn fader(left: &mut [f32], right: &mut [f32], gain: (f32, f32), pan: (f32, f32))
 }
 
 fn meter(bus: &mut Bus, n: usize, peak_fall: f32, rms_keep: f32, idle: bool) {
+    bus.level = 0.0;
     for (c, buffer) in [&bus.left[..n], &bus.right[..n]].into_iter().enumerate() {
         let (peak, sum) = if idle {
             (0.0, 0.0)
@@ -946,6 +1141,7 @@ fn meter(bus: &mut Bus, n: usize, peak_fall: f32, rms_keep: f32, idle: bool) {
                 .iter()
                 .fold((0f32, 0f32), |(p, s), &x| (p.max(x.abs()), s + x * x))
         };
+        bus.level = bus.level.max(peak);
         bus.meter.peak[c] = peak.max(bus.meter.peak[c] * peak_fall);
         let ms = sum / n as f32;
         bus.mean_square[c] = bus.mean_square[c] * rms_keep + ms * (1.0 - rms_keep);

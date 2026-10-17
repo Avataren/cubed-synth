@@ -9,7 +9,11 @@
 //! 2. Commands arrive as [`cubed_mixer::wire`] bytes: write them at
 //!    `cw_inbox(len)` and call `cw_apply(len)`.
 //! 3. Clips arrive as PCM: write it at `cw_clip_buffer(frames, channels)`
-//!    (and `cw_clip_right()` for stereo), then `cw_add_clip`.
+//!    (and `cw_clip_right()` for stereo), then `cw_add_clip`. Songs arrive
+//!    as files: write one at `cw_file_buffer(len)`, then `cw_prepare_song`
+//!    makes it a prepared source for a `PlaySource` command. Effects arrive
+//!    as a kind and parameters: write them at `cw_effect_params()`, then
+//!    `cw_set_effect`.
 //! 4. Each render quantum, `cw_process(frames)` renders into `cw_left()` and
 //!    `cw_right()`; events (`cw_events`, encoded with `wire::encode_event`),
 //!    meters (`cw_meters`, 5 floats per bus: exists, peak L/R, RMS L/R) and
@@ -21,7 +25,10 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
-use cubed_mixer::{wire, BusId, Clip, ClipId, Command, Mixer, MixerConfig, Returned};
+use cubed_mixer::effects::MAX_PARAMS;
+use cubed_mixer::{
+    wire, BusId, Clip, ClipId, Command, Effect, EffectKind, Mixer, MixerConfig, Returned,
+};
 
 /// The Web Audio render quantum.
 pub const BLOCK: usize = 128;
@@ -37,6 +44,11 @@ struct State {
     inbox: Vec<u8>,
     clip_left: Vec<f32>,
     clip_right: Vec<f32>,
+    /// A song file on its way to `cw_prepare_song`.
+    file: Vec<u8>,
+    effect_params: [f32; MAX_PARAMS],
+    /// Why the last `cw_prepare_song` failed, as ASCII.
+    error: Vec<u8>,
     events: Vec<u8>,
     meters: Vec<f32>,
     /// Objects the mixer let go of during rendering, freed by the next
@@ -90,6 +102,9 @@ pub extern "C" fn cw_init(
         inbox: Vec::new(),
         clip_left: Vec::new(),
         clip_right: Vec::new(),
+        file: Vec::new(),
+        effect_params: [0.0; MAX_PARAMS],
+        error: Vec::new(),
         events: Vec::with_capacity(MAX_EVENTS * wire::EVENT_SIZE),
         meters: vec![0.0; buses * METER_FIELDS],
         released: Vec::with_capacity(released),
@@ -215,6 +230,106 @@ pub extern "C" fn cw_add_clip(id: u32, sample_rate: f32, frames: u32, channels: 
     s.mixer.apply(Command::AddClip(ClipId(id), Arc::new(clip)));
 }
 
+/// Room for a song file of `len` bytes; write it there, then call
+/// `cw_prepare_song`.
+#[no_mangle]
+pub extern "C" fn cw_file_buffer(len: u32) -> *mut u8 {
+    let file = &mut state().file;
+    file.resize(len as usize, 0);
+    file.as_mut_ptr()
+}
+
+/// Builds the song written at `cw_file_buffer` as prepared source `source`.
+/// `format` 0 is AHX/HVL, 1 A2M, 2 SID. Returns 1 on success; on failure 0,
+/// with the reason at `cw_error`.
+#[no_mangle]
+pub extern "C" fn cw_prepare_song(source: u32, format: u32, subsong: u32, looped: u32) -> u32 {
+    let s = state();
+    s.released.clear();
+    s.error.clear();
+    match prepare_song(s, source, format, subsong as usize, looped != 0) {
+        Ok(()) => 1,
+        Err(why) => {
+            s.error.extend(
+                why.chars()
+                    .map(|c| if c.is_ascii() { c as u8 } else { b'?' }),
+            );
+            0
+        }
+    }
+}
+
+#[cfg(feature = "songs")]
+fn prepare_song(
+    s: &mut State,
+    source: u32,
+    format: u32,
+    subsong: usize,
+    looped: bool,
+) -> Result<(), String> {
+    use cubed_mixer::songs::{open_song, SongFormat, SongOptions};
+    let format = match format {
+        0 => SongFormat::Ahx,
+        1 => SongFormat::A2m,
+        2 => SongFormat::Sid,
+        other => return Err(format!("unknown song format {other}")),
+    };
+    let rate = s.mixer.config().sample_rate;
+    let song = open_song(format, &s.file, rate, SongOptions { subsong, looped })?;
+    s.mixer
+        .apply(Command::PrepareSource(cubed_mixer::SourceId(source), song));
+    Ok(())
+}
+
+#[cfg(not(feature = "songs"))]
+fn prepare_song(_: &mut State, _: u32, _: u32, _: usize, _: bool) -> Result<(), String> {
+    Err("this build of cubed-worklet plays no songs".into())
+}
+
+/// The reason the last `cw_prepare_song` failed (`cw_error_len` bytes).
+#[no_mangle]
+pub extern "C" fn cw_error() -> *const u8 {
+    state().error.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn cw_error_len() -> u32 {
+    state().error.len() as u32
+}
+
+/// Where `cw_set_effect` reads its parameters: `MAX_PARAMS` floats, in the
+/// order of the effect's parameter list.
+#[no_mangle]
+pub extern "C" fn cw_effect_params() -> *mut f32 {
+    state().effect_params.as_mut_ptr()
+}
+
+/// Puts built-in effect `kind` (`EffectKind::index`) with the parameters at
+/// `cw_effect_params` in insert `slot` of `bus`; any other kind empties the
+/// slot. Returns 1 if an effect was built.
+#[no_mangle]
+pub extern "C" fn cw_set_effect(bus: u32, slot: u32, kind: u32) -> u32 {
+    let s = state();
+    s.released.clear();
+    let insert = u8::try_from(kind)
+        .ok()
+        .and_then(EffectKind::from_index)
+        .map(|kind| {
+            Effect {
+                kind,
+                params: s.effect_params,
+            }
+            .build(s.mixer.config().sample_rate, BLOCK)
+        });
+    let built = insert.is_some() as u32;
+    s.mixer.apply(Command::SetInsert {
+        bus: BusId(bus as u16),
+        slot: slot as u8,
+        insert,
+    });
+    built
+}
+
 /// The encoded events since `cw_clear_events`.
 #[no_mangle]
 pub extern "C" fn cw_events() -> *const u8 {
@@ -270,10 +385,18 @@ mod tests {
     use super::*;
     use cubed_mixer::{BusSettings, Play, VoiceId};
 
+    /// The exports share one global mixer, so the tests take turns.
+    static EXPORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn exports() -> std::sync::MutexGuard<'static, ()> {
+        EXPORTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The exports driven the way the worklet does: init, a bus, a clip, a
     /// play, render, read events and meters.
     #[test]
     fn the_exports_play_a_clip() {
+        let _turn = exports();
         cw_init(48_000.0, 0, 0, 0, 1, 2);
         let mut bytes = Vec::new();
         wire::encode(
@@ -313,5 +436,58 @@ mod tests {
         assert_eq!(cw_events_len(), 0);
         assert_eq!(cw_frame(), 256.0);
         assert_eq!(cw_bad_batches(), 0);
+    }
+
+    fn send(command: Command) {
+        let mut bytes = Vec::new();
+        assert!(wire::encode(&command, &mut bytes));
+        let inbox = cw_inbox(bytes.len() as u32);
+        // SAFETY: cw_inbox made room for the bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), inbox, bytes.len()) };
+        assert_eq!(cw_apply(bytes.len() as u32), 1);
+    }
+
+    /// A song file through the exports, on a bus with a built effect.
+    #[cfg(feature = "songs")]
+    #[test]
+    fn the_exports_play_a_song_through_an_effect() {
+        use cubed_mixer::{PlaySource, SourceId};
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 3, 4);
+        send(Command::SetBus(BusId(2), BusSettings::default()));
+
+        let song = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ahx/tests/fixtures/songs/a_new_beginning.ahx"
+        ))
+        .unwrap();
+        let at = cw_file_buffer(song.len() as u32);
+        // SAFETY: cw_file_buffer made room for the file.
+        unsafe { std::ptr::copy_nonoverlapping(song.as_ptr(), at, song.len()) };
+        assert_eq!(cw_prepare_song(0, 0, 0, 1), 1);
+        assert_eq!(cw_prepare_song(1, 9, 0, 1), 0, "unknown format");
+        let error = unsafe { std::slice::from_raw_parts(cw_error(), cw_error_len() as usize) };
+        assert!(std::str::from_utf8(error).unwrap().contains("format"));
+
+        // SAFETY: cw_effect_params holds MAX_PARAMS floats.
+        let params = unsafe { std::slice::from_raw_parts_mut(cw_effect_params(), MAX_PARAMS) };
+        params.copy_from_slice(&Effect::new(EffectKind::LowPass).params);
+        assert_eq!(cw_set_effect(2, 0, EffectKind::LowPass.index() as u32), 1);
+
+        send(Command::PlaySource(PlaySource::new(
+            VoiceId(1),
+            SourceId(0),
+            BusId(2),
+        )));
+        let mut energy = 0.0;
+        for _ in 0..400 {
+            cw_process(128);
+            let left = unsafe { std::slice::from_raw_parts(cw_left(), BLOCK) };
+            energy += left.iter().map(|s| s * s).sum::<f32>();
+        }
+        assert!(energy > 1.0, "the song is heard: {energy}");
+        assert_eq!(cw_voices(), 1);
+        assert_eq!(cw_set_effect(2, 0, 255), 0, "empties the slot");
+        assert_eq!(cw_rejected(), 0);
     }
 }

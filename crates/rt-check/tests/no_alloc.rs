@@ -15,9 +15,11 @@ use cubed_dsp::nodes::{
     Freeverb, Limiter, Saturation, Waveform,
 };
 use cubed_dsp::{AutomationFrame, PortId};
+use cubed_mixer::songs::{open_song, SongFormat, SongOptions};
 use cubed_mixer::{
-    BusId, BusSettings, Clip, ClipId, Command, DspInsert, Listener, Mixer, MixerConfig, Play,
-    SendSettings, Spatial, SpatialMode, Start, VoiceId,
+    BusId, BusSettings, Clip, ClipId, Command, DspInsert, Duck, Effect, EffectKind, Listener,
+    Mixer, MixerConfig, Play, PlaySource, SendSettings, SourceId, Spatial, SpatialMode, Start,
+    VoiceId,
 };
 use cubed_opl::a2::player::A2Player;
 use cubed_rt_check::{allocations_during, trace_allocations, CountingAllocator};
@@ -352,4 +354,139 @@ fn mixer() {
         mixer.drain_events(|_| {});
         mixer.take_returned(drop);
     });
+}
+
+/// Songs through the mixer, counted from their first block (the songs are
+/// built and warmed up off the audio thread): two at a time crossfading on
+/// a music bus that ducks under effects, through every built-in effect with
+/// its parameters moving.
+#[test]
+fn mixer_songs() {
+    let rate = RATE as f32;
+    let songs = [
+        (
+            "ahx/tests/fixtures/songs/a_new_beginning.ahx",
+            SongFormat::Ahx,
+        ),
+        (
+            "ahx/tests/fixtures/songs/a_little_cyberfunk.hvl",
+            SongFormat::Ahx,
+        ),
+        (
+            "opl/tests/fixtures/a2m/NAB622/corridors of time.a2m",
+            SongFormat::A2m,
+        ),
+        ("sid/tests/fixtures/sid/s3-chain.asid", SongFormat::Sid),
+    ];
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        ..MixerConfig::default()
+    });
+    let (sfx, music) = (BusId(1), BusId(2));
+    mixer.apply(Command::SetBus(sfx, BusSettings::default()));
+    mixer.apply(Command::SetBus(
+        music,
+        BusSettings {
+            duck: Some(Duck::new(sfx, 9.0)),
+            ..BusSettings::default()
+        },
+    ));
+    mixer.apply(Command::AddClip(
+        ClipId(0),
+        std::sync::Arc::new(Clip::mono(rate, vec![0.3; 6_000])),
+    ));
+    for (slot, kind) in EffectKind::ALL.into_iter().take(8).enumerate() {
+        mixer.apply(Command::SetInsert {
+            bus: music,
+            slot: slot as u8,
+            insert: Some(Effect::new(kind).build(rate, BLOCK)),
+        });
+    }
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let fade = RATE / 2;
+    for (i, (path, format)) in songs.into_iter().enumerate() {
+        let song = open_song(format, &fixture(path), rate, SongOptions::default())
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        let voice = VoiceId(100 + i as u64);
+        mixer.apply(Command::PrepareSource(SourceId(i as u32 % 2), song));
+        let events = allocations_during(|| {
+            mixer.apply(Command::PlaySource(PlaySource {
+                gain: 0.0,
+                ..PlaySource::new(voice, SourceId(i as u32 % 2), music)
+            }));
+            mixer.apply(Command::FadeVoice {
+                voice,
+                gain: 1.0,
+                frames: fade,
+            });
+            if i > 0 {
+                mixer.apply(Command::Stop(VoiceId(99 + i as u64), fade));
+            }
+            for block in 0..3 * BLOCKS_PER_SECOND {
+                let sweep = (block % 100) as f32 / 100.0;
+                for slot in 0..8 {
+                    mixer.apply(Command::SetInsertParam {
+                        bus: music,
+                        slot,
+                        param: (block % 3) as u8,
+                        value: 0.2 + sweep * 900.0,
+                    });
+                }
+                if block % 50 == 0 {
+                    mixer.apply(Command::Play(Play::new(
+                        VoiceId(block as u64),
+                        ClipId(0),
+                        sfx,
+                    )));
+                }
+                mixer.process(&mut left, &mut right);
+                mixer.drain_events(|_| {});
+            }
+        });
+        assert_eq!(events, 0, "{path}: {events} allocations or frees");
+        // Ended songs come back to be freed here, off the audio thread.
+        mixer.take_returned(drop);
+    }
+}
+
+/// A stream through the mixer while another thread pushes frames into it.
+#[test]
+fn mixer_stream() {
+    let rate = RATE as f32;
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        ..MixerConfig::default()
+    });
+    mixer.apply(Command::SetBus(BusId(1), BusSettings::default()));
+    let (mut writer, stream) = cubed_mixer::stream::stream(48_000, 44_100.0, rate);
+    let feeder = std::thread::spawn(move || {
+        let chunk: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+        let mut pushed = 0;
+        while pushed < 44_100 * 6 && !writer.is_abandoned() {
+            let n = writer.push(&chunk);
+            pushed += n;
+            if n == 0 {
+                std::thread::yield_now();
+            }
+        }
+        writer.finish();
+    });
+    mixer.apply(Command::PrepareSource(SourceId(0), Box::new(stream)));
+    mixer.apply(Command::PlaySource(PlaySource::new(
+        VoiceId(1),
+        SourceId(0),
+        BusId(1),
+    )));
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    // Counted on this thread only (the counter is per thread).
+    let mut ended = false;
+    while !ended {
+        let events = allocations_during(|| mixer.process(&mut left, &mut right));
+        assert_eq!(events, 0, "a stream block allocated or freed");
+        mixer.drain_events(|e| ended |= e == cubed_mixer::Event::Ended(VoiceId(1)));
+        assert!(mixer.frame() < RATE as u64 * 20, "the stream never ended");
+    }
+    mixer.take_returned(drop);
+    feeder.join().unwrap();
 }

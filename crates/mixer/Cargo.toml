@@ -13,9 +13,15 @@ default = []
 # Output to the default audio device through cpal, with lock-free rings
 # between the game thread and the audio callback (`native::NativeHost`).
 native = ["dep:cpal", "dep:rtrb"]
+# Chip-music songs as sources: AHX/HVL, Adlib Tracker II and SID songs
+# (`songs::open_song`).
+songs = ["dep:cubed-ahx", "dep:cubed-opl", "dep:cubed-sid"]
 
 [dependencies]
 cubed-dsp = { path = "../dsp" }
+cubed-ahx = { path = "../ahx", optional = true }
+cubed-opl = { path = "../opl", optional = true }
+cubed-sid = { path = "../sid", optional = true }
 cpal = { version = "0.18", optional = true }
 rtrb = { version = "0.3", optional = true }
 

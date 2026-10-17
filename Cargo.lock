@@ -169,7 +169,10 @@ name = "cubed-mixer"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "cubed-ahx",
  "cubed-dsp",
+ "cubed-opl",
+ "cubed-sid",
  "rtrb",
 ]
 

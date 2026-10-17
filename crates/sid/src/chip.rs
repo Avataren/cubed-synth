@@ -182,6 +182,10 @@ pub struct Chip {
     written: [u8; 32],
 }
 
+/// Scheduled writes a chip has room for before its queue grows: more than a
+/// player frame's worth.
+const PENDING_WRITES: usize = 64;
+
 /// All three voices heard: the mask of a powered-on chip.
 pub const ALL_VOICES: u8 = 0x07;
 
@@ -226,7 +230,8 @@ impl Chip {
             dc_y: 0.0,
             dc_r: (-2.0 * std::f64::consts::PI * DC_BLOCK_HZ / sample_rate).exp(),
             voice_mask: ALL_VOICES,
-            pending: Vec::new(),
+            // Room for a frame's writes, so the audio thread never grows it.
+            pending: Vec::with_capacity(PENDING_WRITES),
             written: [0; 32],
             trim: match model {
                 SidModel::Sid8580 => GAIN_TRIM_8580,
@@ -387,9 +392,12 @@ impl Chip {
     /// Applies every scheduled write at once, whatever its cycle: for a caller
     /// that steps a player without rendering audio and reads the registers.
     pub fn flush_writes(&mut self) {
-        for (_, reg, val) in std::mem::take(&mut self.pending) {
+        let mut pending = std::mem::take(&mut self.pending);
+        for &(_, reg, val) in &pending {
             self.write(reg, val);
         }
+        pending.clear();
+        self.pending = pending;
     }
 
     /// Applies every scheduled write whose cycle has come.

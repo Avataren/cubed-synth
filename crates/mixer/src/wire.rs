@@ -3,12 +3,13 @@
 //! and its AudioWorklet.
 //!
 //! Each message is a tag byte and fixed little-endian fields. Commands that
-//! carry objects (clips, inserts, recordings) have no encoding; a host sends
-//! their data its own way (the worklet takes clip PCM through its own
-//! export). Decoding never allocates.
+//! carry objects (clips, inserts, sources, recordings) have no encoding; a
+//! host sends their data its own way (the worklet takes clip PCM and song
+//! files through its own exports). Decoding never allocates.
 
 use crate::command::{
-    BusId, BusSettings, ClipId, Command, Event, Play, SendSettings, Start, VoiceId,
+    BusId, BusSettings, ClipId, Command, Duck, Event, Play, PlaySource, SendSettings, SourceId,
+    Start, VoiceId,
 };
 use crate::spatial::{Listener, Rolloff, Spatial, SpatialMode};
 
@@ -33,6 +34,9 @@ mod tag {
     pub const SET_LISTENER: u8 = 18;
     pub const VOICE_SPATIAL: u8 = 19;
     pub const VOICE_POSITION: u8 = 20;
+    pub const PLAY_SOURCE: u8 = 21;
+    pub const FADE_VOICE: u8 = 22;
+    pub const INSERT_PARAM: u8 = 23;
 
     pub const ENDED: u8 = 1;
     pub const STOLEN: u8 = 2;
@@ -43,7 +47,8 @@ mod tag {
 pub const EVENT_SIZE: usize = 9;
 
 /// Appends `command` to `out`. Returns false (and writes nothing) for the
-/// commands that carry objects: `SetInsert`, `AddClip` and `Capture`.
+/// commands that carry objects: `SetInsert`, `AddClip`, `PrepareSource` and
+/// `Capture`.
 pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
     let mut w = Writer(out);
     match command {
@@ -55,6 +60,17 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             w.f32(s.pan);
             w.u8(s.mute as u8 | (s.solo as u8) << 1);
             w.u16(s.voice_limit);
+            match &s.duck {
+                None => w.u8(0),
+                Some(d) => {
+                    w.u8(1);
+                    w.u16(d.key.0);
+                    w.f32(d.depth_db);
+                    w.f32(d.threshold_db);
+                    w.f32(d.attack_ms);
+                    w.f32(d.release_ms);
+                }
+            }
         }
         Command::RemoveBus(bus) => {
             w.u8(tag::REMOVE_BUS);
@@ -89,6 +105,18 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             w.u8(*slot);
             w.u8(*bypass as u8);
         }
+        Command::SetInsertParam {
+            bus,
+            slot,
+            param,
+            value,
+        } => {
+            w.u8(tag::INSERT_PARAM);
+            w.u16(bus.0);
+            w.u8(*slot);
+            w.u8(*param);
+            w.f32(*value);
+        }
         Command::RemoveClip(clip) => {
             w.u8(tag::REMOVE_CLIP);
             w.u32(clip.0);
@@ -103,17 +131,29 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             w.f32(p.pan);
             w.u8(p.looped as u8);
             w.u8(p.priority);
-            match p.start {
-                Start::Now => {
-                    w.u8(0);
-                    w.u64(0);
-                }
-                Start::AtFrame(frame) => {
-                    w.u8(1);
-                    w.u64(frame);
-                }
-            }
+            w.start(p.start);
             w.spatial(p.spatial.as_ref());
+        }
+        Command::PlaySource(p) => {
+            w.u8(tag::PLAY_SOURCE);
+            w.u64(p.voice.0);
+            w.u32(p.source.0);
+            w.u16(p.bus.0);
+            w.f32(p.gain);
+            w.f32(p.pan);
+            w.u8(p.priority);
+            w.start(p.start);
+            w.spatial(p.spatial.as_ref());
+        }
+        Command::FadeVoice {
+            voice,
+            gain,
+            frames,
+        } => {
+            w.u8(tag::FADE_VOICE);
+            w.u64(voice.0);
+            w.f32(*gain);
+            w.u32(*frames);
         }
         Command::SetListener(l) => {
             w.u8(tag::SET_LISTENER);
@@ -157,7 +197,10 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             w.u8(tag::STOP_ALL);
             w.u32(*fade);
         }
-        Command::SetInsert { .. } | Command::AddClip(..) | Command::Capture(_) => return false,
+        Command::SetInsert { .. }
+        | Command::AddClip(..)
+        | Command::PrepareSource(..)
+        | Command::Capture(_) => return false,
     }
     true
 }
@@ -244,6 +287,18 @@ impl Writer<'_> {
     fn vec3(&mut self, v: [f32; 3]) {
         v.iter().for_each(|&x| self.f32(x));
     }
+    fn start(&mut self, start: Start) {
+        match start {
+            Start::Now => {
+                self.u8(0);
+                self.u64(0);
+            }
+            Start::AtFrame(frame) => {
+                self.u8(1);
+                self.u64(frame);
+            }
+        }
+    }
     /// A presence byte, then the settings.
     fn spatial(&mut self, spatial: Option<&Spatial>) {
         let Some(s) = spatial else {
@@ -306,6 +361,27 @@ impl Reader<'_> {
     fn vec3(&mut self) -> Result<[f32; 3], WireError> {
         Ok([self.f32()?, self.f32()?, self.f32()?])
     }
+    fn start(&mut self) -> Result<Start, WireError> {
+        let kind = self.u8()?;
+        let frame = self.u64()?;
+        Ok(if kind == 1 {
+            Start::AtFrame(frame)
+        } else {
+            Start::Now
+        })
+    }
+    fn duck(&mut self) -> Result<Option<Duck>, WireError> {
+        if !self.bool()? {
+            return Ok(None);
+        }
+        Ok(Some(Duck {
+            key: self.bus()?,
+            depth_db: self.f32()?,
+            threshold_db: self.f32()?,
+            attack_ms: self.f32()?,
+            release_ms: self.f32()?,
+        }))
+    }
     fn spatial(&mut self) -> Result<Option<Spatial>, WireError> {
         if !self.bool()? {
             return Ok(None);
@@ -339,6 +415,7 @@ impl Reader<'_> {
                 let pan = self.f32()?;
                 let flags = self.u8()?;
                 let voice_limit = self.u16()?;
+                let duck = self.duck()?;
                 Command::SetBus(
                     bus,
                     BusSettings {
@@ -348,6 +425,7 @@ impl Reader<'_> {
                         mute: flags & 1 != 0,
                         solo: flags & 2 != 0,
                         voice_limit,
+                        duck,
                     },
                 )
             }
@@ -379,6 +457,12 @@ impl Reader<'_> {
                 slot: self.u8()?,
                 bypass: self.bool()?,
             },
+            tag::INSERT_PARAM => Command::SetInsertParam {
+                bus: self.bus()?,
+                slot: self.u8()?,
+                param: self.u8()?,
+                value: self.f32()?,
+            },
             tag::REMOVE_CLIP => Command::RemoveClip(ClipId(self.u32()?)),
             tag::PLAY => {
                 let voice = self.voice()?;
@@ -389,8 +473,7 @@ impl Reader<'_> {
                 let pan = self.f32()?;
                 let looped = self.bool()?;
                 let priority = self.u8()?;
-                let start_kind = self.u8()?;
-                let frame = self.u64()?;
+                let start = self.start()?;
                 let spatial = self.spatial()?;
                 Command::Play(Play {
                     voice,
@@ -401,14 +484,25 @@ impl Reader<'_> {
                     pan,
                     looped,
                     priority,
-                    start: if start_kind == 1 {
-                        Start::AtFrame(frame)
-                    } else {
-                        Start::Now
-                    },
+                    start,
                     spatial,
                 })
             }
+            tag::PLAY_SOURCE => Command::PlaySource(PlaySource {
+                voice: self.voice()?,
+                source: SourceId(self.u32()?),
+                bus: self.bus()?,
+                gain: self.f32()?,
+                pan: self.f32()?,
+                priority: self.u8()?,
+                start: self.start()?,
+                spatial: self.spatial()?,
+            }),
+            tag::FADE_VOICE => Command::FadeVoice {
+                voice: self.voice()?,
+                gain: self.f32()?,
+                frames: self.u32()?,
+            },
             tag::VOICE_GAIN => Command::SetVoiceGain(self.voice()?, self.f32()?),
             tag::VOICE_PITCH => Command::SetVoicePitch(self.voice()?, self.f32()?),
             tag::VOICE_PAN => Command::SetVoicePan(self.voice()?, self.f32()?),
@@ -464,8 +558,33 @@ mod tests {
                     mute: true,
                     solo: false,
                     voice_limit: 12,
+                    duck: None,
                 },
             ),
+            Command::SetBus(
+                bus,
+                BusSettings {
+                    duck: Some(Duck {
+                        threshold_db: -30.0,
+                        ..Duck::new(BusId(2), 9.0)
+                    }),
+                    ..BusSettings::default()
+                },
+            ),
+            Command::PlaySource(PlaySource {
+                gain: 0.0,
+                pan: 0.5,
+                priority: 200,
+                start: Start::AtFrame(99),
+                spatial: Some(Spatial::new(SpatialMode::Full, [1.0, 2.0, 3.0])),
+                ..PlaySource::new(voice, SourceId(3), bus)
+            }),
+            Command::PlaySource(PlaySource::new(voice, SourceId(0), BusId(1))),
+            Command::FadeVoice {
+                voice,
+                gain: 0.75,
+                frames: 96_000,
+            },
             Command::RemoveBus(bus),
             Command::SetBusGain(bus, -3.0),
             Command::SetBusPan(bus, -1.0),
@@ -490,6 +609,12 @@ mod tests {
                 bus,
                 slot: 2,
                 bypass: true,
+            },
+            Command::SetInsertParam {
+                bus,
+                slot: 3,
+                param: 1,
+                value: 0.4,
             },
             Command::RemoveClip(ClipId(77)),
             Command::Play(Play {
