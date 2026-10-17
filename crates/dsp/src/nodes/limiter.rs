@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap;
 use std::any::Any;
 
 use crate::graph::ModulationSource;
-use crate::traits::{AudioNode, PortId};
+use crate::traits::{AudioNode, PortId, StereoEffect};
 
 // --- Helper Functions ---
 #[inline(always)]
@@ -231,12 +231,67 @@ impl Limiter {
             return;
         }
 
-        let left_in = &left_in_slice[..process_len];
-        let right_in = &right_in_slice[..process_len];
         let (out_left, out_right) = (
             &mut out_left_full[..process_len],
             &mut out_right_full[..process_len],
         );
+        out_left.copy_from_slice(&left_in_slice[..process_len]);
+        out_right.copy_from_slice(&right_in_slice[..process_len]);
+        self.process_stereo(out_left, out_right);
+
+        // Zero any remaining tail past process_len
+        if process_len < out_left_full.len() {
+            out_left_full[process_len..].fill(0.0);
+        }
+        if process_len < out_right_full.len() {
+            out_right_full[process_len..].fill(0.0);
+        }
+    }
+
+    /// Resets the internal state of the Limiter node.
+    pub fn reset_state(&mut self) {
+        self.envelope_l = 0.0;
+        self.envelope_r = 0.0;
+        self.gain_reduction_l = 1.0;
+        self.gain_reduction_r = 1.0;
+
+        // Reset lookahead buffer state
+        self.lookahead_buffer_l.fill(0.0);
+        self.lookahead_buffer_r.fill(0.0);
+        self.lookahead_write_index = 0;
+
+        // Recalculate coefficients and linear threshold based on current targets
+        self.attack_coeff = calculate_smooth_coeff(self.target_attack_ms, self.sample_rate);
+        self.release_coeff = calculate_smooth_coeff(self.target_release_ms, self.sample_rate);
+        self.current_threshold_linear = db_to_linear(self.target_threshold_db);
+        // Note: Lookahead samples/delay remain unchanged unless explicitly recalculated.
+    }
+
+    // --- Methods required by AudioNode trait implementation below ---
+    fn node_type_str(&self) -> &str {
+        "limiter"
+    }
+    fn is_node_active(&self) -> bool {
+        self.enabled
+    }
+    fn set_node_active(&mut self, active: bool) {
+        if active && !self.enabled {
+            // Reset state when activating to avoid pops/clicks from old state
+            self.reset_state();
+        }
+        self.enabled = active;
+    }
+    fn as_any_internal_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn as_any_internal(&self) -> &dyn Any {
+        self
+    }
+} // impl Limiter
+
+impl StereoEffect for Limiter {
+    fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let process_len = left.len().min(right.len());
 
         // --- Core limiter state pulled into locals ---
         let threshold_lin = self.current_threshold_linear;
@@ -257,8 +312,8 @@ impl Limiter {
         let has_lookahead = read_delay > 0 && lookahead_buf_len > 1;
 
         for i in 0..process_len {
-            let input_l = left_in[i];
-            let input_r = right_in[i];
+            let input_l = left[i];
+            let input_r = right[i];
 
             // Lookahead
             let (delayed_l, delayed_r) = if has_lookahead {
@@ -330,8 +385,8 @@ impl Limiter {
             gain_reduction_r = gain_reduction_r.min(1.0);
 
             // Apply
-            out_left[i] = delayed_l * gain_reduction_l;
-            out_right[i] = delayed_r * gain_reduction_r;
+            left[i] = delayed_l * gain_reduction_l;
+            right[i] = delayed_r * gain_reduction_r;
         }
 
         // Write back state
@@ -342,56 +397,8 @@ impl Limiter {
         if has_lookahead {
             self.lookahead_write_index = write_idx;
         }
-
-        // Zero any remaining tail past process_len
-        if process_len < out_left_full.len() {
-            out_left_full[process_len..].fill(0.0);
-        }
-        if process_len < out_right_full.len() {
-            out_right_full[process_len..].fill(0.0);
-        }
     }
-
-    /// Resets the internal state of the Limiter node.
-    pub fn reset_state(&mut self) {
-        self.envelope_l = 0.0;
-        self.envelope_r = 0.0;
-        self.gain_reduction_l = 1.0;
-        self.gain_reduction_r = 1.0;
-
-        // Reset lookahead buffer state
-        self.lookahead_buffer_l.fill(0.0);
-        self.lookahead_buffer_r.fill(0.0);
-        self.lookahead_write_index = 0;
-
-        // Recalculate coefficients and linear threshold based on current targets
-        self.attack_coeff = calculate_smooth_coeff(self.target_attack_ms, self.sample_rate);
-        self.release_coeff = calculate_smooth_coeff(self.target_release_ms, self.sample_rate);
-        self.current_threshold_linear = db_to_linear(self.target_threshold_db);
-        // Note: Lookahead samples/delay remain unchanged unless explicitly recalculated.
-    }
-
-    // --- Methods required by AudioNode trait implementation below ---
-    fn node_type_str(&self) -> &str {
-        "limiter"
-    }
-    fn is_node_active(&self) -> bool {
-        self.enabled
-    }
-    fn set_node_active(&mut self, active: bool) {
-        if active && !self.enabled {
-            // Reset state when activating to avoid pops/clicks from old state
-            self.reset_state();
-        }
-        self.enabled = active;
-    }
-    fn as_any_internal_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-    fn as_any_internal(&self) -> &dyn Any {
-        self
-    }
-} // impl Limiter
+}
 
 // --- AudioNode Trait Implementation ---
 impl AudioNode for Limiter {
@@ -433,5 +440,8 @@ impl AudioNode for Limiter {
     }
     fn node_type(&self) -> &str {
         self.node_type_str()
+    }
+    fn as_stereo_effect(&mut self) -> Option<&mut dyn StereoEffect> {
+        Some(self)
     }
 }

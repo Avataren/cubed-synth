@@ -45,3 +45,12 @@ pub use sampler::*;
 pub use saturation::*;
 pub use wavetable::*;
 pub use wavetable_oscillator::*;
+
+/// Copies `input` into `output` and zeroes the rest of `output`: how an effect's
+/// port-map `process` hands its input to `StereoEffect::process_stereo`, which
+/// then works on the output buffers in place.
+pub(crate) fn copy_input(output: &mut [f32], input: &[f32]) {
+    let len = input.len().min(output.len());
+    output[..len].copy_from_slice(&input[..len]);
+    output[len..].fill(0.0);
+}

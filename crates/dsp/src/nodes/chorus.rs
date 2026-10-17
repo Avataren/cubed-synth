@@ -13,7 +13,7 @@ const MIN_MIX: f32 = 0.0;
 const MAX_MIX: f32 = 1.0;
 
 use crate::graph::ModulationSource; // Assuming these paths are correct for your project
-use crate::traits::{AudioNode, PortId};
+use crate::traits::{AudioNode, PortId, StereoEffect};
 
 const SIMD_WIDTH: usize = 4; // web wasm guaranteed supported
 
@@ -483,8 +483,6 @@ impl Chorus {
             return;
         }
 
-        self.ensure_buffer_capacity(buffer_size);
-
         // Obtain the output slices by temporarily removing them from the map.
         // (This pattern is safe because the hash map has only two entries.)
         let mut out_left = outputs.remove(&PortId::AudioOutput0);
@@ -570,6 +568,81 @@ impl Chorus {
             return;
         }
 
+        out_left_slice[..process_len].copy_from_slice(&left_in_slice[..process_len]);
+        out_right_slice[..process_len].copy_from_slice(&right_in_slice[..process_len]);
+        self.process_stereo(
+            &mut out_left_slice[..process_len],
+            &mut out_right_slice[..process_len],
+        );
+        if process_len < out_left_slice.len() {
+            out_left_slice[process_len..].fill(0.0);
+        }
+        if process_len < out_right_slice.len() {
+            out_right_slice[process_len..].fill(0.0);
+        }
+
+        // Finally, reinsert the output slices back into the outputs map.
+        outputs.insert(PortId::AudioOutput0, out_left.unwrap());
+        outputs.insert(PortId::AudioOutput1, out_right.unwrap());
+    }
+
+    pub fn reset_state(&mut self) {
+        self.delay_buffer_left.fill(0.0);
+        self.delay_buffer_right.fill(0.0);
+        self.write_index = 0;
+        self.lfo_phase_left = 0.0;
+        self.lfo_phase_right = self.target_lfo_stereo_phase_offset_rad.rem_euclid(TAU);
+        self.upsample_filter1_left.reset();
+        self.upsample_filter1_right.reset();
+        self.upsample_filter2_left.reset();
+        self.upsample_filter2_right.reset();
+        self.downsample_filter1_left.reset();
+        self.downsample_filter1_right.reset();
+        self.downsample_filter2_left.reset();
+        self.downsample_filter2_right.reset();
+        self.output_dc_blocker_l.reset();
+        self.output_dc_blocker_r.reset();
+        self.current_base_delay_samples = self.target_base_delay_samples;
+        self.current_depth_samples = self.target_depth_samples;
+        self.current_lfo_phase_increment =
+            TAU * self.target_lfo_rate_hz * self.inv_internal_sample_rate;
+        self.current_feedback = self.target_feedback;
+        self.current_mix = self.target_mix;
+        self.upsample_stage1_left.fill(0.0);
+        self.upsample_stage1_right.fill(0.0);
+        self.upsampled_input_left.fill(0.0);
+        self.upsampled_input_right.fill(0.0);
+        self.processed_oversampled_left.fill(0.0);
+        self.processed_oversampled_right.fill(0.0);
+        self.feedback_filter_l.reset();
+        self.feedback_filter_r.reset();
+    }
+
+    fn node_type_str(&self) -> &str {
+        "chorus"
+    }
+    fn is_node_active(&self) -> bool {
+        self.enabled
+    }
+    fn set_node_active(&mut self, active: bool) {
+        if active && !self.enabled {
+            self.reset_state();
+        }
+        self.enabled = active;
+    }
+    fn as_any_internal_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn as_any_internal(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl StereoEffect for Chorus {
+    fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let process_len = left.len().min(right.len());
+        self.ensure_buffer_capacity(process_len);
+
         // Smooth parameters (as before)
         let coeff = self.param_smooth_coeff;
         self.current_base_delay_samples = smooth_parameter(
@@ -612,8 +685,8 @@ impl Chorus {
             let filter1_l = &mut self.upsample_filter1_left;
             let filter1_r = &mut self.upsample_filter1_right;
             for i in 0..process_len {
-                self.upsample_stage1_left[up_idx] = filter1_l.process(left_in_slice[i]);
-                self.upsample_stage1_right[up_idx] = filter1_r.process(right_in_slice[i]);
+                self.upsample_stage1_left[up_idx] = filter1_l.process(left[i]);
+                self.upsample_stage1_right[up_idx] = filter1_r.process(right[i]);
                 up_idx += 1;
                 self.upsample_stage1_left[up_idx] = filter1_l.process(0.0);
                 self.upsample_stage1_right[up_idx] = filter1_r.process(0.0);
@@ -797,70 +870,9 @@ impl Chorus {
             final_right[i] = self.output_dc_blocker_r.process(final_right[i]);
         }
 
-        // Copy from our scratch final buffers directly into the output slices.
-        out_left_slice[..process_len].copy_from_slice(&final_left[..process_len]);
-        out_right_slice[..process_len].copy_from_slice(&final_right[..process_len]);
-        if process_len < out_left_slice.len() {
-            out_left_slice[process_len..].fill(0.0);
-        }
-        if process_len < out_right_slice.len() {
-            out_right_slice[process_len..].fill(0.0);
-        }
-
-        // Finally, reinsert the output slices back into the outputs map.
-        outputs.insert(PortId::AudioOutput0, out_left.unwrap());
-        outputs.insert(PortId::AudioOutput1, out_right.unwrap());
-    }
-
-    pub fn reset_state(&mut self) {
-        self.delay_buffer_left.fill(0.0);
-        self.delay_buffer_right.fill(0.0);
-        self.write_index = 0;
-        self.lfo_phase_left = 0.0;
-        self.lfo_phase_right = self.target_lfo_stereo_phase_offset_rad.rem_euclid(TAU);
-        self.upsample_filter1_left.reset();
-        self.upsample_filter1_right.reset();
-        self.upsample_filter2_left.reset();
-        self.upsample_filter2_right.reset();
-        self.downsample_filter1_left.reset();
-        self.downsample_filter1_right.reset();
-        self.downsample_filter2_left.reset();
-        self.downsample_filter2_right.reset();
-        self.output_dc_blocker_l.reset();
-        self.output_dc_blocker_r.reset();
-        self.current_base_delay_samples = self.target_base_delay_samples;
-        self.current_depth_samples = self.target_depth_samples;
-        self.current_lfo_phase_increment =
-            TAU * self.target_lfo_rate_hz * self.inv_internal_sample_rate;
-        self.current_feedback = self.target_feedback;
-        self.current_mix = self.target_mix;
-        self.upsample_stage1_left.fill(0.0);
-        self.upsample_stage1_right.fill(0.0);
-        self.upsampled_input_left.fill(0.0);
-        self.upsampled_input_right.fill(0.0);
-        self.processed_oversampled_left.fill(0.0);
-        self.processed_oversampled_right.fill(0.0);
-        self.feedback_filter_l.reset();
-        self.feedback_filter_r.reset();
-    }
-
-    fn node_type_str(&self) -> &str {
-        "chorus"
-    }
-    fn is_node_active(&self) -> bool {
-        self.enabled
-    }
-    fn set_node_active(&mut self, active: bool) {
-        if active && !self.enabled {
-            self.reset_state();
-        }
-        self.enabled = active;
-    }
-    fn as_any_internal_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-    fn as_any_internal(&self) -> &dyn Any {
-        self
+        // Copy from our scratch final buffers into the block, in place.
+        left[..process_len].copy_from_slice(&final_left[..process_len]);
+        right[..process_len].copy_from_slice(&final_right[..process_len]);
     }
 }
 
@@ -904,5 +916,8 @@ impl AudioNode for Chorus {
     }
     fn node_type(&self) -> &str {
         self.node_type_str()
+    }
+    fn as_stereo_effect(&mut self) -> Option<&mut dyn StereoEffect> {
+        Some(self)
     }
 }

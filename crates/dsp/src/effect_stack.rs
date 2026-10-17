@@ -11,35 +11,16 @@ pub struct Effect {
 
 pub struct EffectStack {
     pub effects: Vec<Effect>,
-    work_left_a: Vec<f32>,
-    work_right_a: Vec<f32>,
-    work_left_b: Vec<f32>,
-    work_right_b: Vec<f32>,
+    work_left: Vec<f32>,
+    work_right: Vec<f32>,
 }
 
 impl EffectStack {
     pub fn new(_buffer_size: usize) -> Self {
         Self {
             effects: Vec::new(),
-            work_left_a: Vec::new(),
-            work_right_a: Vec::new(),
-            work_left_b: Vec::new(),
-            work_right_b: Vec::new(),
-        }
-    }
-
-    fn ensure_capacity(&mut self, len: usize) {
-        if self.work_left_a.len() < len {
-            self.work_left_a.resize(len, 0.0);
-        }
-        if self.work_right_a.len() < len {
-            self.work_right_a.resize(len, 0.0);
-        }
-        if self.work_left_b.len() < len {
-            self.work_left_b.resize(len, 0.0);
-        }
-        if self.work_right_b.len() < len {
-            self.work_right_b.resize(len, 0.0);
+            work_left: Vec::new(),
+            work_right: Vec::new(),
         }
     }
 
@@ -72,6 +53,9 @@ impl EffectStack {
         self.effects.len()
     }
 
+    /// Runs the input through every active effect in order. Stereo effects
+    /// process the output buffers in place; any other node goes through its
+    /// port-map `process`, which allocates.
     pub fn process_audio(
         &mut self,
         input_left: &[f32],
@@ -79,7 +63,6 @@ impl EffectStack {
         output_left: &mut [f32],
         output_right: &mut [f32],
     ) {
-        // FIXED: Use actual buffer lengths instead of self.buffer_size
         let actual_buffer_size = input_left
             .len()
             .min(input_right.len())
@@ -90,103 +73,64 @@ impl EffectStack {
             return;
         }
 
-        // If all effects are disabled, bypass processing entirely.
-        if self.effects.iter().all(|e| !e.node.is_active()) {
-            output_left[..actual_buffer_size].copy_from_slice(&input_left[..actual_buffer_size]);
-            output_right[..actual_buffer_size].copy_from_slice(&input_right[..actual_buffer_size]);
-            return;
-        }
-
-        if self.effects.iter().all(|e| !e.node.is_active()) {
-            output_left[..actual_buffer_size].copy_from_slice(&input_left[..actual_buffer_size]);
-            output_right[..actual_buffer_size].copy_from_slice(&input_right[..actual_buffer_size]);
-            return;
-        }
-
-        self.ensure_capacity(actual_buffer_size);
-
-        self.work_left_a[..actual_buffer_size].copy_from_slice(&input_left[..actual_buffer_size]);
-        self.work_right_a[..actual_buffer_size].copy_from_slice(&input_right[..actual_buffer_size]);
-
-        let mut current_is_a = true;
-        let mut had_active_effect = false;
+        let (out_left, left_tail) = output_left.split_at_mut(actual_buffer_size);
+        let (out_right, right_tail) = output_right.split_at_mut(actual_buffer_size);
+        out_left.copy_from_slice(&input_left[..actual_buffer_size]);
+        out_right.copy_from_slice(&input_right[..actual_buffer_size]);
 
         for effect in &mut self.effects {
             if !effect.node.is_active() {
                 continue;
             }
-            had_active_effect = true;
-
-            let (current_left, current_right, next_left, next_right) = if current_is_a {
-                (
-                    &mut self.work_left_a,
-                    &mut self.work_right_a,
-                    &mut self.work_left_b,
-                    &mut self.work_right_b,
-                )
+            if let Some(stereo) = effect.node.as_stereo_effect() {
+                stereo.process_stereo(out_left, out_right);
             } else {
-                (
-                    &mut self.work_left_b,
-                    &mut self.work_right_b,
-                    &mut self.work_left_a,
-                    &mut self.work_right_a,
-                )
-            };
-
-            next_left[..actual_buffer_size].fill(0.0);
-            next_right[..actual_buffer_size].fill(0.0);
-
-            // Zero-copy: Create ModulationSource with references to current buffers
-            let mut inputs = FxHashMap::with_capacity_and_hasher(2, Default::default());
-
-            let left_source = ModulationSource {
-                buffer: &current_left[..actual_buffer_size],
-                amount: 1.0,
-                mod_type: ModulationType::Additive,
-                transformation: ModulationTransformation::None,
-            };
-
-            let right_source = ModulationSource {
-                buffer: &current_right[..actual_buffer_size],
-                amount: 1.0,
-                mod_type: ModulationType::Additive,
-                transformation: ModulationTransformation::None,
-            };
-
-            inputs.insert(PortId::AudioInput0, vec![left_source]);
-            inputs.insert(PortId::AudioInput1, vec![right_source]);
-
-            let mut outputs = FxHashMap::with_capacity_and_hasher(2, Default::default());
-            outputs.insert(PortId::AudioOutput0, &mut next_left[..actual_buffer_size]);
-            outputs.insert(PortId::AudioOutput1, &mut next_right[..actual_buffer_size]);
-
-            effect
-                .node
-                .process(&inputs, &mut outputs, actual_buffer_size);
-
-            // No need to store ModulationSource instances - they're created on the fly
-            current_is_a = !current_is_a;
-        }
-
-        let (final_left, final_right) = if had_active_effect {
-            if current_is_a {
-                (&self.work_left_a, &self.work_right_a)
-            } else {
-                (&self.work_left_b, &self.work_right_b)
+                Self::process_ports(
+                    effect.node.as_mut(),
+                    &mut self.work_left,
+                    &mut self.work_right,
+                    out_left,
+                    out_right,
+                );
             }
-        } else {
-            (&self.work_left_a, &self.work_right_a)
-        };
-
-        output_left[..actual_buffer_size].copy_from_slice(&final_left[..actual_buffer_size]);
-        output_right[..actual_buffer_size].copy_from_slice(&final_right[..actual_buffer_size]);
+        }
 
         // CRITICAL: Zero out any remaining samples to prevent garbage data
-        if actual_buffer_size < output_left.len() {
-            output_left[actual_buffer_size..].fill(0.0);
-        }
-        if actual_buffer_size < output_right.len() {
-            output_right[actual_buffer_size..].fill(0.0);
-        }
+        left_tail.fill(0.0);
+        right_tail.fill(0.0);
+    }
+
+    /// Runs a node that is not a `StereoEffect` through its port maps, using
+    /// the work buffers as its input.
+    fn process_ports(
+        node: &mut dyn AudioNode,
+        work_left: &mut Vec<f32>,
+        work_right: &mut Vec<f32>,
+        left: &mut [f32],
+        right: &mut [f32],
+    ) {
+        let len = left.len();
+        work_left.clear();
+        work_left.extend_from_slice(left);
+        work_right.clear();
+        work_right.extend_from_slice(right);
+        left.fill(0.0);
+        right.fill(0.0);
+
+        let source = |buffer| ModulationSource {
+            buffer,
+            amount: 1.0,
+            mod_type: ModulationType::Additive,
+            transformation: ModulationTransformation::None,
+        };
+        let mut inputs = FxHashMap::with_capacity_and_hasher(2, Default::default());
+        inputs.insert(PortId::AudioInput0, vec![source(&work_left[..])]);
+        inputs.insert(PortId::AudioInput1, vec![source(&work_right[..])]);
+
+        let mut outputs = FxHashMap::with_capacity_and_hasher(2, Default::default());
+        outputs.insert(PortId::AudioOutput0, left);
+        outputs.insert(PortId::AudioOutput1, right);
+
+        node.process(&inputs, &mut outputs, len);
     }
 }

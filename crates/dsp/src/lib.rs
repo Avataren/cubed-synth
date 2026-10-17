@@ -22,7 +22,7 @@ pub use graph::AudioGraph;
 pub use graph::{Connection, ConnectionId, NodeId};
 pub use macros::{MacroManager, ModulationTarget};
 pub use nodes::{Envelope, EnvelopeConfig};
-pub use traits::{AudioNode, PortId};
+pub use traits::{AudioNode, PortId, StereoEffect};
 pub use utils::*;
 pub use voice::Voice;
 

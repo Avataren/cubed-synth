@@ -1,5 +1,6 @@
+use super::copy_input;
 use crate::graph::ModulationSource;
-use crate::traits::{AudioNode, PortId};
+use crate::traits::{AudioNode, PortId, StereoEffect};
 use cubed_simd::f32x4;
 use cubed_simd::num::SimdFloat;
 use rustc_hash::FxHashMap;
@@ -254,46 +255,9 @@ impl Freeverb {
     }
 }
 
-impl AudioNode for Freeverb {
-    fn get_ports(&self) -> FxHashMap<PortId, bool> {
-        let mut ports = FxHashMap::default();
-        ports.insert(PortId::AudioInput0, false); // Left input
-        ports.insert(PortId::AudioInput1, false); // Right input
-        ports.insert(PortId::AudioOutput0, true); // Left output
-        ports.insert(PortId::AudioOutput1, true); // Right output
-        ports
-    }
-
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
-        // Retrieve input buffers; if absent, use a zero buffer.
-        let left_in = inputs
-            .get(&PortId::AudioInput0)
-            .and_then(|sources| sources.first())
-            .map(|src| &src.buffer[..buffer_size])
-            .unwrap_or_else(|| {
-                static ZERO_BUFFER: [f32; 1024] = [0.0; 1024];
-                &ZERO_BUFFER[..buffer_size.min(ZERO_BUFFER.len())]
-            });
-        let right_in = inputs
-            .get(&PortId::AudioInput1)
-            .and_then(|sources| sources.first())
-            .map(|src| &src.buffer[..buffer_size])
-            .unwrap_or_else(|| {
-                static ZERO_BUFFER: [f32; 1024] = [0.0; 1024];
-                &ZERO_BUFFER[..buffer_size.min(ZERO_BUFFER.len())]
-            });
-        let outs = outputs.get_disjoint_mut([&PortId::AudioOutput0, &PortId::AudioOutput1]);
-        let [Some(out_left), Some(out_right)] = outs else {
-            panic!("Missing stereo output buffers");
-        };
-        let out_left: &mut [f32] = out_left;
-        let out_right: &mut [f32] = out_right;
-
+impl StereoEffect for Freeverb {
+    fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let buffer_size = left.len().min(right.len());
         // Fixed gain constant to scale down each channel.
         let fixed_gain = 0.015;
 
@@ -313,8 +277,8 @@ impl AudioNode for Freeverb {
             for j in 0..block_size {
                 let idx = i + j;
                 // Apply fixed gain to each channel separately.
-                let input_l = left_in[idx] * fixed_gain;
-                let input_r = right_in[idx] * fixed_gain;
+                let input_l = left[idx] * fixed_gain;
+                let input_r = right[idx] * fixed_gain;
 
                 // --- Comb Filter Processing for Left Channel ---
                 let c0 = self.comb_filters_l[0].process(input_l);
@@ -362,8 +326,8 @@ impl AudioNode for Freeverb {
 
             // --- Final Mixing of Dry and Wet Signals ---
             if block_size == simd_block {
-                let in_left_block = f32x4::from_slice(&left_in[i..i + simd_block]);
-                let in_right_block = f32x4::from_slice(&right_in[i..i + simd_block]);
+                let in_left_block = f32x4::from_slice(&left[i..i + simd_block]);
+                let in_right_block = f32x4::from_slice(&right[i..i + simd_block]);
                 let dry_left = in_left_block * f32x4::splat(self.dry);
                 let dry_right = in_right_block * f32x4::splat(self.dry);
                 let reverb_l_vec = f32x4::from_array(temp_reverb_l);
@@ -373,21 +337,69 @@ impl AudioNode for Freeverb {
 
                 let mixed_left = dry_left + wet1_vec * reverb_l_vec + wet2_vec * reverb_r_vec;
                 let mixed_right = dry_right + wet1_vec * reverb_r_vec + wet2_vec * reverb_l_vec;
-                mixed_left.copy_to_slice(&mut out_left[i..i + simd_block]);
-                mixed_right.copy_to_slice(&mut out_right[i..i + simd_block]);
+                mixed_left.copy_to_slice(&mut left[i..i + simd_block]);
+                mixed_right.copy_to_slice(&mut right[i..i + simd_block]);
             } else {
                 for j in 0..block_size {
                     let idx = i + j;
-                    let dry_l = left_in[idx] * self.dry;
-                    let dry_r = right_in[idx] * self.dry;
-                    out_left[idx] =
-                        dry_l + self.wet1 * temp_reverb_l[j] + self.wet2 * temp_reverb_r[j];
-                    out_right[idx] =
+                    let dry_l = left[idx] * self.dry;
+                    let dry_r = right[idx] * self.dry;
+                    left[idx] = dry_l + self.wet1 * temp_reverb_l[j] + self.wet2 * temp_reverb_r[j];
+                    right[idx] =
                         dry_r + self.wet1 * temp_reverb_r[j] + self.wet2 * temp_reverb_l[j];
                 }
             }
             i += block_size;
         }
+    }
+}
+
+impl AudioNode for Freeverb {
+    fn get_ports(&self) -> FxHashMap<PortId, bool> {
+        let mut ports = FxHashMap::default();
+        ports.insert(PortId::AudioInput0, false); // Left input
+        ports.insert(PortId::AudioInput1, false); // Right input
+        ports.insert(PortId::AudioOutput0, true); // Left output
+        ports.insert(PortId::AudioOutput1, true); // Right output
+        ports
+    }
+
+    fn process<'a>(
+        &mut self,
+        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
+        outputs: &mut FxHashMap<PortId, &mut [f32]>,
+        buffer_size: usize,
+    ) {
+        // Retrieve input buffers; if absent, use a zero buffer.
+        let left_in = inputs
+            .get(&PortId::AudioInput0)
+            .and_then(|sources| sources.first())
+            .map(|src| &src.buffer[..buffer_size])
+            .unwrap_or_else(|| {
+                static ZERO_BUFFER: [f32; 1024] = [0.0; 1024];
+                &ZERO_BUFFER[..buffer_size.min(ZERO_BUFFER.len())]
+            });
+        let right_in = inputs
+            .get(&PortId::AudioInput1)
+            .and_then(|sources| sources.first())
+            .map(|src| &src.buffer[..buffer_size])
+            .unwrap_or_else(|| {
+                static ZERO_BUFFER: [f32; 1024] = [0.0; 1024];
+                &ZERO_BUFFER[..buffer_size.min(ZERO_BUFFER.len())]
+            });
+        let outs = outputs.get_disjoint_mut([&PortId::AudioOutput0, &PortId::AudioOutput1]);
+        let [Some(out_left), Some(out_right)] = outs else {
+            panic!("Missing stereo output buffers");
+        };
+        let out_left = &mut out_left[..buffer_size];
+        let out_right = &mut out_right[..buffer_size];
+        copy_input(out_left, left_in);
+        copy_input(out_right, right_in);
+        self.process_stereo(out_left, out_right);
+    }
+
+    fn as_stereo_effect(&mut self) -> Option<&mut dyn StereoEffect> {
+        Some(self)
     }
 
     fn reset(&mut self) {

@@ -180,4 +180,18 @@ pub trait AudioNode: Any {
     fn node_type(&self) -> &str {
         "unknown" // Default implementation returns "unknown"
     }
+
+    /// The node's in-place stereo path, when it is an effect that can run as an
+    /// insert (an `EffectStack` slot or a mixer bus insert).
+    fn as_stereo_effect(&mut self) -> Option<&mut dyn StereoEffect> {
+        None
+    }
+}
+
+/// An effect that processes a stereo block in place, with no port maps, so it
+/// can run as an insert without allocating on the audio thread.
+pub trait StereoEffect {
+    /// Processes one block in place; `left` and `right` have the same length.
+    /// It always processes: the host skips effects that are bypassed.
+    fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]);
 }

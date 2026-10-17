@@ -3,22 +3,13 @@
 use fft_convolver::FFTConvolver;
 use rustc_hash::FxHashMap;
 use std::any::Any;
-use std::borrow::Cow;
 
 // Removed: use web_sys::console; // No longer needed
 
 // Import ModulationProcessor and ModulationSource from the graph module.
+use super::copy_input;
 use crate::graph::{ModulationProcessor, ModulationSource};
-use crate::traits::{AudioNode, PortId}; // Ensure these paths are correct
-
-/// Helper function to ensure a Vec has at least a certain size, filling with a value if resizing,
-/// and truncating if it's too long.
-fn ensure_buffer_size_and_fill(buffer: &mut Vec<f32>, required_size: usize, fill_value: f32) {
-    if buffer.len() < required_size {
-        buffer.resize_with(required_size, || fill_value);
-    }
-    buffer.truncate(required_size);
-}
+use crate::traits::{AudioNode, PortId, StereoEffect}; // Ensure these paths are correct
 
 /// A Convolver that uses FFTConvolver for fast convolution processing.
 /// Assumes only audio inputs are connected, uses self.wet_level for mix.
@@ -29,7 +20,6 @@ pub struct Convolver {
     pub wet_level: f32,
     pub partition_size: usize,
     pub sample_rate: f32,
-    fallback_zero_buffer: Vec<f32>,
     temp_wet_l: Vec<f32>,
     temp_wet_r: Vec<f32>,
     /// Store the original impulse response for serialization
@@ -132,7 +122,6 @@ impl Convolver {
             wet_level: 0.2,
             partition_size,
             sample_rate,
-            fallback_zero_buffer: Vec::new(),
             temp_wet_l: Vec::new(),
             temp_wet_r: Vec::new(),
             original_impulse_response: impulse_response, // Store original IR
@@ -211,6 +200,37 @@ impl Convolver {
     }
 }
 
+impl StereoEffect for Convolver {
+    fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        if self.convolvers.is_empty() {
+            return; // no IR: pass the dry signal through
+        }
+        let len = left.len().min(right.len());
+        if self.temp_wet_l.len() < len {
+            self.temp_wet_l.resize(len, 0.0);
+        }
+        if self.temp_wet_r.len() < len {
+            self.temp_wet_r.resize(len, 0.0);
+        }
+        let wet_l = &mut self.temp_wet_l[..len];
+        let wet_r = &mut self.temp_wet_r[..len];
+
+        Convolver::process_block_wet_signal(
+            &mut self.convolvers,
+            &mut self.tail_count,
+            &[&left[..len], &right[..len]],
+            wet_l,
+            wet_r,
+        );
+
+        let mix_factor = self.wet_level;
+        for i in 0..len {
+            left[i] = wet_l[i] * mix_factor + left[i] * (1.0 - mix_factor);
+            right[i] = wet_r[i] * mix_factor + right[i] * (1.0 - mix_factor);
+        }
+    }
+}
+
 // ============================================================
 // Implement the AudioNode trait for graph integration
 // ============================================================
@@ -269,79 +289,30 @@ impl AudioNode for Convolver {
             return;
         }
 
-        // --- Prepare Buffers ---
-        ensure_buffer_size_and_fill(&mut self.fallback_zero_buffer, buffer_size, 0.0);
-        ensure_buffer_size_and_fill(&mut self.temp_wet_l, buffer_size, 0.0);
-        ensure_buffer_size_and_fill(&mut self.temp_wet_r, buffer_size, 0.0);
-
-        // --- Get Audio Input Sources ---
-        let input_l_source_buffer_opt: Option<&[f32]> = inputs
+        // --- Get Audio Input Sources (a missing right input reuses the left) ---
+        let input_l: Option<&[f32]> = inputs
             .get(&PortId::AudioInput0)
             .and_then(|s| s.first())
             .map(|s| s.buffer.get(..buffer_size).unwrap_or(s.buffer));
-        let input_r_source_buffer_opt: Option<&[f32]> = inputs
+        let input_r: Option<&[f32]> = inputs
             .get(&PortId::AudioInput1)
             .and_then(|s| s.first())
-            .map(|s| s.buffer.get(..buffer_size).unwrap_or(s.buffer));
+            .map(|s| s.buffer.get(..buffer_size).unwrap_or(s.buffer))
+            .or(input_l);
 
-        // --- Determine final DRY slices using Cow ---
-        let dry_l_signal: Cow<[f32]> = input_l_source_buffer_opt
-            .map(Cow::Borrowed)
-            .unwrap_or_else(|| Cow::Owned(self.fallback_zero_buffer[..buffer_size].to_vec()));
-        let dry_r_signal: Cow<[f32]> = input_r_source_buffer_opt
-            .map(Cow::Borrowed)
-            .unwrap_or_else(|| dry_l_signal.clone());
+        let outs = outputs.get_disjoint_mut([&PortId::AudioOutput0, &PortId::AudioOutput1]);
+        let [Some(out_left), Some(out_right)] = outs else {
+            return;
+        };
+        let out_left = &mut out_left[..buffer_size];
+        let out_right = &mut out_right[..buffer_size];
+        copy_input(out_left, input_l.unwrap_or(&[]));
+        copy_input(out_right, input_r.unwrap_or(&[]));
+        self.process_stereo(out_left, out_right);
+    }
 
-        // --- Get Output Buffers ---
-        let mut out_l_buffer_opt = outputs.remove(&PortId::AudioOutput0);
-        let mut out_r_buffer_opt = outputs.remove(&PortId::AudioOutput1);
-
-        // --- Process Block ---
-        if let (Some(out_l_buffer), Some(out_r_buffer)) =
-            (&mut out_l_buffer_opt, &mut out_r_buffer_opt)
-        {
-            let conv_input_l: &[f32] = &dry_l_signal;
-            let conv_input_r: &[f32] = &dry_r_signal;
-            let input_slices_for_conv: &[&[f32]] = &[conv_input_l, conv_input_r];
-            let temp_wet_l_slice = &mut self.temp_wet_l[..buffer_size];
-            let temp_wet_r_slice = &mut self.temp_wet_r[..buffer_size];
-
-            // --- Calculate Wet Signal ---
-            Convolver::process_block_wet_signal(
-                &mut self.convolvers,
-                &mut self.tail_count,
-                input_slices_for_conv,
-                temp_wet_l_slice,
-                temp_wet_r_slice,
-            );
-
-            // --- Apply Wet/Dry Mix using self.wet_level ---
-            let final_out_l_slice = &mut out_l_buffer[..buffer_size];
-            let final_out_r_slice = &mut out_r_buffer[..buffer_size];
-            let mix_factor = self.wet_level; // Use property directly
-
-            // Removed pre-mix logs
-
-            for i in 0..buffer_size {
-                let wet_l = *self.temp_wet_l.get(i).unwrap_or(&0.0);
-                let wet_r = *self.temp_wet_r.get(i).unwrap_or(&0.0);
-                let dry_l = *dry_l_signal.get(i).unwrap_or(&0.0);
-                let dry_r = *dry_r_signal.get(i).unwrap_or(&0.0);
-
-                final_out_l_slice[i] = wet_l * mix_factor + dry_l * (1.0 - mix_factor);
-                final_out_r_slice[i] = wet_r * mix_factor + dry_r * (1.0 - mix_factor);
-            }
-        } else {
-            //todo: error handling
-        }
-
-        // --- Reinsert Output Buffers ---
-        if let Some(out_l) = out_l_buffer_opt {
-            outputs.insert(PortId::AudioOutput0, out_l);
-        }
-        if let Some(out_r) = out_r_buffer_opt {
-            outputs.insert(PortId::AudioOutput1, out_r);
-        }
+    fn as_stereo_effect(&mut self) -> Option<&mut dyn StereoEffect> {
+        Some(self)
     }
 
     // --- Other trait methods ---

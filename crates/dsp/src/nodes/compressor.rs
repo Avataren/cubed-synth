@@ -1,8 +1,9 @@
 use rustc_hash::FxHashMap;
 use std::any::Any;
 
+use super::copy_input;
 use crate::graph::ModulationSource;
-use crate::traits::{AudioNode, PortId};
+use crate::traits::{AudioNode, PortId, StereoEffect};
 
 /// Simple stereo compressor with peak detection and wet/dry mix.
 pub struct Compressor {
@@ -100,6 +101,27 @@ impl Compressor {
     }
 }
 
+impl StereoEffect for Compressor {
+    fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let mix = self.mix;
+        let dry_mix = 1.0 - mix;
+
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let dry_l = *l;
+            let dry_r = *r;
+            let detector = dry_l.abs().max(dry_r.abs());
+            self.envelope = self.update_envelope(self.envelope, detector);
+            let gain = self.compute_gain(self.envelope);
+
+            let wet_l = dry_l * gain;
+            let wet_r = dry_r * gain;
+
+            *l = dry_l * dry_mix + wet_l * mix;
+            *r = dry_r * dry_mix + wet_r * mix;
+        }
+    }
+}
+
 impl AudioNode for Compressor {
     fn get_ports(&self) -> FxHashMap<PortId, bool> {
         let mut ports = FxHashMap::default();
@@ -148,25 +170,15 @@ impl AudioNode for Compressor {
         let [Some(out_left), Some(out_right)] = outs else {
             return;
         };
-        let out_left: &mut [f32] = out_left;
-        let out_right: &mut [f32] = out_right;
+        let out_left = &mut out_left[..buffer_size];
+        let out_right = &mut out_right[..buffer_size];
+        copy_input(out_left, left_in);
+        copy_input(out_right, right_in);
+        self.process_stereo(out_left, out_right);
+    }
 
-        let mix = self.mix;
-        let dry_mix = 1.0 - mix;
-
-        for i in 0..buffer_size {
-            let dry_l = left_in.get(i).copied().unwrap_or(0.0);
-            let dry_r = right_in.get(i).copied().unwrap_or(0.0);
-            let detector = dry_l.abs().max(dry_r.abs());
-            self.envelope = self.update_envelope(self.envelope, detector);
-            let gain = self.compute_gain(self.envelope);
-
-            let wet_l = dry_l * gain;
-            let wet_r = dry_r * gain;
-
-            out_left[i] = dry_l * dry_mix + wet_l * mix;
-            out_right[i] = dry_r * dry_mix + wet_r * mix;
-        }
+    fn as_stereo_effect(&mut self) -> Option<&mut dyn StereoEffect> {
+        Some(self)
     }
 
     fn reset(&mut self) {

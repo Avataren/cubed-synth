@@ -3,8 +3,9 @@ use std::any::Any;
 
 use rustc_hash::FxHashMap;
 
+use super::copy_input;
 use crate::graph::ModulationSource;
-use crate::traits::{AudioNode, PortId};
+use crate::traits::{AudioNode, PortId, StereoEffect};
 
 pub struct Delay {
     enabled: bool,
@@ -69,58 +70,9 @@ impl Delay {
 // If the modulation trait is no longer required, you can remove this implementation.
 // impl ModulationProcessor for Delay {}
 
-impl AudioNode for Delay {
-    fn get_ports(&self) -> FxHashMap<PortId, bool> {
-        let mut ports = FxHashMap::default();
-        // Stereo inputs:
-        ports.insert(PortId::AudioInput0, false); // Left input
-        ports.insert(PortId::AudioInput1, false); // Right input
-
-        // Stereo outputs:
-        ports.insert(PortId::AudioOutput0, true); // Left output
-        ports.insert(PortId::AudioOutput1, true); // Right output
-
-        ports
-    }
-
-    fn process<'a>(
-        &mut self,
-        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
-        outputs: &mut FxHashMap<PortId, &mut [f32]>,
-        buffer_size: usize,
-    ) {
-        // Instead of calling process_modulations we directly take the audio input from the
-        // first modulation source for each port.
-        // (It is assumed that each input port always provides at least one source.)
-        let left_in = inputs
-            .get(&PortId::AudioInput0)
-            .and_then(|sources| sources.first())
-            .map(|src| &src.buffer[..buffer_size])
-            .unwrap_or_else(|| {
-                // In a real-time context, try to avoid heap allocation on every call.
-                // Here we create a temporary zero-buffer if needed.
-                static ZERO_BUFFER: [f32; 1024] = [0.0; 1024];
-                &ZERO_BUFFER[..buffer_size.min(ZERO_BUFFER.len())]
-            });
-
-        let right_in = inputs
-            .get(&PortId::AudioInput1)
-            .and_then(|sources| sources.first())
-            .map(|src| &src.buffer[..buffer_size])
-            .unwrap_or_else(|| {
-                static ZERO_BUFFER: [f32; 1024] = [0.0; 1024];
-                &ZERO_BUFFER[..buffer_size.min(ZERO_BUFFER.len())]
-            });
-
-        // Use get_disjoint_mut to retrieve both outputs at once.
-        let outs = outputs.get_disjoint_mut([&PortId::AudioOutput0, &PortId::AudioOutput1]);
-        let [Some(out_left), Some(out_right)] = outs else {
-            panic!("Missing stereo output buffers");
-        };
-
-        let out_left: &mut [f32] = out_left;
-        let out_right: &mut [f32] = out_right;
-
+impl StereoEffect for Delay {
+    fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let buffer_size = left.len().min(right.len());
         let mut i = 0;
         while i < buffer_size {
             let chunk_len = (buffer_size - i).min(4);
@@ -128,8 +80,8 @@ impl AudioNode for Delay {
             // Load up to 4 samples from left and right inputs.
             let mut in_left_arr = [0.0; 4];
             let mut in_right_arr = [0.0; 4];
-            in_left_arr[..chunk_len].copy_from_slice(&left_in[i..i + chunk_len]);
-            in_right_arr[..chunk_len].copy_from_slice(&right_in[i..i + chunk_len]);
+            in_left_arr[..chunk_len].copy_from_slice(&left[i..i + chunk_len]);
+            in_right_arr[..chunk_len].copy_from_slice(&right[i..i + chunk_len]);
             let in_left_vec = f32x4::from_array(in_left_arr);
             let in_right_vec = f32x4::from_array(in_right_arr);
 
@@ -203,13 +155,74 @@ impl AudioNode for Delay {
             let mixed_right_vec = in_right_vec * dry_level + delayed_right_vec * wet_level;
             let mixed_left_arr = mixed_left_vec.to_array();
             let mixed_right_arr = mixed_right_vec.to_array();
-            out_left[i..i + chunk_len].copy_from_slice(&mixed_left_arr[..chunk_len]);
-            out_right[i..i + chunk_len].copy_from_slice(&mixed_right_arr[..chunk_len]);
+            left[i..i + chunk_len].copy_from_slice(&mixed_left_arr[..chunk_len]);
+            right[i..i + chunk_len].copy_from_slice(&mixed_right_arr[..chunk_len]);
 
             // Advance the write pointer and the processing index.
             self.write_index = (self.write_index + chunk_len) % self.max_delay_samples;
             i += chunk_len;
         }
+    }
+}
+
+impl AudioNode for Delay {
+    fn get_ports(&self) -> FxHashMap<PortId, bool> {
+        let mut ports = FxHashMap::default();
+        // Stereo inputs:
+        ports.insert(PortId::AudioInput0, false); // Left input
+        ports.insert(PortId::AudioInput1, false); // Right input
+
+        // Stereo outputs:
+        ports.insert(PortId::AudioOutput0, true); // Left output
+        ports.insert(PortId::AudioOutput1, true); // Right output
+
+        ports
+    }
+
+    fn process<'a>(
+        &mut self,
+        inputs: &FxHashMap<PortId, Vec<ModulationSource<'a>>>,
+        outputs: &mut FxHashMap<PortId, &mut [f32]>,
+        buffer_size: usize,
+    ) {
+        // Instead of calling process_modulations we directly take the audio input from the
+        // first modulation source for each port.
+        // (It is assumed that each input port always provides at least one source.)
+        let left_in = inputs
+            .get(&PortId::AudioInput0)
+            .and_then(|sources| sources.first())
+            .map(|src| &src.buffer[..buffer_size])
+            .unwrap_or_else(|| {
+                // In a real-time context, try to avoid heap allocation on every call.
+                // Here we create a temporary zero-buffer if needed.
+                static ZERO_BUFFER: [f32; 1024] = [0.0; 1024];
+                &ZERO_BUFFER[..buffer_size.min(ZERO_BUFFER.len())]
+            });
+
+        let right_in = inputs
+            .get(&PortId::AudioInput1)
+            .and_then(|sources| sources.first())
+            .map(|src| &src.buffer[..buffer_size])
+            .unwrap_or_else(|| {
+                static ZERO_BUFFER: [f32; 1024] = [0.0; 1024];
+                &ZERO_BUFFER[..buffer_size.min(ZERO_BUFFER.len())]
+            });
+
+        // Use get_disjoint_mut to retrieve both outputs at once.
+        let outs = outputs.get_disjoint_mut([&PortId::AudioOutput0, &PortId::AudioOutput1]);
+        let [Some(out_left), Some(out_right)] = outs else {
+            panic!("Missing stereo output buffers");
+        };
+
+        let out_left = &mut out_left[..buffer_size];
+        let out_right = &mut out_right[..buffer_size];
+        copy_input(out_left, left_in);
+        copy_input(out_right, right_in);
+        self.process_stereo(out_left, out_right);
+    }
+
+    fn as_stereo_effect(&mut self) -> Option<&mut dyn StereoEffect> {
+        Some(self)
     }
 
     fn reset(&mut self) {

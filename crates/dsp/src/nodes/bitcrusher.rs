@@ -2,9 +2,10 @@ use std::any::Any;
 
 use rustc_hash::FxHashMap;
 
+use super::copy_input;
 use crate::{
     graph::ModulationSource,
-    traits::{AudioNode, PortId},
+    traits::{AudioNode, PortId, StereoEffect},
 };
 
 /// Simple stereo bitcrusher with sample-rate reduction.
@@ -57,6 +58,46 @@ impl Bitcrusher {
     }
 }
 
+impl StereoEffect for Bitcrusher {
+    fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let bits = self.bits.clamp(1, 24);
+        let levels = 1u32.checked_shl(bits as u32).unwrap_or(0).max(2) as f32;
+        let step = 2.0 / (levels - 1.0);
+        let factor = self.downsample_factor.max(1);
+        let dry_gain = 1.0 - self.mix;
+        let wet_gain = self.mix;
+
+        let mut phase = if factor == 1 {
+            0
+        } else {
+            self.sample_hold_phase % factor
+        };
+
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            if phase == 0 {
+                self.held_left = Self::quantize(*l, step);
+                self.held_right = Self::quantize(*r, step);
+            }
+
+            *l = *l * dry_gain + self.held_left * wet_gain;
+            *r = *r * dry_gain + self.held_right * wet_gain;
+
+            if factor > 1 {
+                phase += 1;
+                if phase >= factor {
+                    phase = 0;
+                }
+            }
+        }
+
+        if factor > 1 {
+            self.sample_hold_phase = phase;
+        } else {
+            self.sample_hold_phase = 0;
+        }
+    }
+}
+
 impl AudioNode for Bitcrusher {
     fn get_ports(&self) -> FxHashMap<PortId, bool> {
         let mut ports = FxHashMap::default();
@@ -80,44 +121,15 @@ impl AudioNode for Bitcrusher {
         let [Some(out_left), Some(out_right)] = outs else {
             panic!("Missing stereo output buffers for Bitcrusher");
         };
-        let out_left: &mut [f32] = out_left;
-        let out_right: &mut [f32] = out_right;
+        let out_left = &mut out_left[..buffer_size];
+        let out_right = &mut out_right[..buffer_size];
+        copy_input(out_left, left_in);
+        copy_input(out_right, right_in);
+        self.process_stereo(out_left, out_right);
+    }
 
-        let bits = self.bits.clamp(1, 24);
-        let levels = 1u32.checked_shl(bits as u32).unwrap_or(0).max(2) as f32;
-        let step = 2.0 / (levels - 1.0);
-        let factor = self.downsample_factor.max(1);
-        let dry_gain = 1.0 - self.mix;
-        let wet_gain = self.mix;
-
-        let mut phase = if factor == 1 {
-            0
-        } else {
-            self.sample_hold_phase % factor
-        };
-
-        for i in 0..buffer_size {
-            if phase == 0 {
-                self.held_left = Self::quantize(left_in[i], step);
-                self.held_right = Self::quantize(right_in[i], step);
-            }
-
-            out_left[i] = left_in[i] * dry_gain + self.held_left * wet_gain;
-            out_right[i] = right_in[i] * dry_gain + self.held_right * wet_gain;
-
-            if factor > 1 {
-                phase += 1;
-                if phase >= factor {
-                    phase = 0;
-                }
-            }
-        }
-
-        if factor > 1 {
-            self.sample_hold_phase = phase;
-        } else {
-            self.sample_hold_phase = 0;
-        }
+    fn as_stereo_effect(&mut self) -> Option<&mut dyn StereoEffect> {
+        Some(self)
     }
 
     fn reset(&mut self) {
