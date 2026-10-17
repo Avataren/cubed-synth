@@ -1,9 +1,9 @@
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 use crate::impulse_generator::fill_seed;
 use crate::PortId;
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 use rand::rngs::StdRng;
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -30,14 +30,15 @@ impl Default for NodeId {
 
 impl NodeId {
     pub fn new() -> Self {
-        #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+        #[cfg(target_arch = "wasm32")]
         {
             // In WASM we avoid relying directly on `Uuid::new_v4()` because it
             // uses `getrandom` internally, which can fail in environments like
             // AudioWorklets where `crypto.getRandomValues` is not available.
             //
-            // Instead we reuse the crate's own seeding helper that already
-            // knows how to fall back to JS and Math.random() as needed.
+            // Instead we reuse the crate's own seeding helper, which falls back
+            // to JS and Math.random() (the `wasm` feature) or to the host-seeded
+            // `crate::seed` stream.
             let mut seed = [0u8; 32];
             // Errors are already logged and a JS fallback is used, so ignore
             // the result here – we always end up with some seed bytes.
@@ -47,7 +48,7 @@ impl NodeId {
             NodeId(Uuid::from_u128(random_u128))
         }
 
-        #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             NodeId(Uuid::new_v4())
         }

@@ -1,5 +1,3 @@
-#[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
-use getrandom::fill;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 use js_sys::{self, Reflect};
 use rand::rngs::StdRng;
@@ -49,20 +47,14 @@ pub fn js_fallback_fill(seed: &mut [u8]) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
-pub fn js_fallback_fill(seed: &mut [u8]) -> Result<(), String> {
-    let mut rng = rand::rng();
-    for byte in seed.iter_mut() {
-        *byte = rng.random();
-    }
-    Ok(())
-}
-
-/// Tries getrandom::fill first (on native), then falls back to js_fallback_fill.
+/// Fills `seed` with random bytes for seeding an RNG.
 ///
-/// On WebAssembly this skips getrandom entirely and only uses the JS/Math.random
-/// fallback to avoid relying on the Web Crypto API in contexts where it is
-/// unavailable (e.g. AudioWorklet global scope).
+/// Native builds read the OS through getrandom and fall back to the
+/// [`crate::seed`] stream if that fails. With the `wasm` feature on wasm32 this
+/// skips getrandom entirely and uses the JS/Math.random fallback, which works in
+/// an AudioWorklet global scope. Other wasm32 builds (a host's own worklet
+/// module, with no JS glue) use the [`crate::seed`] stream, which the host seeds
+/// with [`crate::seed::set_seed`].
 pub fn fill_seed(seed: &mut [u8]) -> Result<(), String> {
     #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
     {
@@ -72,15 +64,19 @@ pub fn fill_seed(seed: &mut [u8]) -> Result<(), String> {
         js_fallback_fill(seed)
     }
 
-    #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     {
-        match fill(seed) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                log_error(&format!("getrandom failed: {:?}", e));
-                js_fallback_fill(seed)
-            }
+        if let Err(e) = getrandom::fill(seed) {
+            log_error(&format!("getrandom failed: {:?}", e));
+            crate::seed::fill(seed);
         }
+        Ok(())
+    }
+
+    #[cfg(all(not(feature = "wasm"), target_arch = "wasm32"))]
+    {
+        crate::seed::fill(seed);
+        Ok(())
     }
 }
 
