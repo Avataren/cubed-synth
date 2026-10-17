@@ -16,8 +16,8 @@ use cubed_dsp::nodes::{
 };
 use cubed_dsp::{AutomationFrame, PortId};
 use cubed_mixer::{
-    BusId, BusSettings, Clip, ClipId, Command, DspInsert, Mixer, MixerConfig, Play, SendSettings,
-    Start, VoiceId,
+    BusId, BusSettings, Clip, ClipId, Command, DspInsert, Listener, Mixer, MixerConfig, Play,
+    SendSettings, Spatial, SpatialMode, Start, VoiceId,
 };
 use cubed_opl::a2::player::A2Player;
 use cubed_rt_check::{allocations_during, trace_allocations, CountingAllocator};
@@ -254,8 +254,9 @@ fn effect_stack() {
 }
 
 /// The game mixer: six buses, a reverb on a return fed by sends, 48 voices
-/// of looping and one-shot clips, and every block a few plays, stops, fader
-/// moves and pan changes applied as commands.
+/// of looping and one-shot clips (most of them spatial, in 2D and 3D), and
+/// every block a few plays, stops, fader moves, pan changes and listener and
+/// emitter moves applied as commands.
 #[test]
 fn mixer() {
     let rate = RATE as f32;
@@ -302,11 +303,21 @@ fn mixer() {
         for _ in 0..2 {
             next_voice += 1;
             let v = next_voice;
+            let mode = if v.is_multiple_of(2) {
+                SpatialMode::Full
+            } else {
+                SpatialMode::Planar
+            };
+            let spatial = (!v.is_multiple_of(4)).then(|| Spatial {
+                velocity: [3.0, 0.0, -1.0],
+                ..Spatial::new(mode, [(v % 9) as f32 - 4.0, 0.0, -((v % 13) as f32)])
+            });
             mixer.apply(Command::Play(Play {
                 pitch: 0.5 + (v % 7) as f32 * 0.25,
                 pan: (v % 5) as f32 * 0.5 - 1.0,
                 looped: v.is_multiple_of(3),
                 start: Start::AtFrame(mixer.frame() + v % 200),
+                spatial,
                 ..Play::new(
                     VoiceId(v),
                     ClipId((v % 4) as u32),
@@ -316,6 +327,23 @@ fn mixer() {
             if v > 40 {
                 mixer.apply(Command::Stop(VoiceId(v - 40), 2_000));
             }
+        }
+        let t = block as f32 * 0.01;
+        mixer.apply(Command::SetListener(Listener {
+            position: [t.sin() * 3.0, 0.0, t.cos() * 3.0],
+            velocity: [1.0, 0.0, 0.0],
+            ..Listener::default()
+        }));
+        for v in next_voice.saturating_sub(30)..next_voice {
+            mixer.apply(Command::SetVoicePosition {
+                voice: VoiceId(v),
+                position: [
+                    (v as f32 + t).sin() * 20.0,
+                    0.0,
+                    (v as f32 + t).cos() * 20.0,
+                ],
+                velocity: [5.0, 0.0, 5.0],
+            });
         }
         let bus = BusId(1 + (block % 5) as u16);
         mixer.apply(Command::SetBusGain(bus, -((block % 24) as f32)));

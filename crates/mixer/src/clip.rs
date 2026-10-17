@@ -1,6 +1,7 @@
 //! Decoded sounds and the voices that play them.
 
 use crate::smooth::{apply_ramp, balance, Smoothed};
+use crate::spatial::{equal_power, Hearing, Spatial, SpatialVoice};
 
 /// A decoded sound: mono or stereo PCM at its own sample rate. Voices
 /// resample it to the mixer's rate as they play.
@@ -119,6 +120,8 @@ pub(crate) struct ClipVoice {
     pub(crate) looped: bool,
     /// The fade-out of a stop: frames left and the fade's full length.
     fade: Option<(u32, u32)>,
+    /// Where the voice is heard from; `None` plays it as it is.
+    pub(crate) spatial: Option<SpatialVoice>,
 }
 
 impl ClipVoice {
@@ -130,6 +133,7 @@ impl ClipVoice {
         pitch: f32,
         pan: f32,
         looped: bool,
+        spatial: Option<(Spatial, u64)>,
     ) -> ClipVoice {
         ClipVoice {
             clip,
@@ -140,6 +144,7 @@ impl ClipVoice {
             pan: Smoothed::new(pan.clamp(-1.0, 1.0)),
             looped,
             fade: None,
+            spatial: spatial.map(|(params, frame)| SpatialVoice::new(params, frame)),
         }
     }
 
@@ -166,16 +171,28 @@ impl ClipVoice {
         right: &mut [f32],
         scratch: &mut [f32],
         coeff: f32,
+        hearing: &Hearing,
     ) -> bool {
         let n = left.len().min(right.len()).min(scratch.len());
         let frames = clip.frames() as f64;
         if frames == 0.0 {
             return false;
         }
-        let step = self.base_rate * self.pitch as f64;
         // A stop's fade is exact to the sample: it may end partway through.
         let (fade_start, fade_end, fade_frames) = self.advance_fade(n);
         let audible = fade_frames.unwrap_or(n).min(n);
+        if self.spatial.is_some() {
+            return self.render_spatial(
+                clip,
+                &mut left[..n],
+                &mut right[..n],
+                &mut scratch[..n],
+                coeff,
+                hearing,
+                (fade_start, fade_end, fade_frames),
+            );
+        }
+        let step = self.base_rate * self.pitch as f64;
 
         // Mono or the left channel into scratch, sample by sample, so a
         // non-looped clip can end partway through the block.
@@ -237,6 +254,60 @@ impl ClipVoice {
         !finished
     }
 
+    /// A spatial voice: the clip (stereo summed to mono) at its doppler-shifted
+    /// rate, low-passed, then panned equal-power by where it is. Out of
+    /// earshot it goes virtual: its clock runs, nothing renders.
+    #[allow(clippy::too_many_arguments)]
+    fn render_spatial(
+        &mut self,
+        clip: &Clip,
+        left: &mut [f32],
+        right: &mut [f32],
+        scratch: &mut [f32],
+        coeff: f32,
+        hearing: &Hearing,
+        (fade_start, fade_end, fade_frames): (f32, f32, Option<usize>),
+    ) -> bool {
+        let n = left.len();
+        let audible = fade_frames.unwrap_or(n).min(n);
+        let fade_ended = fade_frames.is_some_and(|f| f <= n);
+        let (gain_start, gain_end) = self.gain.advance(coeff);
+        self.pan.advance(coeff);
+        let spatial = self.spatial.as_mut().expect("checked by render");
+        let block = spatial.advance(hearing, coeff);
+        let step = self.base_rate * self.pitch as f64 * block.ratio as f64;
+        let g0 = gain_start * fade_start * block.gain.0;
+        let g1 = gain_end * fade_end * block.gain.1;
+
+        if g0 == 0.0 && g1 == 0.0 {
+            let (position, ended) = skip(self.position, step, audible, clip.frames(), self.looped);
+            self.position = position;
+            return !(fade_ended || ended);
+        }
+
+        let (written, ended, position) = read_mono(
+            clip,
+            self.position,
+            step,
+            self.looped,
+            &mut scratch[..audible],
+        );
+        scratch[written..n].fill(0.0);
+        spatial.filter(&mut scratch[..written], block.lowpass_coeff);
+        let (l0, r0) = equal_power(block.pan.0);
+        let (l1, r1) = equal_power(block.pan.1);
+        let (a0, b0) = (g0 * l0, g0 * r0);
+        let step_l = (g1 * l1 - a0) / n as f32;
+        let step_r = (g1 * r1 - b0) / n as f32;
+        for i in 0..written {
+            let s = scratch[i];
+            left[i] += s * (a0 + step_l * i as f32);
+            right[i] += s * (b0 + step_r * i as f32);
+        }
+        self.position = position;
+        !(fade_ended || ended)
+    }
+
     /// The fade's level at the start of an `n`-frame block and where its
     /// line would be at the block's end (below zero if it ends sooner), and
     /// the frames it has left.
@@ -257,6 +328,48 @@ impl ClipVoice {
     }
 }
 
+/// Reads up to `out.len()` frames from `position`, the channels summed to
+/// mono. Returns the frames written, whether a one-shot clip ran out, and the
+/// next position.
+fn read_mono(
+    clip: &Clip,
+    mut position: f64,
+    step: f64,
+    looped: bool,
+    out: &mut [f32],
+) -> (usize, bool, f64) {
+    let frames = clip.frames() as f64;
+    for (i, sample) in out.iter_mut().enumerate() {
+        if !looped && position >= frames {
+            return (i, true, position);
+        }
+        *sample = match &clip.right {
+            None => interpolate(&clip.left, position, looped),
+            Some(right) => {
+                0.5 * (interpolate(&clip.left, position, looped)
+                    + interpolate(right, position, looped))
+            }
+        };
+        position += step;
+        if looped && position >= frames {
+            position -= frames * (position / frames).floor();
+        }
+    }
+    (out.len(), false, position)
+}
+
+/// Moves a silent voice's clock on by `count` frames. Returns the next
+/// position and whether a one-shot clip ran out.
+fn skip(position: f64, step: f64, count: usize, frames: usize, looped: bool) -> (f64, bool) {
+    let frames = frames as f64;
+    let next = position + step * count as f64;
+    if looped {
+        (next - frames * (next / frames).floor(), false)
+    } else {
+        (next, next >= frames)
+    }
+}
+
 fn sanitize_pitch(pitch: f32) -> f32 {
     if pitch.is_finite() {
         pitch.clamp(0.01, 16.0)
@@ -274,7 +387,14 @@ mod tests {
     fn render_all(voice: &mut ClipVoice, clip: &Clip, frames: usize) -> (Vec<f32>, Vec<f32>, bool) {
         let (mut l, mut r) = (vec![0.0; frames], vec![0.0; frames]);
         let mut scratch = vec![0.0; frames];
-        let alive = voice.render(clip, &mut l, &mut r, &mut scratch, 0.0);
+        let listener = crate::spatial::Listener::default();
+        let hearing = Hearing {
+            listener: &listener,
+            ear: listener.position,
+            frame: 0,
+            sample_rate: RATE,
+        };
+        let alive = voice.render(clip, &mut l, &mut r, &mut scratch, 0.0, &hearing);
         (l, r, alive)
     }
 
@@ -282,7 +402,7 @@ mod tests {
     fn plays_a_clip_at_its_own_rate_bit_exactly() {
         let samples: Vec<f32> = (0..100).map(|i| (i as f32 * 0.1).sin()).collect();
         let clip = Clip::mono(RATE, samples.clone());
-        let mut voice = ClipVoice::new(0, RATE, RATE, 1.0, 1.0, 0.0, false);
+        let mut voice = ClipVoice::new(0, RATE, RATE, 1.0, 1.0, 0.0, false, None);
         let (l, r, alive) = render_all(&mut voice, &clip, 128);
         assert!(!alive, "a 100-frame clip ends within 128 frames");
         assert_eq!(&l[..100], &samples[..]);
@@ -294,7 +414,7 @@ mod tests {
     fn resamples_to_the_mixer_rate() {
         // A 24 kHz clip lasts twice as many frames at 48 kHz.
         let clip = Clip::mono(24_000.0, vec![0.5; 100]);
-        let mut voice = ClipVoice::new(0, 24_000.0, RATE, 1.0, 1.0, 0.0, false);
+        let mut voice = ClipVoice::new(0, 24_000.0, RATE, 1.0, 1.0, 0.0, false, None);
         let (l, _, alive) = render_all(&mut voice, &clip, 256);
         assert!(!alive);
         let heard = l.iter().filter(|&&s| s != 0.0).count();
@@ -304,7 +424,7 @@ mod tests {
     #[test]
     fn loops_until_stopped_then_fades_out() {
         let clip = Clip::stereo(RATE, vec![1.0; 50], vec![-1.0; 50]);
-        let mut voice = ClipVoice::new(0, RATE, RATE, 1.0, 1.0, 0.0, true);
+        let mut voice = ClipVoice::new(0, RATE, RATE, 1.0, 1.0, 0.0, true, None);
         let (l, r, alive) = render_all(&mut voice, &clip, 300);
         assert!(alive);
         assert!(l.iter().all(|&s| (s - 1.0).abs() < 1e-6));

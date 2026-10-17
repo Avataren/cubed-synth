@@ -23,6 +23,7 @@ mod command;
 mod insert;
 mod mixer;
 mod smooth;
+mod spatial;
 pub mod wire;
 
 #[cfg(feature = "native")]
@@ -36,3 +37,4 @@ pub use command::{
 pub use insert::{DspInsert, Insert};
 pub use mixer::{BusMeter, Mixer, MixerConfig, Stats, MAX_INSERTS, MAX_SENDS};
 pub use smooth::MIN_DB;
+pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};

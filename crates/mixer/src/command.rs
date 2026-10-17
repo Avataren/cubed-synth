@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::clip::Clip;
 use crate::insert::Insert;
+use crate::spatial::{Listener, Spatial};
 
 /// A bus slot. The host names its buses and maps the names to slots; slot 0
 /// is the master bus, which feeds the output.
@@ -87,6 +88,8 @@ pub struct Play {
     /// Who loses when a bus runs out of voices: lower priorities first.
     pub priority: u8,
     pub start: Start,
+    /// Where it is heard from; `None` plays it as it is (music, UI).
+    pub spatial: Option<Spatial>,
 }
 
 impl Play {
@@ -101,6 +104,7 @@ impl Play {
             looped: false,
             priority: 128,
             start: Start::Now,
+            spatial: None,
         }
     }
 }
@@ -175,6 +179,17 @@ pub enum Command {
     StopAll(u32),
     /// Starts recording the master output into the buffer.
     Capture(Box<Capture>),
+    /// Moves the listener (once per game frame, with its velocity).
+    SetListener(Listener),
+    /// Makes the voice spatial, changes its spatial settings, or (`None`)
+    /// plays it as it is from now on.
+    SetVoiceSpatial(VoiceId, Option<Spatial>),
+    /// Moves a spatial voice (once per game frame, with its velocity).
+    SetVoicePosition {
+        voice: VoiceId,
+        position: [f32; 3],
+        velocity: [f32; 3],
+    },
 }
 
 impl std::fmt::Debug for Command {
@@ -212,6 +227,13 @@ impl std::fmt::Debug for Command {
             Command::StopBus(bus, fade) => write!(f, "StopBus({bus:?}, {fade})"),
             Command::StopAll(fade) => write!(f, "StopAll({fade})"),
             Command::Capture(c) => write!(f, "Capture({} frames)", c.left.len()),
+            Command::SetListener(l) => write!(f, "SetListener({l:?})"),
+            Command::SetVoiceSpatial(v, s) => write!(f, "SetVoiceSpatial({v:?}, {s:?})"),
+            Command::SetVoicePosition {
+                voice,
+                position,
+                velocity,
+            } => write!(f, "SetVoicePosition({voice:?}, {position:?}, {velocity:?})"),
         }
     }
 }

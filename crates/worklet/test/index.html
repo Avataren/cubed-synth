@@ -22,8 +22,8 @@ function play(voice, clip, bus) {
   v.setUint8(0, 11); v.setBigUint64(1, BigInt(voice), true); v.setUint32(9, clip, true);
   v.setUint16(13, bus, true); v.setFloat32(15, 1, true); v.setFloat32(19, 1, true);
   v.setFloat32(23, 0, true); v.setUint8(27, 0); v.setUint8(28, 128); v.setUint8(29, 0);
-  v.setBigUint64(30, 0n, true);
-  return new Uint8Array(v.buffer, 0, 38);
+  v.setBigUint64(30, 0n, true); v.setUint8(38, 0); // not spatial
+  return new Uint8Array(v.buffer, 0, 39);
 }
 
 async function run() {

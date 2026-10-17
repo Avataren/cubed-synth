@@ -10,6 +10,7 @@
 use crate::command::{
     BusId, BusSettings, ClipId, Command, Event, Play, SendSettings, Start, VoiceId,
 };
+use crate::spatial::{Listener, Rolloff, Spatial, SpatialMode};
 
 mod tag {
     pub const SET_BUS: u8 = 1;
@@ -29,6 +30,9 @@ mod tag {
     pub const STOP: u8 = 15;
     pub const STOP_BUS: u8 = 16;
     pub const STOP_ALL: u8 = 17;
+    pub const SET_LISTENER: u8 = 18;
+    pub const VOICE_SPATIAL: u8 = 19;
+    pub const VOICE_POSITION: u8 = 20;
 
     pub const ENDED: u8 = 1;
     pub const STOLEN: u8 = 2;
@@ -109,6 +113,32 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
                     w.u64(frame);
                 }
             }
+            w.spatial(p.spatial.as_ref());
+        }
+        Command::SetListener(l) => {
+            w.u8(tag::SET_LISTENER);
+            w.vec3(l.position);
+            w.vec3(l.forward);
+            w.vec3(l.up);
+            w.vec3(l.velocity);
+            w.f32(l.pan_width);
+            w.f32(l.speed_of_sound);
+            w.u8(l.doppler as u8);
+        }
+        Command::SetVoiceSpatial(voice, spatial) => {
+            w.u8(tag::VOICE_SPATIAL);
+            w.u64(voice.0);
+            w.spatial(spatial.as_ref());
+        }
+        Command::SetVoicePosition {
+            voice,
+            position,
+            velocity,
+        } => {
+            w.u8(tag::VOICE_POSITION);
+            w.u64(voice.0);
+            w.vec3(*position);
+            w.vec3(*velocity);
         }
         Command::SetVoiceGain(v, x) => w.voice_f32(tag::VOICE_GAIN, *v, *x),
         Command::SetVoicePitch(v, x) => w.voice_f32(tag::VOICE_PITCH, *v, *x),
@@ -211,6 +241,30 @@ impl Writer<'_> {
         self.u64(voice.0);
         self.f32(v);
     }
+    fn vec3(&mut self, v: [f32; 3]) {
+        v.iter().for_each(|&x| self.f32(x));
+    }
+    /// A presence byte, then the settings.
+    fn spatial(&mut self, spatial: Option<&Spatial>) {
+        let Some(s) = spatial else {
+            self.u8(0);
+            return;
+        };
+        self.u8(1);
+        self.u8(match s.mode {
+            SpatialMode::Planar => 0,
+            SpatialMode::Full => 1,
+        });
+        self.vec3(s.position);
+        self.vec3(s.velocity);
+        self.f32(s.min_distance);
+        self.f32(s.max_distance);
+        self.u8(match s.rolloff {
+            Rolloff::Inverse => 0,
+            Rolloff::Linear => 1,
+        });
+        self.f32(s.doppler);
+    }
 }
 
 struct Reader<'a> {
@@ -248,6 +302,32 @@ impl Reader<'_> {
     }
     fn voice(&mut self) -> Result<VoiceId, WireError> {
         Ok(VoiceId(self.u64()?))
+    }
+    fn vec3(&mut self) -> Result<[f32; 3], WireError> {
+        Ok([self.f32()?, self.f32()?, self.f32()?])
+    }
+    fn spatial(&mut self) -> Result<Option<Spatial>, WireError> {
+        if !self.bool()? {
+            return Ok(None);
+        }
+        let mode = if self.u8()? == 0 {
+            SpatialMode::Planar
+        } else {
+            SpatialMode::Full
+        };
+        Ok(Some(Spatial {
+            mode,
+            position: self.vec3()?,
+            velocity: self.vec3()?,
+            min_distance: self.f32()?,
+            max_distance: self.f32()?,
+            rolloff: if self.u8()? == 0 {
+                Rolloff::Inverse
+            } else {
+                Rolloff::Linear
+            },
+            doppler: self.f32()?,
+        }))
     }
 
     fn command(&mut self) -> Result<Command, WireError> {
@@ -311,6 +391,7 @@ impl Reader<'_> {
                 let priority = self.u8()?;
                 let start_kind = self.u8()?;
                 let frame = self.u64()?;
+                let spatial = self.spatial()?;
                 Command::Play(Play {
                     voice,
                     clip,
@@ -325,6 +406,7 @@ impl Reader<'_> {
                     } else {
                         Start::Now
                     },
+                    spatial,
                 })
             }
             tag::VOICE_GAIN => Command::SetVoiceGain(self.voice()?, self.f32()?),
@@ -333,6 +415,21 @@ impl Reader<'_> {
             tag::STOP => Command::Stop(self.voice()?, self.u32()?),
             tag::STOP_BUS => Command::StopBus(self.bus()?, self.u32()?),
             tag::STOP_ALL => Command::StopAll(self.u32()?),
+            tag::SET_LISTENER => Command::SetListener(Listener {
+                position: self.vec3()?,
+                forward: self.vec3()?,
+                up: self.vec3()?,
+                velocity: self.vec3()?,
+                pan_width: self.f32()?,
+                speed_of_sound: self.f32()?,
+                doppler: self.bool()?,
+            }),
+            tag::VOICE_SPATIAL => Command::SetVoiceSpatial(self.voice()?, self.spatial()?),
+            tag::VOICE_POSITION => Command::SetVoicePosition {
+                voice: self.voice()?,
+                position: self.vec3()?,
+                velocity: self.vec3()?,
+            },
             other => return Err(WireError::UnknownTag(other)),
         })
     }
@@ -411,6 +508,34 @@ mod tests {
             Command::Stop(voice, 240),
             Command::StopBus(bus, 10),
             Command::StopAll(0),
+            Command::Play(Play {
+                spatial: Some(Spatial {
+                    velocity: [1.0, -2.0, 3.5],
+                    min_distance: 2.0,
+                    max_distance: 40.0,
+                    rolloff: Rolloff::Linear,
+                    doppler: 0.5,
+                    ..Spatial::new(SpatialMode::Planar, [4.0, 5.0, 6.0])
+                }),
+                ..Play::new(voice, ClipId(1), bus)
+            }),
+            Command::SetListener(Listener {
+                position: [1.0, 2.0, 3.0],
+                velocity: [0.5, 0.0, 0.0],
+                pan_width: 12.0,
+                doppler: false,
+                ..Listener::default()
+            }),
+            Command::SetVoiceSpatial(
+                voice,
+                Some(Spatial::new(SpatialMode::Full, [1.0, 0.0, 0.0])),
+            ),
+            Command::SetVoiceSpatial(voice, None),
+            Command::SetVoicePosition {
+                voice,
+                position: [9.0, 8.0, 7.0],
+                velocity: [-1.0, 0.0, 1.0],
+            },
         ] {
             round_trip(command);
         }

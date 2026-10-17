@@ -9,6 +9,7 @@ use crate::command::{
 };
 use crate::insert::Insert;
 use crate::smooth::{balance, block_coeff, db_to_gain, Smoothed};
+use crate::spatial::{add_scaled, Hearing, Listener, SpatialVoice};
 
 /// Insert slots per bus.
 pub const MAX_INSERTS: usize = 8;
@@ -167,6 +168,9 @@ pub struct Mixer {
     returned: Vec<Returned>,
     capture: Option<Box<Capture>>,
     stats: Stats,
+    listener: Listener,
+    /// The frame of the listener's last update.
+    listener_updated_at: u64,
     // Scratch for rebuilding the order.
     indegree: Vec<u16>,
     stack: Vec<usize>,
@@ -201,6 +205,8 @@ impl Mixer {
             returned: Vec::with_capacity(config.max_returned),
             capture: None,
             stats: Stats::default(),
+            listener: Listener::default(),
+            listener_updated_at: 0,
             indegree: Vec::with_capacity(config.max_buses),
             stack: Vec::with_capacity(config.max_buses),
             new_order: Vec::with_capacity(config.max_buses),
@@ -313,6 +319,35 @@ impl Mixer {
                 for slot in self.voices.iter_mut().flatten() {
                     slot.voice.stop(fade);
                 }
+            }
+            Command::SetListener(listener) => {
+                self.listener = listener;
+                self.listener_updated_at = self.frame;
+            }
+            Command::SetVoiceSpatial(id, spatial) => {
+                let frame = self.frame;
+                self.with_voice(id, |v| match (spatial, &mut v.voice.spatial) {
+                    (Some(params), Some(state)) => {
+                        state.params = params;
+                        state.updated_at = frame;
+                    }
+                    (Some(params), state) => *state = Some(SpatialVoice::new(params, frame)),
+                    (None, state) => *state = None,
+                });
+            }
+            Command::SetVoicePosition {
+                voice,
+                position,
+                velocity,
+            } => {
+                let frame = self.frame;
+                self.with_voice(voice, |v| {
+                    if let Some(state) = &mut v.voice.spatial {
+                        state.params.position = position;
+                        state.params.velocity = velocity;
+                        state.updated_at = frame;
+                    }
+                });
             }
             Command::Capture(mut capture) => {
                 capture.filled = 0;
@@ -660,6 +695,7 @@ impl Mixer {
                 play.pitch,
                 play.pan,
                 play.looped,
+                play.spatial.map(|s| (s, start_frame)),
             ),
         });
     }
@@ -706,6 +742,17 @@ impl Mixer {
         let n = out_left.len();
         let sample_rate = self.config.sample_rate;
         let coeff = block_coeff(n, sample_rate);
+        let since = self.frame.saturating_sub(self.listener_updated_at) as f32 / sample_rate;
+        let hearing = Hearing {
+            listener: &self.listener,
+            ear: add_scaled(
+                self.listener.position,
+                self.listener.velocity,
+                since.min(0.1),
+            ),
+            frame: self.frame,
+            sample_rate,
+        };
         let Mixer {
             buses,
             order,
@@ -747,6 +794,7 @@ impl Mixer {
                 &mut bus.right[offset..n],
                 &mut scratch[..n - offset],
                 coeff,
+                &hearing,
             );
             bus.has_input = true;
             if alive {
