@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use crate::clip::{Clip, ClipVoice};
 use crate::command::{
-    BusId, BusSettings, Capture, ClipId, Command, Event, Play, PlaySource, Returned, SendSettings,
-    SourceId, Start, VoiceId,
+    BusId, BusSettings, Capture, ClipId, Command, Event, Play, PlaySfx, PlaySource, Returned,
+    SendSettings, SourceId, Start, VoiceId,
 };
 use crate::insert::Insert;
+use crate::sfx::SfxVoice;
 use crate::smooth::{balance, block_coeff, db_to_gain, GainRamp, Smoothed};
-use crate::source::{Source, SourceVoice, Voice};
+use crate::source::{Generator, Source, SourceVoice, Voice};
 use crate::spatial::{add_scaled, Hearing, Listener, SpatialVoice};
 
 /// Insert slots per bus.
@@ -338,6 +339,7 @@ impl Mixer {
                 }
             }
             Command::PlaySource(play) => self.play_source(play),
+            Command::PlaySfx(play) => self.play_sfx(play),
             Command::SourceEvent { voice, event } => self.with_voice(voice, |v| {
                 if let Some(source) = v.voice.source_mut() {
                     source.event(event);
@@ -404,6 +406,18 @@ impl Mixer {
                         state.params.position = position;
                         state.params.velocity = velocity;
                         state.updated_at = frame;
+                    }
+                });
+            }
+            Command::SetVoiceOcclusion { voice, amount } => {
+                let amount = if amount.is_finite() {
+                    amount.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                self.with_voice(voice, |v| {
+                    if let Some(state) = v.voice.spatial() {
+                        state.occlusion.set(amount);
                     }
                 });
             }
@@ -744,7 +758,34 @@ impl Mixer {
         };
         let start_frame = self.start_frame(play.start);
         let voice = SourceVoice::new(
-            source,
+            Generator::Boxed(source),
+            play.gain,
+            play.pan,
+            play.spatial.map(|s| (s, start_frame)),
+        );
+        self.place_voice(
+            slot,
+            play.voice,
+            bus,
+            play.priority,
+            start_frame,
+            Voice::Source(voice),
+        );
+    }
+
+    fn play_sfx(&mut self, play: PlaySfx) {
+        let Some(bus) = self.used_bus(play.bus) else {
+            self.stats.rejected_commands += 1;
+            self.emit(Event::Rejected(play.voice));
+            return;
+        };
+        let Some(slot) = self.allocate_voice(bus, play.priority, play.voice) else {
+            return;
+        };
+        let start_frame = self.start_frame(play.start);
+        let sfx = SfxVoice::new(play.sfx, self.config.sample_rate, play.pitch);
+        let voice = SourceVoice::new(
+            Generator::Sfx(sfx),
             play.gain,
             play.pan,
             play.spatial.map(|s| (s, start_frame)),
@@ -1070,7 +1111,7 @@ fn give_back(returned: &mut Vec<Returned>, stats: &mut Stats, item: Returned) {
 /// Lets go of an ended voice: a source goes back to the host.
 fn retire(returned: &mut Vec<Returned>, stats: &mut Stats, mut slot: VoiceSlot) {
     if let Voice::Source(voice) = &mut slot.voice {
-        if let Some(source) = voice.source.take() {
+        if let Some(Generator::Boxed(source)) = voice.source.take() {
             give_back(returned, stats, Returned::Source(source));
         }
     }

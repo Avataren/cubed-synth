@@ -2,6 +2,7 @@
 //! chip-music players, streams, synths.
 
 use crate::clip::ClipVoice;
+use crate::sfx::SfxVoice;
 use crate::smooth::{balance, fade_step, start_fade, step_ramp, GainRamp, Smoothed};
 use crate::spatial::{equal_power, Hearing, Spatial, SpatialVoice};
 
@@ -37,10 +38,19 @@ pub enum SourceEvent {
     AllNotesOff,
 }
 
+/// What makes a source voice's sound.
+pub(crate) enum Generator {
+    /// A host's source object, handed back when the voice ends.
+    Boxed(Box<dyn Source>),
+    /// A procedural sound effect, made in place from plain data.
+    Sfx(SfxVoice),
+}
+
 /// A playing source.
 pub(crate) struct SourceVoice {
-    /// Taken when the voice ends, to be handed back off the audio thread.
-    pub(crate) source: Option<Box<dyn Source>>,
+    /// Taken when the voice ends, a boxed one to be handed back off the
+    /// audio thread.
+    pub(crate) source: Option<Generator>,
     pub(crate) gain: Smoothed,
     pub(crate) pan: Smoothed,
     fade: Option<(u32, u32)>,
@@ -50,7 +60,7 @@ pub(crate) struct SourceVoice {
 
 impl SourceVoice {
     pub(crate) fn new(
-        source: Box<dyn Source>,
+        source: Generator,
         gain: f32,
         pan: f32,
         spatial: Option<(Spatial, u64)>,
@@ -85,7 +95,14 @@ impl SourceVoice {
         };
         let (sl, sr) = (&mut scratch.0[..n], &mut scratch.1[..n]);
         // A source keeps its own clock, so it renders even when silent.
-        let alive = source.render(sl, sr);
+        let alive = match source {
+            Generator::Boxed(source) => source.render(sl, sr),
+            Generator::Sfx(sfx) => {
+                let more = sfx.render(sl);
+                sr.copy_from_slice(sl);
+                more
+            }
+        };
         step_ramp(&mut self.gain, &mut self.ramp, n);
         let (fade_start, fade_end, fade_frames) = fade_step(&mut self.fade, n);
         let audible = fade_frames.unwrap_or(n).min(n);
@@ -129,7 +146,10 @@ impl Voice {
     /// The source playing on this voice, if it is one.
     pub(crate) fn source_mut(&mut self) -> Option<&mut (dyn Source + 'static)> {
         match self {
-            Voice::Source(v) => v.source.as_deref_mut(),
+            Voice::Source(v) => match v.source.as_mut()? {
+                Generator::Boxed(source) => Some(source.as_mut()),
+                Generator::Sfx(_) => None,
+            },
             Voice::Clip(_) => None,
         }
     }

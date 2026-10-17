@@ -27,6 +27,7 @@ mod command;
 pub mod effects;
 mod insert;
 mod mixer;
+pub mod sfx;
 mod smooth;
 mod source;
 mod spatial;
@@ -42,12 +43,13 @@ pub mod stream;
 
 pub use clip::Clip;
 pub use command::{
-    BusId, BusSettings, Capture, ClipId, Command, Duck, Event, Play, PlaySource, Returned,
+    BusId, BusSettings, Capture, ClipId, Command, Duck, Event, Play, PlaySfx, PlaySource, Returned,
     SendSettings, SourceId, Start, VoiceId,
 };
 pub use effects::{Effect, EffectKind};
 pub use insert::{DspInsert, Insert};
 pub use mixer::{BusMeter, Mixer, MixerConfig, Stats, MAX_INSERTS, MAX_SENDS};
+pub use sfx::{Sfx, SfxPreset, SfxWave};
 pub use smooth::MIN_DB;
 pub use source::{Source, SourceEvent};
 pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};

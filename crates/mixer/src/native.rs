@@ -332,6 +332,9 @@ impl NativeHost {
 
     /// Queues a command for the next callback; gives it back if the queue is
     /// full.
+    // A command is large (a sound effect travels as plain data, so the audio
+    // thread never frees it), and it comes back by value to be retried.
+    #[allow(clippy::result_large_err)]
     pub fn send(&mut self, command: Command) -> Result<(), Command> {
         self.commands.push(command).map_err(|e| match e {
             rtrb::PushError::Full(command) => command,

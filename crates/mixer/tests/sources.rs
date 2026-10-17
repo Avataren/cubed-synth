@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use cubed_mixer::{
-    BusId, BusSettings, Clip, ClipId, Command, Duck, Event, Mixer, MixerConfig, Play, PlaySource,
-    Returned, Source, SourceId, VoiceId,
+    BusId, BusSettings, Clip, ClipId, Command, Duck, Event, Mixer, MixerConfig, Play, PlaySfx,
+    PlaySource, Returned, Sfx, SfxPreset, Source, SourceId, VoiceId,
 };
 
 const RATE: f32 = 48_000.0;
@@ -277,4 +277,38 @@ mod songs {
             assert!(open_song(format, b"not a song", RATE, SongOptions::default()).is_err());
         }
     }
+}
+
+#[test]
+fn a_sound_effect_plays_from_plain_data_and_ends() {
+    let mut mixer = mixer();
+    let sfx = SfxPreset::Laser.sfx().normalized(0.5, RATE);
+    mixer.apply(Command::PlaySfx(PlaySfx::new(VoiceId(1), sfx, SFX)));
+    let (l, r) = render(&mut mixer, 24_000);
+    let peak = l.iter().chain(&r).fold(0f32, |p, s| p.max(s.abs()));
+    assert!((peak - 0.5).abs() < 0.01, "normalized: {peak}");
+    // A quarter-second laser ends by itself; nothing comes back to free.
+    assert_eq!(events(&mut mixer), vec![Event::Ended(VoiceId(1))]);
+    assert_eq!(returned_sources(&mut mixer), 0);
+
+    // Pitch shortens nothing but raises the sound; another seed changes the noise.
+    let explosion = SfxPreset::Explosion.sfx();
+    let play = |mixer: &mut Mixer, voice, sfx: Sfx, pitch| {
+        mixer.apply(Command::PlaySfx(PlaySfx {
+            pitch,
+            ..PlaySfx::new(VoiceId(voice), sfx, SFX)
+        }));
+        render(mixer, 48_000).0
+    };
+    let a = play(&mut mixer, 2, explosion, 1.0);
+    let b = play(
+        &mut mixer,
+        3,
+        Sfx {
+            seed: 5,
+            ..explosion
+        },
+        1.0,
+    );
+    assert_ne!(a, b);
 }

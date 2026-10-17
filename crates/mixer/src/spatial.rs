@@ -8,7 +8,7 @@
 
 use std::f32::consts::{FRAC_PI_4, TAU};
 
-use crate::smooth::Smoothed;
+use crate::smooth::{db_to_gain, Smoothed};
 
 /// How a spatial voice is heard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +78,11 @@ pub struct Listener {
     pub speed_of_sound: f32,
     /// The project-wide doppler switch.
     pub doppler: bool,
+    /// How a fully occluded voice (`Command::SetVoiceOcclusion` 1) is heard:
+    /// this much quieter (dB, below 0) and low-passed at this cutoff. A
+    /// partly occluded one is part of the way there.
+    pub occlusion_db: f32,
+    pub occlusion_cutoff_hz: f32,
 }
 
 impl Default for Listener {
@@ -90,6 +95,8 @@ impl Default for Listener {
             pan_width: 10.0,
             speed_of_sound: 343.0,
             doppler: true,
+            occlusion_db: -12.0,
+            occlusion_cutoff_hz: 1_000.0,
         }
     }
 }
@@ -105,6 +112,13 @@ const MAX_DOPPLER: f32 = 2.0;
 /// Positions are extrapolated by their velocity for at most this long after
 /// an update, in case updates stop.
 const MAX_EXTRAPOLATION_SECONDS: f32 = 0.1;
+/// Occlusion glides this many times slower than the other spatial results
+/// (about 60 ms), so a wall passing between does not thump.
+const OCCLUSION_GLIDE: f32 = 6.0;
+/// For this long after a voice starts, occlusion glides as fast as the rest:
+/// the host's first occlusion for a new sound lands within a game frame, and
+/// the sound's attack should not be heard through the wall meanwhile.
+const YOUNG_SECONDS: f32 = 0.05;
 
 /// What a spatial voice sounds like from the listener this block.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -262,6 +276,15 @@ fn doppler(listener: &Listener, ear: [f32; 3], spatial: &Spatial, position: [f32
     ((c + toward_source) / denominator).clamp(1.0 / MAX_DOPPLER, MAX_DOPPLER)
 }
 
+/// `cutoff` moved toward `occluded` (when that is lower) by `amount`, on a
+/// log scale.
+fn occluded_cutoff(cutoff: f32, occluded: f32, amount: f32) -> f32 {
+    if amount <= 0.0 || occluded >= cutoff || occluded <= 0.0 {
+        return cutoff;
+    }
+    cutoff * (occluded / cutoff).powf(amount.min(1.0))
+}
+
 /// Equal-power gains for `pan` in -1..1: the centre is -3 dB on each side.
 pub(crate) fn equal_power(pan: f32) -> (f32, f32) {
     let angle = (pan.clamp(-1.0, 1.0) + 1.0) * FRAC_PI_4;
@@ -282,10 +305,14 @@ pub(crate) struct SpatialVoice {
     pub(crate) params: Spatial,
     /// The mixer frame of the last position update.
     pub(crate) updated_at: u64,
+    /// The mixer frame it became spatial at.
+    born: u64,
     gain: Smoothed,
     pan: Smoothed,
     cutoff: Smoothed,
     ratio: Smoothed,
+    /// 0 (heard directly) to 1 (behind a wall).
+    pub(crate) occlusion: Smoothed,
     lowpass: f32,
     started: bool,
 }
@@ -313,10 +340,12 @@ impl SpatialVoice {
         SpatialVoice {
             params,
             updated_at: frame,
+            born: frame,
             gain: Smoothed::new(0.0),
             pan: Smoothed::new(0.0),
             cutoff: Smoothed::new(NEAR_CUTOFF_HZ),
             ratio: Smoothed::new(1.0),
+            occlusion: Smoothed::new(0.0),
             lowpass: 0.0,
             started: false,
         }
@@ -328,19 +357,34 @@ impl SpatialVoice {
         let since = hearing.frame.saturating_sub(self.updated_at) as f32 / hearing.sample_rate;
         let position = extrapolate(&self.params, since);
         let heard = hear(hearing.listener, hearing.ear, &self.params, position);
+        let listener = hearing.listener;
+        if !self.started {
+            self.occlusion.snap(self.occlusion.target());
+        }
+        let young =
+            (hearing.frame.saturating_sub(self.born) as f32) < YOUNG_SECONDS * hearing.sample_rate;
+        let glide = if young {
+            coeff
+        } else {
+            coeff.powf(1.0 / OCCLUSION_GLIDE)
+        };
+        let (o0, o1) = self.occlusion.advance(glide);
+        let cutoff = occluded_cutoff(heard.cutoff_hz, listener.occlusion_cutoff_hz, o1);
         if self.started {
             self.gain.set(heard.gain);
             self.pan.set(heard.pan);
-            self.cutoff.set(heard.cutoff_hz);
+            self.cutoff.set(cutoff);
             self.ratio.set(heard.ratio);
         } else {
             self.gain.snap(heard.gain);
             self.pan.snap(heard.pan);
-            self.cutoff.snap(heard.cutoff_hz);
+            self.cutoff.snap(cutoff);
             self.ratio.snap(heard.ratio);
             self.started = true;
         }
-        let gain = self.gain.advance(coeff);
+        let (g0, g1) = self.gain.advance(coeff);
+        let db = listener.occlusion_db.min(0.0);
+        let gain = (g0 * db_to_gain(db * o0), g1 * db_to_gain(db * o1));
         let pan = self.pan.advance(coeff);
         let (_, cutoff) = self.cutoff.advance(coeff);
         let (r0, r1) = self.ratio.advance(coeff);

@@ -8,9 +8,10 @@
 //! files through its own exports). Decoding never allocates.
 
 use crate::command::{
-    BusId, BusSettings, ClipId, Command, Duck, Event, Play, PlaySource, SendSettings, SourceId,
-    Start, VoiceId,
+    BusId, BusSettings, ClipId, Command, Duck, Event, Play, PlaySfx, PlaySource, SendSettings,
+    SourceId, Start, VoiceId,
 };
+use crate::sfx::{Sfx, SfxWave};
 use crate::source::SourceEvent;
 use crate::spatial::{Listener, Rolloff, Spatial, SpatialMode};
 
@@ -39,6 +40,8 @@ mod tag {
     pub const FADE_VOICE: u8 = 22;
     pub const INSERT_PARAM: u8 = 23;
     pub const SOURCE_EVENT: u8 = 24;
+    pub const PLAY_SFX: u8 = 25;
+    pub const VOICE_OCCLUSION: u8 = 26;
 
     pub const ENDED: u8 = 1;
     pub const STOLEN: u8 = 2;
@@ -147,6 +150,36 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             w.start(p.start);
             w.spatial(p.spatial.as_ref());
         }
+        Command::PlaySfx(p) => {
+            w.u8(tag::PLAY_SFX);
+            w.u64(p.voice.0);
+            w.u16(p.bus.0);
+            w.f32(p.gain);
+            w.f32(p.pitch);
+            w.f32(p.pan);
+            w.u8(p.priority);
+            w.start(p.start);
+            w.spatial(p.spatial.as_ref());
+            let s = &p.sfx;
+            for v in [s.duration, s.start_hz, s.end_hz] {
+                w.f32(v);
+            }
+            w.u8(s.wave.index());
+            for v in [
+                s.noise_mix,
+                s.attack,
+                s.release,
+                s.decay,
+                s.vibrato_hz,
+                s.vibrato_depth,
+                s.lowpass_hz,
+                s.duty_cycle,
+            ] {
+                w.f32(v);
+            }
+            w.u64(s.seed);
+            w.f32(s.level);
+        }
         Command::SourceEvent { voice, event } => {
             w.u8(tag::SOURCE_EVENT);
             w.u64(voice.0);
@@ -194,6 +227,11 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             w.f32(l.pan_width);
             w.f32(l.speed_of_sound);
             w.u8(l.doppler as u8);
+            w.f32(l.occlusion_db);
+            w.f32(l.occlusion_cutoff_hz);
+        }
+        Command::SetVoiceOcclusion { voice, amount } => {
+            w.voice_f32(tag::VOICE_OCCLUSION, *voice, *amount)
         }
         Command::SetVoiceSpatial(voice, spatial) => {
             w.u8(tag::VOICE_SPATIAL);
@@ -528,6 +566,43 @@ impl Reader<'_> {
                 start: self.start()?,
                 spatial: self.spatial()?,
             }),
+            tag::PLAY_SFX => {
+                let voice = self.voice()?;
+                let bus = self.bus()?;
+                let gain = self.f32()?;
+                let pitch = self.f32()?;
+                let pan = self.f32()?;
+                let priority = self.u8()?;
+                let start = self.start()?;
+                let spatial = self.spatial()?;
+                let sfx = Sfx {
+                    duration: self.f32()?,
+                    start_hz: self.f32()?,
+                    end_hz: self.f32()?,
+                    wave: SfxWave::from_index(self.u8()?),
+                    noise_mix: self.f32()?,
+                    attack: self.f32()?,
+                    release: self.f32()?,
+                    decay: self.f32()?,
+                    vibrato_hz: self.f32()?,
+                    vibrato_depth: self.f32()?,
+                    lowpass_hz: self.f32()?,
+                    duty_cycle: self.f32()?,
+                    seed: self.u64()?,
+                    level: self.f32()?,
+                };
+                Command::PlaySfx(PlaySfx {
+                    voice,
+                    bus,
+                    sfx,
+                    gain,
+                    pitch,
+                    pan,
+                    priority,
+                    start,
+                    spatial,
+                })
+            }
             tag::SOURCE_EVENT => {
                 let voice = self.voice()?;
                 let kind = self.u8()?;
@@ -566,7 +641,13 @@ impl Reader<'_> {
                 pan_width: self.f32()?,
                 speed_of_sound: self.f32()?,
                 doppler: self.bool()?,
+                occlusion_db: self.f32()?,
+                occlusion_cutoff_hz: self.f32()?,
             }),
+            tag::VOICE_OCCLUSION => Command::SetVoiceOcclusion {
+                voice: self.voice()?,
+                amount: self.f32()?,
+            },
             tag::VOICE_SPATIAL => Command::SetVoiceSpatial(self.voice()?, self.spatial()?),
             tag::VOICE_POSITION => Command::SetVoicePosition {
                 voice: self.voice()?,
@@ -650,6 +731,25 @@ mod tests {
                 voice,
                 event: SourceEvent::AllNotesOff,
             },
+            Command::PlaySfx(PlaySfx {
+                gain: 0.7,
+                pitch: 1.25,
+                pan: -0.3,
+                priority: 77,
+                start: Start::AtFrame(5),
+                spatial: Some(Spatial::new(SpatialMode::Planar, [3.0, 0.0, 1.0])),
+                ..PlaySfx::new(
+                    voice,
+                    Sfx {
+                        seed: 0xdead_beef_0123,
+                        vibrato_hz: 6.0,
+                        vibrato_depth: 0.1,
+                        lowpass_hz: 2_000.0,
+                        ..crate::sfx::SfxPreset::Laser.sfx()
+                    },
+                    bus,
+                )
+            }),
             Command::RemoveBus(bus),
             Command::SetBusGain(bus, -3.0),
             Command::SetBusPan(bus, -1.0),
@@ -714,8 +814,14 @@ mod tests {
                 velocity: [0.5, 0.0, 0.0],
                 pan_width: 12.0,
                 doppler: false,
+                occlusion_db: -20.0,
+                occlusion_cutoff_hz: 600.0,
                 ..Listener::default()
             }),
+            Command::SetVoiceOcclusion {
+                voice,
+                amount: 0.75,
+            },
             Command::SetVoiceSpatial(
                 voice,
                 Some(Spatial::new(SpatialMode::Full, [1.0, 0.0, 0.0])),

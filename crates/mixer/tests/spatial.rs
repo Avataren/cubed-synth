@@ -263,3 +263,102 @@ fn a_voice_can_become_spatial_and_stop_being_it() {
     let (left, right) = fly(&mut mixer, 0.25, |_| ([0.0; 3], [0.0; 3]));
     assert!((rms(&left[6000..]) - rms(&right[6000..])).abs() < 1e-3);
 }
+
+fn db(x: f32) -> f32 {
+    20.0 * x.log10()
+}
+
+#[test]
+fn occlusion_muffles_a_voice_and_glides_in_and_out() {
+    let mut mixer = mixer();
+    mixer.apply(Command::SetListener(Listener::default()));
+    play(
+        &mut mixer,
+        Spatial::new(SpatialMode::Full, [0.0, 0.0, -1.0]),
+    );
+    let here = |_| ([0.0, 0.0, -1.0], [0.0; 3]);
+    let (clear, _) = fly(&mut mixer, 0.5, here);
+    let clear = rms(&clear[12_000..]);
+
+    mixer.apply(Command::SetVoiceOcclusion {
+        voice: VOICE,
+        amount: 1.0,
+    });
+    let (left, _) = fly(&mut mixer, 0.5, here);
+    // No step: the first few milliseconds are still near the clear level.
+    let start = rms(&left[..240]);
+    assert!(db(start / clear) > -3.0, "glides: {}", db(start / clear));
+    // -12 dB, and the 1 kHz cutoff takes about 3 dB more off a 1 kHz tone.
+    let occluded = db(rms(&left[12_000..]) / clear);
+    assert!((-17.0..-13.0).contains(&occluded), "{occluded} dB");
+
+    mixer.apply(Command::SetVoiceOcclusion {
+        voice: VOICE,
+        amount: 0.5,
+    });
+    let (left, _) = fly(&mut mixer, 0.5, here);
+    let half = db(rms(&left[12_000..]) / clear);
+    assert!(half > occluded + 4.0 && half < -4.0, "{half} dB");
+
+    mixer.apply(Command::SetVoiceOcclusion {
+        voice: VOICE,
+        amount: 0.0,
+    });
+    let (left, _) = fly(&mut mixer, 0.5, here);
+    assert!(db(rms(&left[12_000..]) / clear).abs() < 0.2);
+}
+
+#[test]
+fn a_voice_occluded_before_it_plays_starts_muffled() {
+    let mut mixer = mixer();
+    mixer.apply(Command::SetListener(Listener {
+        occlusion_db: -20.0,
+        occlusion_cutoff_hz: 20_000.0,
+        ..Listener::default()
+    }));
+    play(
+        &mut mixer,
+        Spatial::new(SpatialMode::Full, [0.0, 0.0, -1.0]),
+    );
+    mixer.apply(Command::SetVoiceOcclusion {
+        voice: VOICE,
+        amount: 1.0,
+    });
+    let (left, _) = fly(&mut mixer, 0.25, |_| ([0.0, 0.0, -1.0], [0.0; 3]));
+    // A 0.5 sine, -3 dB in the centre, then -20 dB.
+    let expected = 0.25 * 0.1;
+    let first = rms(&left[..480]);
+    assert!(
+        (first / expected - 1.0).abs() < 0.1,
+        "{first} vs {expected}"
+    );
+}
+
+#[test]
+fn a_new_voice_takes_its_first_occlusion_quickly() {
+    let mut mixer = mixer();
+    mixer.apply(Command::SetListener(Listener {
+        occlusion_cutoff_hz: 20_000.0,
+        ..Listener::default()
+    }));
+    play(
+        &mut mixer,
+        Spatial::new(SpatialMode::Full, [0.0, 0.0, -1.0]),
+    );
+    // A game frame (800 frames) late: within another ~16 ms it is there.
+    let here = |_| ([0.0, 0.0, -1.0], [0.0; 3]);
+    fly(&mut mixer, 800.0 / RATE, here);
+    mixer.apply(Command::SetVoiceOcclusion {
+        voice: VOICE,
+        amount: 1.0,
+    });
+    let (left, _) = fly(&mut mixer, 0.1, here);
+    let settled = rms(&left[2_400..]);
+    let soon = rms(&left[800..1_600]);
+    assert!(db(soon / settled) < 1.0, "{} dB above", db(soon / settled));
+    assert!(
+        (db(settled / 0.25) + 12.0).abs() < 0.3,
+        "{}",
+        db(settled / 0.25)
+    );
+}

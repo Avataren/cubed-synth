@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::clip::Clip;
 use crate::insert::Insert;
+use crate::sfx::Sfx;
 use crate::source::{Source, SourceEvent};
 use crate::spatial::{Listener, Spatial};
 
@@ -173,6 +174,38 @@ impl PlaySource {
     }
 }
 
+/// A procedural sound effect to play (see `sfx`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaySfx {
+    pub voice: VoiceId,
+    pub bus: BusId,
+    pub sfx: Sfx,
+    /// Linear gain.
+    pub gain: f32,
+    /// Scales every frequency of the sound; 1 is as made.
+    pub pitch: f32,
+    pub pan: f32,
+    pub priority: u8,
+    pub start: Start,
+    pub spatial: Option<Spatial>,
+}
+
+impl PlaySfx {
+    pub fn new(voice: VoiceId, sfx: Sfx, bus: BusId) -> PlaySfx {
+        PlaySfx {
+            voice,
+            bus,
+            sfx,
+            gain: 1.0,
+            pitch: 1.0,
+            pan: 0.0,
+            priority: 128,
+            start: Start::Now,
+            spatial: None,
+        }
+    }
+}
+
 /// A recording of the master output, filled block by block until full and
 /// then handed back as [`Returned::Capture`].
 #[derive(Debug)]
@@ -245,6 +278,8 @@ pub enum Command {
     PrepareSource(SourceId, Box<dyn Source>),
     /// Plays the prepared source; the slot is empty afterwards.
     PlaySource(PlaySource),
+    /// Plays a procedural sound effect, made in place: no object to prepare.
+    PlaySfx(PlaySfx),
     SetVoiceGain(VoiceId, f32),
     /// Hands an event (a note) to the source playing on the voice.
     SourceEvent {
@@ -278,6 +313,14 @@ pub enum Command {
         voice: VoiceId,
         position: [f32; 3],
         velocity: [f32; 3],
+    },
+    /// How much is between a spatial voice and the listener: 0 (nothing) to
+    /// 1 (a wall), which makes it quieter and duller by the listener's
+    /// `occlusion_db` and `occlusion_cutoff_hz`. It glides over about 60 ms;
+    /// sent before the voice's first block, it starts there.
+    SetVoiceOcclusion {
+        voice: VoiceId,
+        amount: f32,
     },
 }
 
@@ -320,6 +363,7 @@ impl std::fmt::Debug for Command {
             Command::Play(play) => write!(f, "Play({play:?})"),
             Command::PrepareSource(id, _) => write!(f, "PrepareSource({id:?}, ..)"),
             Command::PlaySource(play) => write!(f, "PlaySource({play:?})"),
+            Command::PlaySfx(play) => write!(f, "PlaySfx({play:?})"),
             Command::SourceEvent { voice, event } => write!(f, "SourceEvent({voice:?}, {event:?})"),
             Command::FadeVoice {
                 voice,
@@ -340,6 +384,9 @@ impl std::fmt::Debug for Command {
                 position,
                 velocity,
             } => write!(f, "SetVoicePosition({voice:?}, {position:?}, {velocity:?})"),
+            Command::SetVoiceOcclusion { voice, amount } => {
+                write!(f, "SetVoiceOcclusion({voice:?}, {amount})")
+            }
         }
     }
 }

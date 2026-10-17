@@ -21,7 +21,7 @@ use cubed_mixer::{
     Mixer, MixerConfig, Play, PlaySource, SendSettings, SourceId, Spatial, SpatialMode, Start,
     VoiceId,
 };
-use cubed_mixer::{SourceEvent, SynthSource};
+use cubed_mixer::{PlaySfx, SfxPreset, SourceEvent, SynthSource};
 use cubed_opl::a2::player::A2Player;
 use cubed_rt_check::{allocations_during, trace_allocations, CountingAllocator};
 use cubed_sid::stream::SidChipPlayer;
@@ -365,6 +365,10 @@ fn mixer() {
                 ],
                 velocity: [5.0, 0.0, 5.0],
             });
+            mixer.apply(Command::SetVoiceOcclusion {
+                voice: VoiceId(v),
+                amount: ((v + block as u64) % 5) as f32 * 0.25,
+            });
         }
         let bus = BusId(1 + (block % 5) as u16);
         mixer.apply(Command::SetBusGain(bus, -((block % 24) as f32)));
@@ -557,4 +561,40 @@ fn mixer_synth() {
         }
     });
     assert_eq!(events, 0, "{events} allocations or frees");
+}
+
+/// Procedural sound effects started straight from commands, several every
+/// block, spatial and not, at different pitches and seeds.
+#[test]
+fn mixer_sfx() {
+    let rate = RATE as f32;
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        ..MixerConfig::default()
+    });
+    mixer.apply(Command::SetBus(BusId(1), BusSettings::default()));
+    let sounds: Vec<_> = SfxPreset::ALL
+        .iter()
+        .map(|p| p.sfx().normalized(0.5, rate))
+        .collect();
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let mut next = 0u64;
+    assert_no_alloc("sound effects", 5, |block| {
+        for _ in 0..3 {
+            next += 1;
+            let mut sfx = sounds[next as usize % sounds.len()];
+            sfx.seed = next;
+            let spatial = next
+                .is_multiple_of(2)
+                .then(|| Spatial::new(SpatialMode::Full, [(next % 7) as f32 - 3.0, 0.0, -4.0]));
+            mixer.apply(Command::PlaySfx(PlaySfx {
+                pitch: 0.75 + (next % 5) as f32 * 0.125,
+                spatial,
+                ..PlaySfx::new(VoiceId(next), sfx, BusId(1))
+            }));
+        }
+        let _ = block;
+        mixer.process(&mut left, &mut right);
+        mixer.drain_events(|_| {});
+    });
 }
