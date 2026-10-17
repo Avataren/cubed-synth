@@ -9,8 +9,9 @@
 //   {type: 'init', wasm: ArrayBuffer, maxVoices, maxBuses, maxClips, seedLo, seedHi}
 //   {type: 'commands', bytes: ArrayBuffer}  cubed_mixer::wire commands
 //   {type: 'clip', id, sampleRate, left: Float32Array, right?: Float32Array}
-//   {type: 'song', source, format (0 AHX/HVL, 1 A2M, 2 SID), bytes: ArrayBuffer,
-//    subsong, looped}  prepares source slot `source` for a PlaySource command
+//   {type: 'song', source, format (0 AHX/HVL, 1 A2M, 2 SID, 3 MOD, 4 S3M, 5 XM), bytes: ArrayBuffer,
+//    subsong, looped, separation?}  prepares source slot `source` for a
+//    PlaySource command; separation (0-1) is a module's stereo width
 //   {type: 'effect', bus, slot, kind (EffectKind index; -1 empties the slot),
 //    params: Float32Array}
 //   {type: 'synth', source, bytes: ArrayBuffer (the patch JSON, UTF-8), oneShot}
@@ -97,6 +98,7 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
           message.format >>> 0,
           (message.subsong ?? 0) >>> 0,
           message.looped === false ? 0 : 1,
+          typeof message.separation === 'number' ? message.separation : -1,
         ) === 1;
         const reply = { type: 'song', source: message.source, ok };
         if (!ok) {

@@ -26,6 +26,7 @@ use cubed_opl::a2::player::A2Player;
 use cubed_rt_check::{allocations_during, trace_allocations, CountingAllocator};
 use cubed_sid::stream::SidChipPlayer;
 use cubed_sid::{SidModel, SidSong, SidSongPlayer};
+use cubed_tracker::{Player, PlayerOptions};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -125,6 +126,59 @@ fn a2m_player() {
         assert_no_alloc(path, 10, |_| {
             player.render(&mut left, &mut right);
         });
+    }
+}
+
+/// A tracker module from its very first block (a player allocates nothing
+/// once built), through seeks, mutes and the song's loop. With
+/// `CUBED_MODULES=<dir>`, every module in that directory too.
+#[test]
+fn tracker_player() {
+    let mut songs = vec![
+        (
+            "demo.mod".to_string(),
+            fixture("tracker/tests/fixtures/demo.mod"),
+        ),
+        (
+            "demo.s3m".to_string(),
+            fixture("tracker/tests/fixtures/demo.s3m"),
+        ),
+        (
+            "demo.xm".to_string(),
+            fixture("tracker/tests/fixtures/demo.xm"),
+        ),
+    ];
+    if let Some(dir) = std::env::var_os("CUBED_MODULES") {
+        for entry in std::fs::read_dir(dir).expect("CUBED_MODULES is a directory") {
+            let path = entry.unwrap().path();
+            if cubed_tracker::sniff(&std::fs::read(&path).unwrap()).is_some() {
+                songs.push((path.display().to_string(), std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    for (name, bytes) in songs {
+        let module = cubed_tracker::load(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let channels = module.channels;
+        let mut player = Player::new(module, RATE as f32, PlayerOptions::default());
+        let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+        for block in 0..30 * BLOCKS_PER_SECOND {
+            let events = allocations_during(|| {
+                if block == 10 * BLOCKS_PER_SECOND {
+                    player.seek(1, 4);
+                    player.set_channel_muted(0, true);
+                }
+                if block == 20 * BLOCKS_PER_SECOND {
+                    player.set_channel_muted(0, false);
+                    player.set_pattern_loop(true);
+                }
+                player.render(&mut left, &mut right);
+            });
+            assert_eq!(
+                events, 0,
+                "{name} ({channels} channels): block {block} made {events} allocations or frees"
+            );
+        }
     }
 }
 
@@ -400,6 +454,9 @@ fn mixer_songs() {
             SongFormat::A2m,
         ),
         ("sid/tests/fixtures/sid/s3-chain.asid", SongFormat::Sid),
+        ("tracker/tests/fixtures/demo.mod", SongFormat::Mod),
+        ("tracker/tests/fixtures/demo.s3m", SongFormat::S3m),
+        ("tracker/tests/fixtures/demo.xm", SongFormat::Xm),
     ];
     let mut mixer = Mixer::new(MixerConfig {
         sample_rate: rate,

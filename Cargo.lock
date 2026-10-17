@@ -173,6 +173,7 @@ dependencies = [
  "cubed-dsp",
  "cubed-opl",
  "cubed-sid",
+ "cubed-tracker",
  "rtrb",
 ]
 
@@ -195,6 +196,7 @@ dependencies = [
  "cubed-mixer",
  "cubed-opl",
  "cubed-sid",
+ "cubed-tracker",
 ]
 
 [[package]]
@@ -208,6 +210,13 @@ dependencies = [
 [[package]]
 name = "cubed-simd"
 version = "0.1.0"
+
+[[package]]
+name = "cubed-tracker"
+version = "0.1.0"
+dependencies = [
+ "cubed-opl",
+]
 
 [[package]]
 name = "cubed-worklet"

@@ -1,0 +1,24 @@
+[package]
+name = "cubed-tracker"
+description = "MOD, S3M and XM tracker modules: an editable module model, parsers, and a sample-accurate replayer with ProTracker, Scream Tracker 3 and FastTracker 2 semantics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = ["adlib"]
+# S3M AdLib instruments, on a cubed-opl OPL2.
+adlib = ["dep:cubed-opl"]
+
+[dependencies]
+cubed-opl = { path = "../opl", optional = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "module_render"
+harness = false

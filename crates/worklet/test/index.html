@@ -5,7 +5,8 @@
 // Renders the mixer offline through the real AudioWorkletProcessor and
 // checks the samples: a 0.25 DC clip on bus 1 (the bus at -6 dB, so 0.125),
 // then silence once it ends; and telemetry with meters and an Ended event.
-// Then an AHX song sent as a file, played through a low-pass effect.
+// Then an AHX song sent as a file, played through a low-pass effect, and a
+// MOD module.
 // Puts the outcome in `window.result` for test/run.mjs.
 const RATE = 48000;
 const CLIP_FRAMES = 12000;
@@ -99,6 +100,21 @@ async function song() {
   return { ok, rms, replies, voices: last.voices, rejected: last.rejected };
 }
 
+// A MOD module (format 3) played the same way.
+async function module() {
+  const bytes = await (await fetch('../../tracker/tests/fixtures/demo.mod')).arrayBuffer();
+  const context = new OfflineAudioContext(2, RATE, RATE);
+  const replies = [];
+  const { node, ready } = await mixerNode(context, (m) => { if (m.type === 'song') replies.push(m); });
+  node.port.postMessage({ type: 'song', source: 0, format: 3, bytes, subsong: 0, looped: true }, [bytes]);
+  const commands = new Uint8Array([...setBus(2, 0), ...playSource(1, 0, 2)]);
+  node.port.postMessage({ type: 'commands', bytes: commands.buffer }, [commands.buffer]);
+  await ready;
+  const left = (await context.startRendering()).getChannelData(0);
+  const rms = Math.sqrt(left.reduce((sum, s) => sum + s * s, 0) / left.length);
+  return { ok: replies.length === 1 && replies[0].ok && rms > 0.01, rms, replies };
+}
+
 function sourceEvent(voice, kind, note, velocity, duration) {
   const v = new DataView(new ArrayBuffer(23));
   v.setUint8(0, 24); v.setBigUint64(1, BigInt(voice), true); v.setUint8(9, kind);
@@ -124,8 +140,9 @@ async function synth() {
 async function run() {
   const clips = await clip();
   const songs = await song();
+  const modules = await module();
   const synths = await synth();
-  return { ok: clips.ok && songs.ok && synths.ok, clips, songs, synths };
+  return { ok: clips.ok && songs.ok && modules.ok && synths.ok, clips, songs, modules, synths };
 }
 
 run().then((r) => { window.result = r; }, (e) => { window.result = { ok: false, error: String(e) }; });

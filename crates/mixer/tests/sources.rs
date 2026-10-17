@@ -254,6 +254,9 @@ mod songs {
             ("ahx/tests/fixtures/songs/a_little_cyberfunk.hvl", "hvl"),
             ("opl/tests/fixtures/a2m/Kvee/ym3812 funk.a2m", "a2m"),
             ("sid/tests/fixtures/sid/s3-chain.asid", "asid"),
+            ("tracker/tests/fixtures/demo.mod", "MOD"),
+            ("tracker/tests/fixtures/demo.s3m", "s3m"),
+            ("tracker/tests/fixtures/demo.xm", "xm"),
         ] {
             let format = SongFormat::from_extension(ext).expect("known extension");
             let song = open_song(format, &fixture(path), RATE, SongOptions::default())
@@ -269,11 +272,71 @@ mod songs {
         }
     }
 
+    /// A module ends with its song when it is not looped (and is handed
+    /// back to be freed), and can start at a later order.
+    #[test]
+    fn a_module_ends_or_starts_later() {
+        let bytes = fixture("tracker/tests/fixtures/demo.mod");
+        let once = SongOptions {
+            looped: false,
+            ..SongOptions::default()
+        };
+        let song = open_song(SongFormat::Mod, &bytes, RATE, once).unwrap();
+        let mut mixer = mixer();
+        play_source(&mut mixer, 1, 0, MUSIC, song);
+        // The demo is 20.4 s long.
+        let _ = render(&mut mixer, 20 * 48_000);
+        assert_eq!(mixer.stats().voices, 1);
+        let _ = render(&mut mixer, 48_000);
+        assert_eq!(mixer.stats().voices, 0);
+        assert_eq!(events(&mut mixer), vec![Event::Ended(VoiceId(1))]);
+        assert_eq!(returned_sources(&mut mixer), 1);
+
+        // From order 3 (the last) at speed 4 and tempo 150, as the song gets
+        // there: 64 rows, 8 more from a pattern loop, 1 from a delay, 4.9 s.
+        let late = SongOptions { subsong: 3, ..once };
+        let song = open_song(SongFormat::Mod, &bytes, RATE, late).unwrap();
+        play_source(&mut mixer, 2, 0, MUSIC, song);
+        let _ = render(&mut mixer, 4 * 48_000 + 36_000);
+        assert_eq!(mixer.stats().voices, 1);
+        let _ = render(&mut mixer, 48_000);
+        assert_eq!(mixer.stats().voices, 0);
+    }
+
+    /// Stereo separation narrows a module's Amiga panning to mono at 0.
+    #[test]
+    fn a_module_plays_at_a_stereo_separation() {
+        let bytes = fixture("tracker/tests/fixtures/demo.mod");
+        let mut sides = Vec::new();
+        for separation in [None, Some(1.0), Some(0.0)] {
+            let options = SongOptions {
+                stereo_separation: separation,
+                ..SongOptions::default()
+            };
+            let song = open_song(SongFormat::Mod, &bytes, RATE, options).unwrap();
+            let mut mixer = mixer();
+            play_source(&mut mixer, 1, 0, MUSIC, song);
+            let (l, r) = render(&mut mixer, 48_000);
+            let side: Vec<f32> = l.iter().zip(&r).map(|(l, r)| (l - r) * 0.5).collect();
+            sides.push(rms(&side));
+        }
+        // The default is three quarters of full width; mono has no side.
+        assert!((sides[0] / sides[1] - 0.75).abs() < 0.01, "{sides:?}");
+        assert!(sides[2] < 1e-6, "{sides:?}");
+    }
+
     #[test]
     fn unknown_or_broken_files_are_refused() {
         assert_eq!(SongFormat::from_extension("HVL"), Some(SongFormat::Ahx));
         assert_eq!(SongFormat::from_extension("ogg"), None);
-        for format in [SongFormat::Ahx, SongFormat::A2m, SongFormat::Sid] {
+        for format in [
+            SongFormat::Ahx,
+            SongFormat::A2m,
+            SongFormat::Sid,
+            SongFormat::Mod,
+            SongFormat::S3m,
+            SongFormat::Xm,
+        ] {
             assert!(open_song(format, b"not a song", RATE, SongOptions::default()).is_err());
         }
     }

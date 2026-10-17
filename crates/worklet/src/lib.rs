@@ -242,14 +242,26 @@ pub extern "C" fn cw_file_buffer(len: u32) -> *mut u8 {
 }
 
 /// Builds the song written at `cw_file_buffer` as prepared source `source`.
-/// `format` 0 is AHX/HVL, 1 A2M, 2 SID. Returns 1 on success; on failure 0,
-/// with the reason at `cw_error`.
+/// `format` 0 is AHX/HVL, 1 A2M, 2 SID, 3 MOD, 4 S3M, 5 XM. `separation` is a module's
+/// stereo width, 0-1; below 0 plays the module's own. Returns 1 on success;
+/// on failure 0, with the reason at `cw_error`.
 #[no_mangle]
-pub extern "C" fn cw_prepare_song(source: u32, format: u32, subsong: u32, looped: u32) -> u32 {
+pub extern "C" fn cw_prepare_song(
+    source: u32,
+    format: u32,
+    subsong: u32,
+    looped: u32,
+    separation: f32,
+) -> u32 {
     let s = state();
     s.released.clear();
     s.error.clear();
-    match prepare_song(s, source, format, subsong as usize, looped != 0) {
+    let options = SongOptions {
+        subsong: subsong as usize,
+        looped: looped != 0,
+        stereo_separation: (separation >= 0.0).then_some(separation),
+    };
+    match prepare_song(s, source, format, options) {
         Ok(()) => 1,
         Err(why) => {
             s.error.extend(
@@ -261,30 +273,45 @@ pub extern "C" fn cw_prepare_song(source: u32, format: u32, subsong: u32, looped
     }
 }
 
+/// How a song plays, as the exports pass it on.
+#[derive(Clone, Copy)]
+struct SongOptions {
+    subsong: usize,
+    looped: bool,
+    stereo_separation: Option<f32>,
+}
+
 #[cfg(feature = "songs")]
 fn prepare_song(
     s: &mut State,
     source: u32,
     format: u32,
-    subsong: usize,
-    looped: bool,
+    options: SongOptions,
 ) -> Result<(), String> {
-    use cubed_mixer::songs::{open_song, SongFormat, SongOptions};
+    use cubed_mixer::songs::{open_song, SongFormat};
     let format = match format {
         0 => SongFormat::Ahx,
         1 => SongFormat::A2m,
         2 => SongFormat::Sid,
+        3 => SongFormat::Mod,
+        4 => SongFormat::S3m,
+        5 => SongFormat::Xm,
         other => return Err(format!("unknown song format {other}")),
     };
     let rate = s.mixer.config().sample_rate;
-    let song = open_song(format, &s.file, rate, SongOptions { subsong, looped })?;
+    let options = cubed_mixer::songs::SongOptions {
+        subsong: options.subsong,
+        looped: options.looped,
+        stereo_separation: options.stereo_separation,
+    };
+    let song = open_song(format, &s.file, rate, options)?;
     s.mixer
         .apply(Command::PrepareSource(cubed_mixer::SourceId(source), song));
     Ok(())
 }
 
 #[cfg(not(feature = "songs"))]
-fn prepare_song(_: &mut State, _: u32, _: u32, _: usize, _: bool) -> Result<(), String> {
+fn prepare_song(_: &mut State, _: u32, _: u32, _: SongOptions) -> Result<(), String> {
     Err("this build of cubed-worklet plays no songs".into())
 }
 
@@ -501,8 +528,8 @@ mod tests {
         let at = cw_file_buffer(song.len() as u32);
         // SAFETY: cw_file_buffer made room for the file.
         unsafe { std::ptr::copy_nonoverlapping(song.as_ptr(), at, song.len()) };
-        assert_eq!(cw_prepare_song(0, 0, 0, 1), 1);
-        assert_eq!(cw_prepare_song(1, 9, 0, 1), 0, "unknown format");
+        assert_eq!(cw_prepare_song(0, 0, 0, 1, -1.0), 1);
+        assert_eq!(cw_prepare_song(1, 9, 0, 1, -1.0), 0, "unknown format");
         let error = unsafe { std::slice::from_raw_parts(cw_error(), cw_error_len() as usize) };
         assert!(std::str::from_utf8(error).unwrap().contains("format"));
 
@@ -526,5 +553,23 @@ mod tests {
         assert_eq!(cw_voices(), 1);
         assert_eq!(cw_set_effect(2, 0, 255), 0, "empties the slot");
         assert_eq!(cw_rejected(), 0);
+
+        // A MOD module is format 3.
+        let module = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tracker/tests/fixtures/demo.mod"
+        ))
+        .unwrap();
+        let at = cw_file_buffer(module.len() as u32);
+        // SAFETY: cw_file_buffer made room for the file.
+        unsafe { std::ptr::copy_nonoverlapping(module.as_ptr(), at, module.len()) };
+        assert_eq!(cw_prepare_song(1, 3, 0, 1, 0.5), 1);
+        send(Command::PlaySource(PlaySource::new(
+            VoiceId(2),
+            SourceId(1),
+            BusId(2),
+        )));
+        cw_process(128);
+        assert_eq!(cw_voices(), 2);
     }
 }
