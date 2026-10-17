@@ -78,6 +78,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubed-rt-check"
+version = "0.1.0"
+dependencies = [
+ "cubed-ahx",
+ "cubed-dsp",
+ "cubed-opl",
+ "cubed-sid",
+]
+
+[[package]]
 name = "cubed-sid"
 version = "0.1.0"
 dependencies = [

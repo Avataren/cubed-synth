@@ -229,6 +229,31 @@ struct Channel {
     at_row_start: bool,
 }
 
+/// What a note trigger reads from its instrument. It is `Copy`, so taking it
+/// does not clone the instrument (and its name) on the audio thread.
+#[derive(Clone, Copy)]
+struct NoteStart {
+    ad: u8,
+    sr: u8,
+    first_wave: u8,
+    wave_ptr: u8,
+    pulse_ptr: u8,
+    filter_ptr: u8,
+}
+
+impl NoteStart {
+    fn of(ins: &Instrument) -> NoteStart {
+        NoteStart {
+            ad: ins.ad(),
+            sr: ins.sr(),
+            first_wave: ins.first_wave,
+            wave_ptr: ins.wave_ptr,
+            pulse_ptr: ins.pulse_ptr,
+            filter_ptr: ins.filter_ptr,
+        }
+    }
+}
+
 /// Plays one subsong of a `SidSong` on a chip of the song's model.
 #[derive(Debug, Clone)]
 pub struct SidSongPlayer {
@@ -890,7 +915,7 @@ impl SidSongPlayer {
     }
 
     fn trigger(&mut self, c: usize, note: u8) {
-        let ins = self.instrument(c).cloned();
+        let ins = self.instrument(c).map(NoteStart::of);
         let ch = &mut self.channels[c];
         // GT sets no pitch on a note: its wave table's first step does, on the
         // frame after the note's (a row with note column $00 is
@@ -910,8 +935,8 @@ impl SidSongPlayer {
             ch.first_wave = 0;
             return;
         };
-        ch.ad = ins.ad();
-        ch.sr = ins.sr();
+        ch.ad = ins.ad;
+        ch.sr = ins.sr;
         // GT holds the first-frame byte as the channel's waveform
         // (gplay.c:359-365) until the wave table sets one, so a table that
         // starts with `00` rows keeps $09 (test and gate) on. $00 leaves the

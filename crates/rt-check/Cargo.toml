@@ -1,0 +1,19 @@
+[package]
+name = "cubed-rt-check"
+description = "Real-time safety checks across the cubed-synth crates: render paths that must not allocate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dev-dependencies]
+cubed-ahx = { path = "../ahx" }
+cubed-dsp = { path = "../dsp" }
+cubed-opl = { path = "../opl" }
+cubed-sid = { path = "../sid" }
+
+[lints]
+workspace = true

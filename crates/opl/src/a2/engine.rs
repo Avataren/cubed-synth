@@ -592,18 +592,23 @@ impl A2Engine {
     /// algorithm outputs, by the connections of the first chip channel
     /// (second track) and the other (MEASURED order: the first track's,
     /// then the second's; O1/O2 are the second track's modulator/carrier).
-    fn out_ops(&self, (first, second): (usize, usize)) -> Vec<(usize, usize)> {
+    /// A fixed array, not a Vec: volume effects call this on the audio thread.
+    fn out_ops(
+        &self,
+        (first, second): (usize, usize),
+    ) -> std::iter::Take<std::array::IntoIter<(usize, usize), 3>> {
         let (a, b) = (self.additive(second), self.additive(first));
         let o1 = (second, 0);
         let o2 = (second, 1);
         let o3 = (first, 0);
         let o4 = (first, 1);
-        match (a, b) {
-            (false, false) => vec![o4],
-            (true, false) => vec![o4, o1],
-            (false, true) => vec![o4, o2],
-            (true, true) => vec![o3, o4, o1],
-        }
+        let (ops, len) = match (a, b) {
+            (false, false) => ([o4, o4, o4], 1),
+            (true, false) => ([o4, o1, o1], 2),
+            (false, true) => ([o4, o2, o2], 2),
+            (true, true) => ([o3, o4, o1], 3),
+        };
+        ops.into_iter().take(len)
     }
 
     /// The two tracks of a 4-op pair share one pitch and key state (MEASURED: a key-off
@@ -747,15 +752,12 @@ impl A2Engine {
         let tracks = self.tracks_in_use();
         // Versions 1-4 store 9 tracks and 5-8 store 18; the rest are empty.
         let pat = &self.song.patterns[self.pattern];
-        let cells: Vec<Cell> = (0..tracks)
-            .map(|t| {
-                if t < pat.channels {
-                    *pat.cell(self.row, t)
-                } else {
-                    Cell::default()
-                }
-            })
-            .collect();
+        // A fixed array, not a Vec: this runs on the audio thread every row.
+        let mut row = [Cell::default(); 20];
+        for (t, cell) in row.iter_mut().enumerate().take(tracks.min(pat.channels)) {
+            *cell = *pat.cell(self.row, t);
+        }
+        let cells = &row[..tracks];
         for (t, cell) in cells.iter().enumerate() {
             for (c, &(fx, param)) in cell.effects.iter().enumerate() {
                 let col = &mut self.tracks[t].cols[c];
@@ -1101,12 +1103,19 @@ impl A2Engine {
     }
 
     fn set_instrument(&mut self, t: usize, ins: u8, out: &mut impl RegisterSink) {
-        let Some(data) = self.song.instruments.get(ins as usize - 1).cloned() else {
+        // Only the fields used, not a clone: the name is a Vec, and this runs
+        // on the audio thread.
+        let Some((fm, panning, finetune, empty)) = self
+            .song
+            .instruments
+            .get(ins as usize - 1)
+            .map(|d| (d.fm, d.panning, d.finetune, is_empty(d)))
+        else {
             return;
         };
         // MEASURED: an instrument with nothing in it (finetune included)
         // silences the channel first, like ZF0, and always reloads.
-        if is_empty(&data) {
+        if empty {
             self.release_sound(t, out);
         }
         let forced = self.tracks[t].forced_reload;
@@ -1115,21 +1124,18 @@ impl A2Engine {
         tr.forced_reload = false;
         if reload {
             tr.instrument = ins;
-            tr.fm = data.fm;
+            tr.fm = fm;
             // Under a pan lock the reload takes the track's locked panning
             // (AT2 `set_ins_data`), undoing any ZB since.
             tr.panning = if tr.pan_lock {
                 (self.song.lock_flags.get(t).copied().unwrap_or(0) & 3).min(2)
             } else {
-                data.panning
+                panning
             };
-            tr.finetune = data.finetune;
+            tr.finetune = finetune;
             self.load_fm(t, out);
         }
-        let (lm, lc) = (
-            self.ins_level(t, &data.fm, 0),
-            self.ins_level(t, &data.fm, 1),
-        );
+        let (lm, lc) = (self.ins_level(t, &fm, 0), self.ins_level(t, &fm, 1));
         let tr = &mut self.tracks[t];
         if !tr.vol_lock || reload {
             tr.vol_mod = lm;
