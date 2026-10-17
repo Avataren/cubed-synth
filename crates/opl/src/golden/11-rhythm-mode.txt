@@ -1,0 +1,84 @@
+# OPL2-style rhythm mode (NEW=0): each drum alone, then the lot, bass
+# drum in both connections, hi-hat/snare/cymbal noise, re-triggers.
+w BD 20
+w 30 00
+w 50 0B
+w 70 A8
+w 90 4C
+w F0 00
+w 33 00
+w 53 00
+w 73 D6
+w 93 4F
+w F3 00
+w 31 00
+w 51 00
+w 71 F7
+w 91 F7
+w F1 00
+w 34 00
+w 54 00
+w 74 F7
+w 94 F7
+w F4 00
+w 32 02
+w 52 00
+w 72 F8
+w 92 B5
+w F2 00
+w 35 01
+w 55 00
+w 75 D6
+w 95 F7
+w F5 00
+w A6 57
+w B6 09
+w C6 0A
+w A7 57
+w B7 09
+w A8 57
+w B8 0A
+w BD 30
+s 3000
+w BD 20
+s 3000
+w BD 28
+s 3000
+w BD 20
+s 3000
+w BD 24
+s 3000
+w BD 20
+s 3000
+w BD 22
+s 3000
+w BD 20
+s 3000
+w BD 21
+s 3000
+w BD 20
+s 3000
+w BD 3F
+s 5000
+w C6 0B
+w BD 20
+w BD 30
+s 5000
+w BD 2B
+s 1200
+w BD 20
+s 400
+w BD 2B
+s 1200
+w BD 20
+s 400
+w BD 2B
+s 1200
+w BD 20
+s 400
+w BD 2B
+s 1200
+w BD 20
+s 400
+w BD 00
+s 3000

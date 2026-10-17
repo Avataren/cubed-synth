@@ -1,0 +1,28 @@
+# Re-key while still sounding (attack from a non-silent level), change the
+# frequency and TL mid-note, attack rate 15 changed after key-on (the 62/63
+# glitch), sustain-off release through the sustain state.
+w 20 01
+w 23 11
+w 43 00
+w 40 1A
+w 60 A2
+w 63 83
+w 80 25
+w 83 27
+w A0 44
+w B0 32
+s 5000
+w B0 12
+s 700
+w B0 32
+s 3000
+w A0 81
+w 43 10
+s 2000
+w 63 F3
+w B0 12
+s 300
+w B0 32
+s 3000
+w 23 01
+s 6000

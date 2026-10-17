@@ -1,0 +1,26 @@
+[package]
+name = "cubed-sid"
+description = "MOS 6581/8580 SID chip emulation and a GoatTracker-style song player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# wasm-bindgen classes for the browser (another_synth's SID worklet).
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+wasm-bindgen = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "sid_render"
+harness = false

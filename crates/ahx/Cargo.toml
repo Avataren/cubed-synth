@@ -1,0 +1,32 @@
+[package]
+name = "cubed-ahx"
+description = "AHX and HivelyTracker (.ahx/.hvl) module player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# wasm-bindgen classes for the browser (another_synth's AHX worklet).
+wasm = ["dep:wasm-bindgen"]
+# std::simd on a nightly toolchain instead of the stable fallback.
+nightly-simd = ["cubed-simd/nightly"]
+
+[dependencies]
+cubed-simd.workspace = true
+once_cell.workspace = true
+rustc-hash.workspace = true
+rustfft.workspace = true
+wasm-bindgen = { workspace = true, optional = true }
+
+[dev-dependencies]
+rustfft.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "ahx_render"
+harness = false

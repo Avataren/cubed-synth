@@ -1,0 +1,14 @@
+# Channel 0, FM, no feedback: plain carrier modulated by a quiet sine. Instant
+# attack, sustained. The simplest possible note.
+w 20 01
+w 23 01
+w 40 3F
+w 43 00
+w 60 F0
+w 63 F0
+w 80 00
+w 83 00
+w C0 00
+w A0 44
+w B0 32
+s 4096

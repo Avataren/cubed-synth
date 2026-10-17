@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.95"
+authors = ["Morten Andersson <morten.andersson@gmail.com>"]
+repository = "https://github.com/Avataren/cubed-synth"
+
+[workspace.dependencies]
+cubed-simd = { path = "crates/simd" }
+
+wasm-bindgen = "0.2.104"
+js-sys = "0.3.81"
+web-sys = "0.3.81"
+serde-wasm-bindgen = "0.6.5"
+serde = { version = "1.0.226", features = ["derive"] }
+serde_json = "1.0.145"
+serde_path_to_error = "0.1.16"
+once_cell = "1.21.3"
+rustfft = { version = "6.4.1", features = ["wasm_simd"] }
+hound = "3.5.1"
+rand = "0.9"
+base64 = "0.22"
+getrandom = "0.3.3"
+rustc-hash = "2.1.1"
+uuid = { version = "1.11", features = ["v4", "serde", "js"] }
+fft-convolver = "0.2.0"
+rubato = "0.16.2"
+
+[workspace.lints.clippy]
+# Style lints that fight DSP code: per-sample loops index several buffers in
+# lockstep, and node constructors / render entry points take many parameters.
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+module_inception = "allow"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
+
+# The stable SIMD fallback (cubed-simd) is per-lane loops that only become
+# vector code once optimized. Unoptimized, the AHX and synth tests ran 2-3x
+# slower than with std::simd, so the crates that use it are optimized a little
+# even in dev and test builds of this workspace.
+[profile.dev.package.cubed-ahx]
+opt-level = 1
+
+[profile.dev.package.cubed-dsp]
+opt-level = 1
+
+[profile.dev.package.cubed-simd]
+opt-level = 1

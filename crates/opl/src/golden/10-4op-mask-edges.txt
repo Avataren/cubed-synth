@@ -1,0 +1,43 @@
+# Enabling 4-op and keying on in the same sample (key-on routes through
+# the previous assignment), then dropping 4-op mid-note, keying the
+# orphaned partner channel, and clearing NEW with the 4-op mask still set.
+w 105 01
+w 21 01
+w 41 10
+w 61 F2
+w 81 24
+w E1 00
+w 24 01
+w 44 10
+w 64 F3
+w 84 24
+w E4 00
+w 29 01
+w 49 14
+w 69 F3
+w 89 25
+w E9 00
+w 2C 01
+w 4C 00
+w 6C F4
+w 8C 26
+w EC 00
+w A1 44
+w C1 32
+w C4 31
+w A4 81
+w 104 02
+w B1 32
+s 3000
+w B4 32
+s 2000
+w 104 00
+s 3000
+w B4 12
+w B1 12
+s 400
+w 104 02
+w B1 32
+s 2000
+w 105 00
+s 3000

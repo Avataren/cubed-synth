@@ -1,0 +1,16 @@
+[package]
+name = "cubed-simd"
+description = "The slice of std::simd the cubed-synth crates use, on stable Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# Re-export std::simd itself (nightly toolchains only).
+nightly = []
+
+[lints]
+workspace = true

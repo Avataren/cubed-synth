@@ -1,0 +1,20 @@
+# NEW=0: writes to 0x1xx land on channel 0 (bank 1 aliases bank 0), then
+# NEW=1 and the same writes reach channel 9 instead.
+w 120 01
+w 123 01
+w 143 00
+w 160 F0
+w 163 F0
+w 1A0 44
+w 1B0 32
+s 3000
+w 105 01
+w 1C0 30
+w 120 01
+w 123 01
+w 143 00
+w 160 F0
+w 163 F0
+w 1A0 81
+w 1B0 32
+s 3000

@@ -1,0 +1,3 @@
+I1=[0x01,0x21,0x25,0x15,0xf0,0x10,0x00,0x02,1,6,0x0a]
+# fm63b: in a 4-op pair a pitch set by an effect or the FM table (AT2 change_frequency) restarts both tracks' vibrato tables; the vibrato table itself (change_freq) restarts neither
+SPEC=dict(version=11, tempo=50, speed=6, four_op=1, instruments={1: dict(fm=I1), 2: dict(fm=I1)}, vib_macros={1: dict(length=8, speed=1, loop_begin=1, loop_length=8, data=[0,1,2,3,-1,-2,-3,0])}, fm_macros={1: dict(length=1, loop_begin=1, loop_length=1, steps=[dict(fm=[0]*11,slide=3,duration=1)])}, patterns={0: [(0,0,49,1,0x27,0x01),(0,1,49,2,0x27,0x01),(2,1,0,0,0x01,0x02),(4,0,0,0,0x02,0x01)]})

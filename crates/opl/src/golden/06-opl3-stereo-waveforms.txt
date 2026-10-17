@@ -1,0 +1,34 @@
+# NEW=1: waveforms 4..7, bank-1 channel 9 hard right, channel 0 hard left,
+# channel 2 muted by clearing all output bits (feedback still runs).
+w 105 01
+w 20 01
+w 23 01
+w 40 18
+w 43 00
+w 60 F0
+w 63 F0
+w E0 04
+w E3 05
+w C0 12
+w A0 44
+w B0 32
+w 120 01
+w 123 02
+w 140 18
+w 143 00
+w 160 F0
+w 163 F0
+w 1E0 06
+w 1E3 07
+w 1C0 24
+w 1A0 44
+w 1B0 36
+w 22 01
+w 25 01
+w 45 00
+w 62 F0
+w 65 F0
+w C2 0E
+w A2 44
+w B2 32
+s 8000

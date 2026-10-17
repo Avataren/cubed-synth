@@ -1,0 +1,28 @@
+[package]
+name = "cubed-opl"
+description = "Yamaha OPL2/OPL3 FM chip emulation and an Adlib Tracker II (.a2m) player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# wasm-bindgen classes for the browser (another_synth's OPL worklet).
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = { workspace = true, optional = true }
+
+[dev-dependencies]
+hound.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "opl_render"
+harness = false

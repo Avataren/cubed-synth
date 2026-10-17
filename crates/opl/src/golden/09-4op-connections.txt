@@ -1,0 +1,70 @@
+# NEW=1, 4-op pair 0 (channels 0+3, operators 0,3,6,9) through all four
+# connections, re-keyed each time; bank-1 pair 3 (channels 9+12) plays
+# alongside, panned right, with feedback.
+w 105 01
+w 104 09
+w 20 01
+w 40 10
+w 60 F2
+w 80 24
+w E0 00
+w 23 02
+w 43 18
+w 63 F3
+w 83 24
+w E3 01
+w 28 01
+w 48 14
+w 68 F3
+w 88 25
+w E8 00
+w 2B 01
+w 4B 00
+w 6B F4
+w 8B 26
+w EB 00
+w A0 44
+w C0 1E
+w C3 10
+w B0 32
+s 4000
+w B0 12
+w C0 1F
+w C3 10
+w B0 32
+s 4000
+w B0 12
+w C0 1E
+w C3 11
+w B0 32
+s 4000
+w B0 12
+w C0 1F
+w C3 11
+w B0 32
+s 4000
+w 120 21
+w 140 20
+w 160 F1
+w 180 13
+w 1E0 04
+w 123 01
+w 143 10
+w 163 F2
+w 183 13
+w 1E3 00
+w 128 01
+w 148 18
+w 168 F2
+w 188 14
+w 1E8 02
+w 12B 01
+w 14B 00
+w 16B F3
+w 18B 15
+w 1EB 00
+w 1A0 81
+w 1C0 2C
+w 1C3 21
+w 1B0 2E
+s 6000

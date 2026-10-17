@@ -1,0 +1,87 @@
+# Single source of truth for the render-golden corpus. Read by BOTH
+# gen_goldens.sh (which feeds each row to the C reference) and
+# ../ahx_render_golden.rs (which replays each row through AhxEngine), so the
+# two can never drift apart.
+# Columns: fixture  freq  defstereo  frames  chunk_frames  channel_cap
+#   frames       = hvl_DecodeFrame calls (50 per second, so 1500 = 30 s)
+#   chunk_frames = frames per hash line (50 = one second)
+#   channel_cap  = 0 plays every channel of the song; N > 0 truncates to the
+#                  first N (a test hook: the shipped engine plays
+#                  every channel, so cap 0 is the default path)
+# The golden for a row is <fixture>.<freq>.s<defstereo>.cap<channel_cap>.txt
+# (so that triple must be unique). defstereo only affects AHX songs; HVL
+# carries its own, so the sunspots 48000 rows differ only in it on purpose
+# (retargeted from chiprolled.hvl, removed 2026-09-23 as a byte-identical dupe).
+
+# --- karma.ahx: 4-channel AHX; all five stereo modes, four sample rates ---
+karma.ahx               44100 2 3000 50 0
+karma.ahx               44100 0 1500 50 0
+karma.ahx               44100 1 1500 50 0
+karma.ahx               44100 3 1500 50 0
+karma.ahx               44100 4 1500 50 0
+karma.ahx               48000 0 1500 50 0
+karma.ahx               48000 2 1500 50 0
+karma.ahx               22050 2 1500 50 0
+karma.ahx               22050 4 1500 50 0
+karma.ahx               96000 2 1500 50 0
+
+# --- HVL, fixed-4 truncation (a hook-only cap; dropped_channels > 0) ---
+# illuminated runs 3200 frames: past its first natural wrap at tick 2880
+# (pos_nr == position_nr -> restart), the only golden on that branch.
+# sunspots reaches song end via its Bxx loop-back well inside 3000 frames.
+doobrey_gubbins.hvl     44100 2 3000 50 4
+drainage_proble.hvl     44100 2 3000 50 4
+illuminated.hvl         44100 2 3200 50 4
+moderate_sellotaping.hvl 44100 2 3000 50 4
+sliding_away.hvl        44100 2 3000 50 4
+sunspots.hvl            44100 2 3000 50 4
+doobrey_gubbins.hvl     48000 2 1500 50 4
+drainage_proble.hvl     48000 2 1500 50 4
+illuminated.hvl         48000 2 1500 50 4
+moderate_sellotaping.hvl 48000 2 1500 50 4
+sliding_away.hvl        48000 2 1500 50 4
+sunspots.hvl            48000 2 1500 50 4
+doobrey_gubbins.hvl     96000 2 1500 50 4
+sunspots.hvl            96000 2 1500 50 4
+
+# --- HVL, every native channel (11/7/6/8/6/6) ---
+doobrey_gubbins.hvl     44100 2 3000 50 0
+drainage_proble.hvl     44100 2 3000 50 0
+illuminated.hvl         44100 2 3000 50 0
+moderate_sellotaping.hvl 44100 2 3000 50 0
+sliding_away.hvl        44100 2 3000 50 0
+sunspots.hvl            44100 2 3000 50 0
+# speed-multiplier-2 songs at 22050: 441 samples/frame / 2 ticks = 220 per
+# tick, so a frame is 440 samples, not 441 (integer division in DecodeFrame).
+doobrey_gubbins.hvl     22050 2 1500 50 0
+drainage_proble.hvl     22050 2 1500 50 0
+sliding_away.hvl        22050 2 1500 50 0
+moderate_sellotaping.hvl 48000 2 1500 50 0
+
+# --- HVL, a cap strictly between 4 and the native count ---
+moderate_sellotaping.hvl 44100 2 1500 50 6
+doobrey_gubbins.hvl     44100 2 1500 50 8
+
+# --- HVL ignores the defstereo argument (uses the song's own) ---
+sunspots.hvl            48000 0 1500 50 4
+sunspots.hvl            48000 4 1500 50 4
+
+# --- AHX corpus songs added with the demo jukebox (Task 3): 4-channel AHX, native
+# channels, 60 s at the default stereo mode. No cap/rate variants: the engine
+# paths those exercise are already pinned by karma and the HVL rows above. ---
+a_new_beginning.ahx     44100 2 3000 50 0
+a_new_beginning_ii.ahx  44100 2 3000 50 0
+blondie.ahx             44100 2 3000 50 0
+blue_mazda_323.ahx      44100 2 3000 50 0
+brain_artifice.ahx      44100 2 3000 50 0
+countdown_to_nil.ahx    44100 2 3000 50 0
+depressed.ahx           44100 2 3000 50 0
+get_to_the_chopper.ahx  44100 2 3000 50 0
+i_love_holy_daze.ahx    44100 2 3000 50 0
+luminous.ahx            44100 2 3000 50 0
+melodious.ahx           44100 2 3000 50 0
+newsong.ahx             44100 2 3000 50 0
+robocop_iii_j_tel.ahx   44100 2 3000 50 0
+thats_the_wave_it_is.ahx 44100 2 3000 50 0
+the_fugitive.ahx        44100 2 3000 50 0
+wave_stepper.ahx        44100 2 3000 50 0

@@ -1,0 +1,30 @@
+# Feedback 7 with waveforms 1..3 (OPL3 compat mode ignores WSE), then the
+# additive connection, then multiples 0 and 15, all re-keyed on channel 1.
+w 01 00
+w 21 02
+w 24 01
+w 41 10
+w 44 00
+w 61 F2
+w 64 F3
+w 81 12
+w 84 13
+w E1 01
+w E4 02
+w C1 0E
+w A1 57
+w B1 2E
+s 6000
+w E1 03
+w E4 03
+w C1 0B
+s 6000
+w B1 0E
+s 200
+w 21 00
+w 24 0F
+w E1 00
+w E4 00
+w A1 20
+w B1 29
+s 6000

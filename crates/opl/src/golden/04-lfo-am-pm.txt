@@ -1,0 +1,16 @@
+# Tremolo and vibrato on both operators, deep then shallow depth.
+w 20 E1
+w 23 E1
+w 40 20
+w 43 00
+w 60 F0
+w 63 F0
+w 80 0F
+w 83 0F
+w C0 04
+w BD C0
+w A0 81
+w B0 31
+s 20000
+w BD 00
+s 20000

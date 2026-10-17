@@ -1,0 +1,4 @@
+I1=[0x01,0x02,0x10,0x05,0xf3,0xf4,0x0a,0x06,0,0,0x04]
+INS={1: dict(fm=I1), 2: dict(fm=I1)}
+# complete devastation: in a 4-op pair a vibrato restores only its own track's base pitch; the other track's slide starts from the vibrato's pitch
+SPEC=dict(version=11, tempo=50, speed=3, four_op=1, instruments=INS, patterns={0: [(0,0,0,1),(0,1,49,2,0x04,0x87),(1,1,0,0,0x04,0x87),(2,0,0,0,0x02,0x0f),(2,1,0,0,0x02,0x0f),(3,0,0,0,0x01,0x10,0x04,0x46),(4,1,0,0,0x02,0x05),(5,0,0,0,0x02,0x05)]})

@@ -1,0 +1,3 @@
+I1=[0x01,0x21,0x25,0x15,0xf0,0x10,0x00,0x02,1,6,0x0a]
+# LIMITBRK: 15 and 1A strike the note through AT2 output_note, which restarts the instrument's tables (not under ZFF)
+SPEC=dict(version=11, tempo=50, speed=6, instruments={1: dict(fm=I1)}, fm_macros={1: dict(length=2, loop_begin=1, loop_length=2, arp=1, steps=[dict(fm=[0,0,0,0x3b,0,0,0,0,0,0,0],slide=11,duration=2), dict(fm=[0,0,0,0x3f,0,0,0,0,0,0,0],slide=-11,duration=2)])}, arp_macros={1: dict(length=5, speed=1, data=[0,3,7,12,5])}, patterns={0: [(0,0,49,1,0x1a,0x23),(1,0,0,0,0x1a,0x23),(2,0,0,0,0x15,0x03),(3,0,0,0,0x15,0x02,0x23,0xff),(4,0,53,0,0x15,0x01)]})

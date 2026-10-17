@@ -1,0 +1,4 @@
+I1=[0x01,0x02,0x10,0x05,0xf3,0xf4,0x0a,0x06,0,0,0x04]
+INS={1: dict(fm=I1)}
+# asynth/psycho3x: a retrigger counts from 1 when AT2's last_effect is no retrigger: a one-shot right after a retrigger row makes it (0, param); one after empty rows leaves the old retrigger there
+SPEC=dict(version=11, tempo=50, speed=5, instruments=INS, patterns={0: [(0,0,49,1,0x1a,0x20),(1,0,0,0,0x1a,0x20),(2,0,0,0,0x0c,0x30),(3,0,0,0,0x1a,0x20),(4,0,51,0,0x1a,0x20),(5,0,0,0),(6,0,0,0,0x0c,0x00),(7,0,0,0,0x1a,0x20),(8,0,0xff,0,0x1a,0x10),(9,0,0,0,0x1a,0x10)]})

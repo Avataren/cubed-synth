@@ -1,0 +1,17 @@
+# Slow attack, decay to a sustain level, key off, release to silence. KSR on
+# for the carrier, KSL on both. Covers the attack curve, every EG state and
+# the 4096-sample re-prepare once the channel has gone quiet.
+w 20 21
+w 23 31
+w 40 52
+w 43 80
+w 60 74
+w 63 53
+w 80 34
+w 83 46
+w C0 06
+w A0 98
+w B0 2D
+s 24000
+w B0 0D
+s 20000
