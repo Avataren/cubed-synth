@@ -1,0 +1,513 @@
+{
+ "dispatch_by_magic.xm": {
+  "ok": true,
+  "variant": "GTS5",
+  "notes": [],
+  "asid": "415349440201030106000000010100000001010000000101000000010101010000000000000000"
+ },
+ "gt1_arpeggio.sng": {
+  "ok": true,
+  "variant": "GTS!",
+  "notes": [
+   [
+    "gt1-dropped",
+    "pattern 0 row 0: arpeggio $37 before the pattern names an instrument; dropped"
+   ],
+   [
+    "gt1-convert",
+    "instrument 3 (\"unused\"), which no pattern plays, is replaced by an arpeggio instrument (as GoatTracker does)"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $37 of instrument 1 became wave program 6, played by instrument 3"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $C4 of instrument 2 became wave program 12, played by instrument 4"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $04 of instrument 1 became wave program 17, played by instrument 5"
+   ]
+  ],
+  "asid": "415349440201030106000000010100000001010000000101000000010106110000001103000013030000000000001504000017050000050573686f727409a9098200010000000e746869727465656e20636861727300f0098200040000000873686f727430333709a9098200060000000e746869727465656e20636861727300f00982000c0000000873686f727430303409a909820011000000164121ff41ff4121000000ff41010101ff4121000000ff0000000000000003070008000404000d000000040013000000"
+ },
+ "gt1_commands.sng": {
+  "ok": true,
+  "variant": "GTS!",
+  "notes": [
+   [
+    "gt1-convert",
+    "instrument 2: its wavetable has no end jump; one is added"
+   ],
+   [
+    "gt1-dropped",
+    "instrument 3: its wavetable jumps to row 9 of 2; the jump stops instead"
+   ],
+   [
+    "gt1-convert",
+    "pattern 0 row 7: note byte $9F becomes GoatTracker 2's $FF, its pattern end; rested"
+   ],
+   [
+    "gt1-convert",
+    "pattern 0 row 8: note byte $A0 becomes GoatTracker 2's $00, no note; rested"
+   ],
+   [
+    "gt1-convert",
+    "pattern 0 row 9: note byte $FE becomes GoatTracker 2's $5E, no note; rested"
+   ]
+  ],
+  "asid": "4153494402010301060c47543120636f6d6d616e6473000001010000000101000100010100000201020c010100005d000101000002007e0003020000040300000a010000068a00000f1000000d0500000e042102030022030101033102040332000a0033000205030664656c61797309a909820001000000046f70656e0af0098200050001000366617200f0098200080000000941e8efff8141ff41ff00000c00c00000000000029000f1400500010309024000400300"
+ },
+ "gt1_filter.sng": {
+  "ok": true,
+  "variant": "GTS!",
+  "notes": [
+   [
+    "gt1-dropped",
+    "filter table row 4: master volume 5 and voice 3 off has no filter-table equivalent"
+   ],
+   [
+    "gt1-dropped",
+    "filter table row 6: master volume 0 has no filter-table equivalent"
+   ],
+   [
+    "gt1-dropped",
+    "filter table row 6: next row $48 is past the table; the jump stops instead"
+   ],
+   [
+    "gt1-dropped",
+    "instrument 3: filter pointer $50 is past the filter table; dropped"
+   ],
+   [
+    "gt1-dropped",
+    "pattern 0 row 3: filter pointer $70 is past the filter table; dropped"
+   ]
+  ],
+  "asid": "4153494402010301060000000101000000010100000001010000000101041101000012020a0913030a0014000a00030373657400f00982000100010005737765657000f009820001000600047061737400f0098200010000000241ff0000000c90007f11ffa0ffffa000ff10f140020208720c01103000fe00"
+ },
+ "gt1_no_filter_table.sng": {
+  "ok": true,
+  "variant": "GTS!",
+  "notes": [
+   [
+    "gt1-dropped",
+    "instrument 1: filter pointer $03 with no filter table in the file; dropped"
+   ],
+   [
+    "gt1-dropped",
+    "pattern 0 row 1: filter pointer $02 with no filter table in the file; dropped"
+   ]
+  ],
+  "asid": "41534944020103010600000001010000000101000000010100000001010311010a001200000013000e00010b6c6f73742066696c74657200f0098200010000000241ff0000000000"
+ },
+ "gt1_pulse.sng": {
+  "ok": true,
+  "variant": "GTS!",
+  "notes": [
+   [
+    "gt1-convert",
+    "instrument 3: pulse speed $21 becomes +32/-32 per frame (GoatTracker halves and doubles it)"
+   ],
+   [
+    "gt1-convert",
+    "instrument 6: pulse speed $F0 becomes +127/-128 per frame (GoatTracker halves and doubles it)"
+   ],
+   [
+    "gt1-convert",
+    "instrument 7: pulse speed $01 becomes +0/0 per frame (GoatTracker halves and doubles it)"
+   ]
+  ],
+  "asid": "4153494402010301060000000101000000010100000001010000000101081101000012020000130300001404000015050000160600001707000018080000080a6e6f20687220686f6c6400f0090200010100000a7a65726f20737461727400f009820001000000096f646420737065656400f00982000103000007746f206869676800f009820001080000096c6f6e67206c65677300f0098200010d000007636c616d70656400f009820001300000077370656564203100f0098200013500000a61626f7665206869676800f0098200015a00000241ff00005e88ff881f3e1fff82505808ff807f7f7f7f7f7f7f7f7f7f7f7f7f7f7f477f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f38ff88081008ff887f7f7f7f7f7f7f7f087f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f107f7f7f7f7f7f7f7f08ff8c7f0140ff00000020e020040020e020098002020202020202020202020202020202fefefefefefefefefefefefefefefefe020e007f807f310000000000000000000000000000000000000000000000000000000000000000000000003600f0f0105b0000"
+ },
+ "gt1_slots_full.sng": {
+  "ok": true,
+  "variant": "GTS!",
+  "notes": [
+   [
+    "gt1-convert",
+    "arpeggio $01 of instrument 1 became wave program 3, played by instrument 2"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $02 of instrument 1 became wave program 7, played by instrument 3"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $03 of instrument 1 became wave program 11, played by instrument 4"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $04 of instrument 1 became wave program 15, played by instrument 5"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $05 of instrument 1 became wave program 19, played by instrument 6"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $06 of instrument 1 became wave program 23, played by instrument 7"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $07 of instrument 1 became wave program 27, played by instrument 8"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $08 of instrument 1 became wave program 31, played by instrument 9"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $09 of instrument 1 became wave program 35, played by instrument 10"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $0A of instrument 1 became wave program 39, played by instrument 11"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $0B of instrument 1 became wave program 43, played by instrument 12"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $0C of instrument 1 became wave program 47, played by instrument 13"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $0D of instrument 1 became wave program 51, played by instrument 14"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $0E of instrument 1 became wave program 55, played by instrument 15"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $0F of instrument 1 became wave program 59, played by instrument 16"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $10 of instrument 1 became wave program 63, played by instrument 17"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $11 of instrument 1 became wave program 67, played by instrument 18"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $12 of instrument 1 became wave program 71, played by instrument 19"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $13 of instrument 1 became wave program 75, played by instrument 20"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $14 of instrument 1 became wave program 79, played by instrument 21"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $15 of instrument 1 became wave program 83, played by instrument 22"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $16 of instrument 1 became wave program 87, played by instrument 23"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $17 of instrument 1 became wave program 91, played by instrument 24"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $18 of instrument 1 became wave program 95, played by instrument 25"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $19 of instrument 1 became wave program 99, played by instrument 26"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $1A of instrument 1 became wave program 103, played by instrument 27"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $1B of instrument 1 became wave program 107, played by instrument 28"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $1C of instrument 1 became wave program 111, played by instrument 29"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $1D of instrument 1 became wave program 115, played by instrument 30"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $1E of instrument 1 became wave program 119, played by instrument 31"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $1F of instrument 1 became wave program 123, played by instrument 32"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $20 of instrument 1 became wave program 127, played by instrument 33"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $21 of instrument 1 became wave program 131, played by instrument 34"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $22 of instrument 1 became wave program 135, played by instrument 35"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $23 of instrument 1 became wave program 139, played by instrument 36"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $24 of instrument 1 became wave program 143, played by instrument 37"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $25 of instrument 1 became wave program 147, played by instrument 38"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $26 of instrument 1 became wave program 151, played by instrument 39"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $27 of instrument 1 became wave program 155, played by instrument 40"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $28 of instrument 1 became wave program 159, played by instrument 41"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $29 of instrument 1 became wave program 163, played by instrument 42"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $2A of instrument 1 became wave program 167, played by instrument 43"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $2B of instrument 1 became wave program 171, played by instrument 44"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $2C of instrument 1 became wave program 175, played by instrument 45"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $2D of instrument 1 became wave program 179, played by instrument 46"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $2E of instrument 1 became wave program 183, played by instrument 47"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $2F of instrument 1 became wave program 187, played by instrument 48"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $30 of instrument 1 became wave program 191, played by instrument 49"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $31 of instrument 1 became wave program 195, played by instrument 50"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $32 of instrument 1 became wave program 199, played by instrument 51"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $33 of instrument 1 became wave program 203, played by instrument 52"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $34 of instrument 1 became wave program 207, played by instrument 53"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $35 of instrument 1 became wave program 211, played by instrument 54"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $36 of instrument 1 became wave program 215, played by instrument 55"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $37 of instrument 1 became wave program 219, played by instrument 56"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $38 of instrument 1 became wave program 223, played by instrument 57"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $39 of instrument 1 became wave program 227, played by instrument 58"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $3A of instrument 1 became wave program 231, played by instrument 59"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $3B of instrument 1 became wave program 235, played by instrument 60"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $3C of instrument 1 became wave program 239, played by instrument 61"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $3D of instrument 1 became wave program 243, played by instrument 62"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $3E of instrument 1 became wave program 247, played by instrument 63"
+   ],
+   [
+    "gt1-convert",
+    "arpeggio $3F of instrument 1 became wave program 251 (command 8: no instrument slot left)"
+   ],
+   [
+    "gt1-dropped",
+    "pattern 0 row 63: arpeggio $40 of instrument 1 does not fit the wave table; dropped"
+   ],
+   [
+    "gt1-dropped",
+    "pattern 0 row 64: arpeggio $41 of instrument 1 does not fit the wave table; dropped"
+   ],
+   [
+    "gt1-dropped",
+    "pattern 0 row 65: arpeggio $42 of instrument 1 does not fit the wave table; dropped"
+   ]
+  ],
+  "asid": "4153494402010301060000000101000000010100000001010000000101421102000011030000110400001105000011060000110700001108000011090000110a0000110b0000110c0000110d0000110e0000110f000011100000111100001112000011130000111400001115000011160000111700001118000011190000111a0000111b0000111c0000111d0000111e0000111f000011200000112100001122000011230000112400001125000011260000112700001128000011290000112a0000112b0000112c0000112d0000112e0000112f000011300000113100001132000011330000113400001135000011360000113700001138000011390000113a0000113b0000113c0000113d0000113e0000113f0000110008fb1100000011000000110000003f0361727000f0098200010000000661727030303100f0098200030000000661727030303200f0098200070000000661727030303300f00982000b0000000661727030303400f00982000f0000000661727030303500f0098200130000000661727030303600f0098200170000000661727030303700f00982001b0000000661727030303800f00982001f0000000661727030303900f0098200230000000661727030304100f0098200270000000661727030304200f00982002b0000000661727030304300f00982002f0000000661727030304400f0098200330000000661727030304500f0098200370000000661727030304600f00982003b0000000661727030313000f00982003f0000000661727030313100f0098200430000000661727030313200f0098200470000000661727030313300f00982004b0000000661727030313400f00982004f0000000661727030313500f0098200530000000661727030313600f0098200570000000661727030313700f00982005b0000000661727030313800f00982005f0000000661727030313900f0098200630000000661727030314100f0098200670000000661727030314200f00982006b0000000661727030314300f00982006f0000000661727030314400f0098200730000000661727030314500f0098200770000000661727030314600f00982007b0000000661727030323000f00982007f0000000661727030323100f0098200830000000661727030323200f0098200870000000661727030323300f00982008b0000000661727030323400f00982008f0000000661727030323500f0098200930000000661727030323600f0098200970000000661727030323700f00982009b0000000661727030323800f00982009f0000000661727030323900f0098200a30000000661727030324100f0098200a70000000661727030324200f0098200ab0000000661727030324300f0098200af0000000661727030324400f0098200b30000000661727030324500f0098200b70000000661727030324600f0098200bb0000000661727030333000f0098200bf0000000661727030333100f0098200c30000000661727030333200f0098200c70000000661727030333300f0098200cb0000000661727030333400f0098200cf0000000661727030333500f0098200d30000000661727030333600f0098200d70000000661727030333700f0098200db0000000661727030333800f0098200df0000000661727030333900f0098200e30000000661727030334100f0098200e70000000661727030334200f0098200eb0000000661727030334300f0098200ef0000000661727030334400f0098200f30000000661727030334500f0098200f7000000fe00ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000ff000000010003000200070003000b0004000f00050013000600170007001b0008001f00090023000a0027000b002b000c002f000d0033000e0037000f003b0100003f01010043010200470103004b0104004f01050053010600570107005b0108005f01090063010a0067010b006b010c006f010d0073010e0077010f007b0200007f02010083020200870203008b0204008f02050093020600970207009b0208009f020900a3020a00a7020b00ab020c00af020d00b3020e00b7020f00bb030000bf030100c3030200c7030300cb030400cf030500d3030600d7030700db030800df030900e3030a00e7030b00eb030c00ef030d00f3030e00f7030f00fb000000"
+ },
+ "gts5_basics.sng": {
+  "ok": true,
+  "variant": "GTS5",
+  "notes": [
+   [
+    "loop-transpose",
+    "subtune 0 channel 1: its loop replays with a running transpose/repeat the doc cannot hold; the first pass's is kept"
+   ]
+  ],
+  "asid": "415349440201030106064261736963730b63756265642d73796e74680343433002040100030101030400f510010001020001f001000e010100020001010000000101000100010200020101020101030401010000020001015d020f0600000000037e0000007f000a0111010401010d020d0f02046c65616409a409820301010000107369787465656e20636861727321212100f0ff7f00030001010541ff8111ff0000300003038820ff001002039000fff14000010120"
+ },
+ "gts5_loop_transpose.sng": {
+  "ok": true,
+  "variant": "GTS5",
+  "notes": [
+   [
+    "loop-transpose",
+    "subtune 0 channel 1: its loop replays with a running transpose/repeat the doc cannot hold; the first pass's is kept"
+   ]
+  ],
+  "asid": "4153494402010301060000000102000002010105010201000001010002010000000102010100000001030000000000000000"
+ },
+ "gts5_padded_table.sng": {
+  "ok": true,
+  "variant": "GTS5",
+  "notes": [
+   [
+    "table-padded",
+    "instrument 1: its pulse pointer 6 is past the table's 3 rows; blank rows added"
+   ],
+   [
+    "table-padded",
+    "instrument 1: its speed pointer 2 is past the table's 0 rows; blank rows added"
+   ]
+  ],
+  "asid": "41534944020103010600000001010000000101000000010100000001010101010000010b706f696e747320706173740000008000010600020241ff00000688ff88000000000000000000000200000000"
+ },
+ "refuse_bad_command.sng": {
+  "ok": false,
+  "reason": "pattern 0 row 0: command byte $10 is not 0-F"
+ },
+ "refuse_bad_instrument.sng": {
+  "ok": false,
+  "reason": "pattern 0 row 0: instrument 2 does not exist (the song has 1)"
+ },
+ "refuse_bad_note.sng": {
+  "ok": false,
+  "reason": "pattern 0 row 0: note byte $50 is not a GoatTracker note"
+ },
+ "refuse_beta_gts3.sng": {
+  "ok": false,
+  "reason": "it is a GoatTracker 2 beta song (GTS3); only GTS5 (GoatTracker 2.59 on) and GTS! (GoatTracker 1) songs are read. Load and save it in a current GoatTracker to convert it"
+ },
+ "refuse_dual_sid.sng": {
+  "ok": false,
+  "reason": "it is a dual-SID (6-channel) song; dual SID is not supported yet (plan-sid-tracking.md S7)"
+ },
+ "refuse_ends_with_command.sng": {
+  "ok": false,
+  "reason": "subtune 0 channel 1's orderlist ends with a command, not a pattern (readme §3.1)"
+ },
+ "refuse_gt1_end_note.sng": {
+  "ok": false,
+  "reason": "pattern 0 row 0: note byte $FF is not a GoatTracker 1 note"
+ },
+ "refuse_gt1_pattern_length.sng": {
+  "ok": false,
+  "reason": "pattern 0 is 5 bytes long, not a whole number of 3-byte rows"
+ },
+ "refuse_gt1_trailing_bytes.sng": {
+  "ok": false,
+  "reason": "7 bytes follow the last pattern; a GoatTracker 1 song ends there or after a 256-byte filter table"
+ },
+ "refuse_long_pattern.sng": {
+  "ok": false,
+  "reason": "pattern 0 has 129 rows; a pattern has at most 128"
+ },
+ "refuse_no_pattern.sng": {
+  "ok": false,
+  "reason": "subtune 0 channel 1's orderlist plays no pattern"
+ },
+ "refuse_no_pattern_end.sng": {
+  "ok": false,
+  "reason": "pattern 0 does not end with the pattern-end row"
+ },
+ "refuse_no_subtunes.sng": {
+  "ok": false,
+  "reason": "it declares 0 subtunes; a song has 1-32"
+ },
+ "refuse_not_gt.sng": {
+  "ok": false,
+  "reason": "it is not a GoatTracker song (no GTS5 or GTS! identification string)"
+ },
+ "refuse_pattern_missing.sng": {
+  "ok": false,
+  "reason": "subtune 0 channel 2's orderlist plays pattern 3, but the song has 1"
+ },
+ "refuse_restart_past_end.sng": {
+  "ok": false,
+  "reason": "subtune 0 channel 1's orderlist restarts at byte 2, past its end"
+ },
+ "refuse_trailing_bytes.sng": {
+  "ok": false,
+  "reason": "2 bytes follow the last pattern"
+ },
+ "refuse_truncated.sng": {
+  "ok": false,
+  "reason": "the file ends inside pattern 0"
+ },
+ "refuse_truncated_header.sng": {
+  "ok": false,
+  "reason": "the file ends inside the song header"
+ },
+ "x_6581_3x.sng": {
+  "ok": true,
+  "variant": "GTS5",
+  "notes": [],
+  "asid": "415349440201030306000000010100000001010000000101000000010101010000000000000000"
+ }
+}

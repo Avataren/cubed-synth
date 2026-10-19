@@ -7,7 +7,7 @@ in a browser AudioWorklet and in a native audio callback.
 
 | Crate | What it is |
 |---|---|
-| `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, and a register-stream chip player (`stream`) |
+| `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, GoatTracker 1 and 2 `.sng` import (`goattracker`, another_synth's importer ported byte for byte), and a register-stream chip player (`stream`) |
 | `cubed-ahx` | AHX / HivelyTracker (`.ahx`, `.hvl`) parser and replayer, bit-exact against `hvl_replay.c`, with a band-limited "hifi" path |
 | `cubed-opl` | Yamaha OPL2/OPL3 FM chip (a port of ymfm's OPL path) and an Adlib Tracker II (`.a2m`) parser and player |
 | `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. An `Observer` sees every row and command |
@@ -66,7 +66,9 @@ AdLib channels 14–21 µs).
 
 Test fixtures live under each crate's `tests/fixtures`: AHX/HVL songs (`cubed-ahx`),
 Adlib Tracker II modules (`cubed-opl`), SID song files plus the instrument-visuals
-parity fixture another_synth's TypeScript tests share (`cubed-sid`), and synthetic
+parity fixture another_synth's TypeScript tests share and synthetic GoatTracker songs
+with the DAW's import of them (`cubed-sid`, `tests/fixtures/goattracker`: its
+`oracle.ts` reruns the DAW's importer over any corpus), and synthetic
 MOD, S3M and XM modules with the scripts that write them (`cubed-tracker`).
 
 One test fails, as it does in another_synth:

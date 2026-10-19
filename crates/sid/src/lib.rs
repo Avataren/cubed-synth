@@ -35,6 +35,7 @@
 pub mod chip;
 pub mod envelope;
 pub mod filter;
+pub mod goattracker;
 pub mod noise;
 pub mod player;
 pub mod revision;
