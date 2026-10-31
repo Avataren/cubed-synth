@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::clip::Clip;
+use crate::engine::{EngineControls, EngineSound};
 use crate::insert::Insert;
 use crate::sfx::Sfx;
 use crate::source::{Source, SourceEvent};
@@ -206,6 +207,39 @@ impl PlaySfx {
     }
 }
 
+/// An engine sound to play (see `engine`): it plays until stopped, following the
+/// controls `Command::SetEngine` sends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayEngine {
+    pub voice: VoiceId,
+    pub bus: BusId,
+    pub engine: EngineSound,
+    /// What it starts at, before the first `SetEngine`.
+    pub controls: EngineControls,
+    /// Linear gain.
+    pub gain: f32,
+    pub pan: f32,
+    pub priority: u8,
+    pub start: Start,
+    pub spatial: Option<Spatial>,
+}
+
+impl PlayEngine {
+    pub fn new(voice: VoiceId, engine: EngineSound, bus: BusId) -> PlayEngine {
+        PlayEngine {
+            voice,
+            bus,
+            engine,
+            controls: EngineControls::default(),
+            gain: 1.0,
+            pan: 0.0,
+            priority: 128,
+            start: Start::Now,
+            spatial: None,
+        }
+    }
+}
+
 /// A recording of the master output, filled block by block until full and
 /// then handed back as [`Returned::Capture`].
 #[derive(Debug)]
@@ -280,6 +314,13 @@ pub enum Command {
     PlaySource(PlaySource),
     /// Plays a procedural sound effect, made in place: no object to prepare.
     PlaySfx(PlaySfx),
+    /// Plays an engine sound, made in place like a sound effect.
+    PlayEngine(PlayEngine),
+    /// What the engine sound playing on the voice follows now.
+    SetEngine {
+        voice: VoiceId,
+        controls: EngineControls,
+    },
     SetVoiceGain(VoiceId, f32),
     /// Hands an event (a note) to the source playing on the voice.
     SourceEvent {
@@ -364,6 +405,10 @@ impl std::fmt::Debug for Command {
             Command::PrepareSource(id, _) => write!(f, "PrepareSource({id:?}, ..)"),
             Command::PlaySource(play) => write!(f, "PlaySource({play:?})"),
             Command::PlaySfx(play) => write!(f, "PlaySfx({play:?})"),
+            Command::PlayEngine(play) => write!(f, "PlayEngine({play:?})"),
+            Command::SetEngine { voice, controls } => {
+                write!(f, "SetEngine({voice:?}, {controls:?})")
+            }
             Command::SourceEvent { voice, event } => write!(f, "SourceEvent({voice:?}, {event:?})"),
             Command::FadeVoice {
                 voice,

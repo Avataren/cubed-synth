@@ -8,9 +8,10 @@
 //! files through its own exports). Decoding never allocates.
 
 use crate::command::{
-    BusId, BusSettings, ClipId, Command, Duck, Event, Play, PlaySfx, PlaySource, SendSettings,
-    SourceId, Start, VoiceId,
+    BusId, BusSettings, ClipId, Command, Duck, Event, Play, PlayEngine, PlaySfx, PlaySource,
+    SendSettings, SourceId, Start, VoiceId,
 };
+use crate::engine::{EngineControls, EngineSound, MAX_CYLINDERS};
 use crate::sfx::{Sfx, SfxWave};
 use crate::source::SourceEvent;
 use crate::spatial::{Listener, Rolloff, Spatial, SpatialMode};
@@ -42,6 +43,8 @@ mod tag {
     pub const SOURCE_EVENT: u8 = 24;
     pub const PLAY_SFX: u8 = 25;
     pub const VOICE_OCCLUSION: u8 = 26;
+    pub const PLAY_ENGINE: u8 = 27;
+    pub const SET_ENGINE: u8 = 28;
 
     pub const ENDED: u8 = 1;
     pub const STOLEN: u8 = 2;
@@ -179,6 +182,46 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             }
             w.u64(s.seed);
             w.f32(s.level);
+        }
+        Command::PlayEngine(p) => {
+            w.u8(tag::PLAY_ENGINE);
+            w.u64(p.voice.0);
+            w.u16(p.bus.0);
+            w.f32(p.gain);
+            w.f32(p.pan);
+            w.u8(p.priority);
+            w.start(p.start);
+            w.spatial(p.spatial.as_ref());
+            let e = &p.engine;
+            w.u8(e.cylinders);
+            for angle in e.firing {
+                w.f32(angle);
+            }
+            w.u8(e.two_stroke as u8);
+            for v in [
+                e.header_spread,
+                e.pipe_length,
+                e.resonance,
+                e.muffler,
+                e.exhaust,
+                e.intake,
+                e.mechanical,
+                e.roughness,
+                e.crackle,
+                e.tyres,
+                e.road,
+                e.wind,
+                e.level,
+            ] {
+                w.f32(v);
+            }
+            w.u64(e.seed);
+            w.controls(&p.controls);
+        }
+        Command::SetEngine { voice, controls } => {
+            w.u8(tag::SET_ENGINE);
+            w.u64(voice.0);
+            w.controls(controls);
         }
         Command::SourceEvent { voice, event } => {
             w.u8(tag::SOURCE_EVENT);
@@ -367,6 +410,11 @@ impl Writer<'_> {
             }
         }
     }
+    fn controls(&mut self, c: &EngineControls) {
+        for v in [c.rpm, c.throttle, c.load, c.speed, c.skid] {
+            self.f32(v);
+        }
+    }
     /// A presence byte, then the settings.
     fn spatial(&mut self, spatial: Option<&Spatial>) {
         let Some(s) = spatial else {
@@ -449,6 +497,15 @@ impl Reader<'_> {
             attack_ms: self.f32()?,
             release_ms: self.f32()?,
         }))
+    }
+    fn controls(&mut self) -> Result<EngineControls, WireError> {
+        Ok(EngineControls {
+            rpm: self.f32()?,
+            throttle: self.f32()?,
+            load: self.f32()?,
+            speed: self.f32()?,
+            skid: self.f32()?,
+        })
     }
     fn spatial(&mut self) -> Result<Option<Spatial>, WireError> {
         if !self.bool()? {
@@ -603,6 +660,56 @@ impl Reader<'_> {
                     spatial,
                 })
             }
+            tag::PLAY_ENGINE => {
+                let voice = self.voice()?;
+                let bus = self.bus()?;
+                let gain = self.f32()?;
+                let pan = self.f32()?;
+                let priority = self.u8()?;
+                let start = self.start()?;
+                let spatial = self.spatial()?;
+                let cylinders = self.u8()?;
+                let mut firing = [0.0; MAX_CYLINDERS];
+                for angle in &mut firing {
+                    *angle = self.f32()?;
+                }
+                let two_stroke = self.u8()? != 0;
+                let engine = EngineSound {
+                    cylinders,
+                    firing,
+                    two_stroke,
+                    header_spread: self.f32()?,
+                    pipe_length: self.f32()?,
+                    resonance: self.f32()?,
+                    muffler: self.f32()?,
+                    exhaust: self.f32()?,
+                    intake: self.f32()?,
+                    mechanical: self.f32()?,
+                    roughness: self.f32()?,
+                    crackle: self.f32()?,
+                    tyres: self.f32()?,
+                    road: self.f32()?,
+                    wind: self.f32()?,
+                    level: self.f32()?,
+                    seed: self.u64()?,
+                };
+                let controls = self.controls()?;
+                Command::PlayEngine(PlayEngine {
+                    voice,
+                    bus,
+                    engine,
+                    controls,
+                    gain,
+                    pan,
+                    priority,
+                    start,
+                    spatial,
+                })
+            }
+            tag::SET_ENGINE => Command::SetEngine {
+                voice: self.voice()?,
+                controls: self.controls()?,
+            },
             tag::SOURCE_EVENT => {
                 let voice = self.voice()?;
                 let kind = self.u8()?;
@@ -750,6 +857,43 @@ mod tests {
                     bus,
                 )
             }),
+            Command::PlayEngine(PlayEngine {
+                gain: 0.8,
+                pan: 0.1,
+                priority: 90,
+                start: Start::AtFrame(7),
+                spatial: Some(Spatial::new(SpatialMode::Full, [4.0, 1.0, -2.0])),
+                controls: EngineControls {
+                    rpm: 850.0,
+                    throttle: 0.1,
+                    load: 0.05,
+                    speed: 0.0,
+                    skid: 0.0,
+                },
+                ..PlayEngine::new(
+                    voice,
+                    EngineSound {
+                        cylinders: 8,
+                        firing: [
+                            0.0, 90.0, 270.0, 180.0, 630.0, 540.0, 450.0, 360.0, 0.0, 0.0, 0.0, 0.0,
+                        ],
+                        header_spread: 0.7,
+                        seed: 0x1234_5678_9abc,
+                        ..EngineSound::default()
+                    },
+                    bus,
+                )
+            }),
+            Command::SetEngine {
+                voice,
+                controls: EngineControls {
+                    rpm: 4321.0,
+                    throttle: 0.9,
+                    load: -0.2,
+                    speed: 33.0,
+                    skid: 0.4,
+                },
+            },
             Command::RemoveBus(bus),
             Command::SetBusGain(bus, -3.0),
             Command::SetBusPan(bus, -1.0),

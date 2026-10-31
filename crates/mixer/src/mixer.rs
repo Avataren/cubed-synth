@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use crate::clip::{Clip, ClipVoice};
 use crate::command::{
-    BusId, BusSettings, Capture, ClipId, Command, Event, Play, PlaySfx, PlaySource, Returned,
-    SendSettings, SourceId, Start, VoiceId,
+    BusId, BusSettings, Capture, ClipId, Command, Event, Play, PlayEngine, PlaySfx, PlaySource,
+    Returned, SendSettings, SourceId, Start, VoiceId,
 };
+use crate::engine::EngineVoice;
 use crate::insert::Insert;
 use crate::sfx::SfxVoice;
 use crate::smooth::{balance, block_coeff, db_to_gain, GainRamp, Smoothed};
@@ -340,6 +341,12 @@ impl Mixer {
             }
             Command::PlaySource(play) => self.play_source(play),
             Command::PlaySfx(play) => self.play_sfx(play),
+            Command::PlayEngine(play) => self.play_engine(play),
+            Command::SetEngine { voice, controls } => self.with_voice(voice, |v| {
+                if let Some(engine) = v.voice.engine_mut() {
+                    engine.set_controls(controls);
+                }
+            }),
             Command::SourceEvent { voice, event } => self.with_voice(voice, |v| {
                 if let Some(source) = v.voice.source_mut() {
                     source.event(event);
@@ -759,6 +766,34 @@ impl Mixer {
         let start_frame = self.start_frame(play.start);
         let voice = SourceVoice::new(
             Generator::Boxed(source),
+            play.gain,
+            play.pan,
+            play.spatial.map(|s| (s, start_frame)),
+        );
+        self.place_voice(
+            slot,
+            play.voice,
+            bus,
+            play.priority,
+            start_frame,
+            Voice::Source(voice),
+        );
+    }
+
+    fn play_engine(&mut self, play: PlayEngine) {
+        let Some(bus) = self.used_bus(play.bus) else {
+            self.stats.rejected_commands += 1;
+            self.emit(Event::Rejected(play.voice));
+            return;
+        };
+        let Some(slot) = self.allocate_voice(bus, play.priority, play.voice) else {
+            return;
+        };
+        let start_frame = self.start_frame(play.start);
+        let mut engine = EngineVoice::new(play.engine, self.config.sample_rate);
+        engine.set_controls(play.controls);
+        let voice = SourceVoice::new(
+            Generator::Engine(engine),
             play.gain,
             play.pan,
             play.spatial.map(|s| (s, start_frame)),

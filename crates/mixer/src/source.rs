@@ -2,6 +2,7 @@
 //! chip-music players, streams, synths.
 
 use crate::clip::ClipVoice;
+use crate::engine::EngineVoice;
 use crate::sfx::SfxVoice;
 use crate::smooth::{balance, fade_step, start_fade, step_ramp, GainRamp, Smoothed};
 use crate::spatial::{equal_power, Hearing, Spatial, SpatialVoice};
@@ -39,11 +40,16 @@ pub enum SourceEvent {
 }
 
 /// What makes a source voice's sound.
+// The engine voice holds its exhaust's delay line in place (a few KB): voices are made on
+// the audio thread, which must not allocate.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Generator {
     /// A host's source object, handed back when the voice ends.
     Boxed(Box<dyn Source>),
     /// A procedural sound effect, made in place from plain data.
     Sfx(SfxVoice),
+    /// An engine sound, made in place from plain data and steered by `SetEngine`.
+    Engine(EngineVoice),
 }
 
 /// A playing source.
@@ -102,6 +108,11 @@ impl SourceVoice {
                 sr.copy_from_slice(sl);
                 more
             }
+            Generator::Engine(engine) => {
+                let more = engine.render(sl);
+                sr.copy_from_slice(sl);
+                more
+            }
         };
         step_ramp(&mut self.gain, &mut self.ramp, n);
         let (fade_start, fade_end, fade_frames) = fade_step(&mut self.fade, n);
@@ -148,7 +159,7 @@ impl Voice {
         match self {
             Voice::Source(v) => match v.source.as_mut()? {
                 Generator::Boxed(source) => Some(source.as_mut()),
-                Generator::Sfx(_) => None,
+                Generator::Sfx(_) | Generator::Engine(_) => None,
             },
             Voice::Clip(_) => None,
         }
@@ -156,12 +167,25 @@ impl Voice {
 }
 
 /// A voice of either kind.
+// A source voice can hold an engine sound in place (see `Generator`).
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Voice {
     Clip(ClipVoice),
     Source(SourceVoice),
 }
 
 impl Voice {
+    /// The engine sound playing on this voice, if it is one.
+    pub(crate) fn engine_mut(&mut self) -> Option<&mut EngineVoice> {
+        match self {
+            Voice::Source(v) => match v.source.as_mut()? {
+                Generator::Engine(engine) => Some(engine),
+                _ => None,
+            },
+            Voice::Clip(_) => None,
+        }
+    }
+
     pub(crate) fn clip(&self) -> Option<usize> {
         match self {
             Voice::Clip(v) => Some(v.clip),

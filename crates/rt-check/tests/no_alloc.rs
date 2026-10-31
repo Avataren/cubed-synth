@@ -655,3 +655,53 @@ fn mixer_sfx() {
         mixer.drain_events(|_| {});
     });
 }
+
+/// Engine sounds started from commands and steered every block (as a game's vehicles
+/// are each frame), revving, sliding and stopping; a new one starts as one ends.
+#[test]
+fn mixer_engine() {
+    use cubed_mixer::{EngineControls, EngineSound, PlayEngine};
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: RATE as f32,
+        ..MixerConfig::default()
+    });
+    mixer.apply(Command::SetBus(BusId(1), BusSettings::default()));
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let mut next = 0u64;
+    let start = |mixer: &mut Mixer, voice: u64| {
+        let engine = EngineSound {
+            cylinders: [4, 6, 8, 2][voice as usize % 4],
+            seed: voice,
+            crackle: 1.0,
+            ..EngineSound::default()
+        };
+        mixer.apply(Command::PlayEngine(PlayEngine {
+            spatial: Some(Spatial::new(SpatialMode::Full, [voice as f32, 0.0, -5.0])),
+            ..PlayEngine::new(VoiceId(voice), engine, BusId(1))
+        }));
+    };
+    assert_no_alloc("engine sounds", 5, |block| {
+        if block % 120 == 0 {
+            next += 1;
+            start(&mut mixer, next);
+            if next > 2 {
+                mixer.apply(Command::Stop(VoiceId(next - 2), 256));
+            }
+        }
+        for voice in next.saturating_sub(1)..=next {
+            let t = (block % 120) as f32 / 120.0;
+            mixer.apply(Command::SetEngine {
+                voice: VoiceId(voice),
+                controls: EngineControls {
+                    rpm: 200.0 + 6000.0 * t,
+                    throttle: if t < 0.7 { 1.0 } else { 0.0 },
+                    load: if t < 0.7 { 0.8 } else { -0.4 },
+                    speed: 40.0 * t,
+                    skid: if t > 0.5 { 1.0 } else { 0.0 },
+                },
+            });
+        }
+        mixer.process(&mut left, &mut right);
+        mixer.drain_events(|_| {});
+    });
+}

@@ -25,6 +25,7 @@
 mod clip;
 mod command;
 pub mod effects;
+pub mod engine;
 mod insert;
 mod mixer;
 pub mod sfx;
@@ -43,10 +44,11 @@ pub mod stream;
 
 pub use clip::Clip;
 pub use command::{
-    BusId, BusSettings, Capture, ClipId, Command, Duck, Event, Play, PlaySfx, PlaySource, Returned,
-    SendSettings, SourceId, Start, VoiceId,
+    BusId, BusSettings, Capture, ClipId, Command, Duck, Event, Play, PlayEngine, PlaySfx,
+    PlaySource, Returned, SendSettings, SourceId, Start, VoiceId,
 };
 pub use effects::{Effect, EffectKind};
+pub use engine::{EngineControls, EngineSound, MAX_CYLINDERS};
 pub use insert::{DspInsert, Insert};
 pub use mixer::{BusMeter, Mixer, MixerConfig, Stats, MAX_INSERTS, MAX_SENDS};
 pub use sfx::{Sfx, SfxPreset, SfxWave};
