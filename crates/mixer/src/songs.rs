@@ -2,12 +2,15 @@
 //! modules, SID songs, and MOD, S3M and XM modules, each played by its
 //! cubed-synth player.
 
+use std::sync::Arc;
+
 use cubed_ahx::player::AhxPlayer;
 use cubed_opl::a2::player::A2Player;
 use cubed_sid::{SidSong, SidSongPlayer};
-use cubed_tracker::{Player, PlayerOptions};
+use cubed_tracker::{Loop, Player, PlayerOptions, Probe};
 
-use crate::source::Source;
+use crate::song::{SongControl, SongLoop, SongReader, SongStatus};
+use crate::source::{Source, SourceEvent};
 
 /// The most frames a player is asked for at once; longer blocks are split,
 /// so the players' buffers never grow past what the warm-up sized them for.
@@ -88,22 +91,50 @@ pub fn open_song(
         SongFormat::Ahx => Box::new(AhxSong::new(bytes, sample_rate, options)?),
         SongFormat::A2m => Box::new(A2mSong::new(bytes, sample_rate, options)?),
         SongFormat::Sid => Box::new(SidSongSource::new(bytes, sample_rate, options)?),
-        SongFormat::Mod => Box::new(ModuleSong::new(
-            cubed_tracker::load_format(cubed_tracker::Format::Mod, bytes)?,
-            sample_rate,
-            options,
-        )),
-        SongFormat::S3m => Box::new(ModuleSong::new(
-            cubed_tracker::load_format(cubed_tracker::Format::S3m, bytes)?,
-            sample_rate,
-            options,
-        )),
-        SongFormat::Xm => Box::new(ModuleSong::new(
-            cubed_tracker::load_format(cubed_tracker::Format::Xm, bytes)?,
-            sample_rate,
-            options,
-        )),
+        SongFormat::Mod | SongFormat::S3m | SongFormat::Xm => {
+            open_module_song(format, bytes, sample_rate, options, false)?
+        }
     })
+}
+
+/// A MOD, S3M or XM file as a song under live control, ready to play at
+/// `sample_rate`. It is a [`Source`] like any other, and the host also
+/// [steers](SongControl) it with `SourceEvent::Song` and reads it back through
+/// `Source::song_reader`. `stopped` opens it under transport control and stopped:
+/// it makes no sound until `SongControl::Play` (a note preview or a seek works
+/// meanwhile), and its voice never ends by itself, so an editor keeps one voice for
+/// as long as it has the module open; at the end of a song that does not repeat
+/// (`SongOptions::looped` false or `SongControl::Looped(false)`) the transport
+/// stops at the top instead. With `stopped` false it is `open_song`'s: it plays at
+/// once, and ends where the song does (when not looped).
+///
+/// Build it off the audio thread (it prepares every sample, rings and tables).
+/// Errors for the other formats.
+pub fn open_module_song(
+    format: SongFormat,
+    bytes: &[u8],
+    sample_rate: f32,
+    options: SongOptions,
+    stopped: bool,
+) -> Result<Box<dyn Source>, String> {
+    let format = match format {
+        SongFormat::Mod => cubed_tracker::Format::Mod,
+        SongFormat::S3m => cubed_tracker::Format::S3m,
+        SongFormat::Xm => cubed_tracker::Format::Xm,
+        _ => return Err("not a tracker module format (MOD, S3M, XM)".into()),
+    };
+    let module = cubed_tracker::load_format(format, bytes)?;
+    Ok(open_module(module, sample_rate, options, stopped))
+}
+
+/// [`open_module_song`] for a module the host already holds (an edited one).
+pub fn open_module(
+    module: cubed_tracker::Module,
+    sample_rate: f32,
+    options: SongOptions,
+    stopped: bool,
+) -> Box<dyn Source> {
+    Box::new(ModuleSong::new(module, sample_rate, options, stopped))
 }
 
 /// Calls `render` on chunks of at most [`CHUNK`] frames.
@@ -215,13 +246,23 @@ impl Source for SidSongSource {
 }
 
 /// A tracker module, played by cubed-tracker (which allocates nothing once
-/// built, so it needs no warm-up).
+/// built, so it needs no warm-up), with a probe the host reads and
+/// `SongControl`s it can send.
 struct ModuleSong {
     player: Player,
+    probe: Arc<Probe>,
+    /// Under transport control: the voice never ends by itself.
+    controlled: bool,
 }
 
 impl ModuleSong {
-    fn new(module: cubed_tracker::Module, sample_rate: f32, options: SongOptions) -> ModuleSong {
+    fn new(
+        module: cubed_tracker::Module,
+        sample_rate: f32,
+        options: SongOptions,
+        stopped: bool,
+    ) -> ModuleSong {
+        let probe = Probe::new(module.channels);
         let mut player = Player::new(
             module,
             sample_rate,
@@ -234,12 +275,138 @@ impl ModuleSong {
         if options.subsong > 0 {
             player.seek(options.subsong, 0);
         }
-        ModuleSong { player }
+        if stopped {
+            player.stop();
+        }
+        player.attach_probe(probe.clone());
+        ModuleSong {
+            player,
+            probe,
+            controlled: stopped,
+        }
+    }
+
+    fn control(&mut self, control: SongControl) {
+        let player = &mut self.player;
+        match control {
+            SongControl::Play => player.play(),
+            SongControl::Stop => player.stop(),
+            SongControl::Seek { order, row } => player.seek(order as usize, row as usize),
+            SongControl::Loop(repeat) => player.set_loop(match repeat {
+                SongLoop::None => Loop::None,
+                SongLoop::Pattern { order } => Loop::Pattern(order as usize),
+                SongLoop::Range { order, row0, row1 } => Loop::Range {
+                    order: order as usize,
+                    row0: row0 as usize,
+                    row1: row1 as usize,
+                },
+            }),
+            SongControl::Mute { channel, on } => player.set_mute(channel as usize, on),
+            SongControl::Solo { channel, on } => player.set_solo(channel as usize, on),
+            SongControl::MuteMask(mask) => player.set_mute_mask(mask),
+            SongControl::SoloMask(mask) => player.set_solo_mask(mask),
+            SongControl::PreviewOn {
+                instrument,
+                note,
+                velocity,
+                duration,
+            } => {
+                player.preview_on(instrument, note, velocity, duration);
+            }
+            SongControl::PreviewOff => player.preview_off(),
+            SongControl::Looped(on) => player.set_looped(on),
+            SongControl::Scopes(on) => self.probe.set_scopes(on),
+            SongControl::SetCell(cell) => {
+                player.set_cell(
+                    cell.pattern as usize,
+                    cell.row as usize,
+                    cell.channel as usize,
+                    cubed_tracker::Cell {
+                        note: match cell.note {
+                            0 => cubed_tracker::Note::None,
+                            255 => cubed_tracker::Note::Off,
+                            midi => cubed_tracker::Note::On(midi),
+                        },
+                        period: cell.period,
+                        instrument: cell.instrument,
+                        volume: cell.volume,
+                        effect: cell.effect,
+                        param: cell.param,
+                    },
+                );
+            }
+        }
     }
 }
 
 impl Source for ModuleSong {
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) -> bool {
-        self.player.render(left, right)
+        let more = self.player.render(left, right);
+        if !more && self.controlled {
+            // The song ran out: stop at the top, and keep the voice.
+            self.player.stop();
+            self.player.seek(0, 0);
+            return true;
+        }
+        more
+    }
+
+    fn event(&mut self, event: SourceEvent) {
+        if let SourceEvent::Song(control) = event {
+            self.control(control);
+        }
+    }
+
+    fn song_reader(&self) -> Option<Arc<dyn SongReader>> {
+        Some(self.probe.clone())
+    }
+}
+
+impl From<cubed_tracker::Status> for SongStatus {
+    fn from(s: cubed_tracker::Status) -> SongStatus {
+        SongStatus {
+            playing: s.playing,
+            preview: s.preview,
+            order: s.order,
+            pattern: s.pattern,
+            row: s.row,
+            tick: s.tick,
+            speed: s.speed,
+            tempo: s.tempo,
+            rows: s.rows,
+            frames: s.frames,
+            version: s.version,
+        }
+    }
+}
+
+/// A module song's probe is its reader.
+impl SongReader for Probe {
+    fn status(&self) -> SongStatus {
+        Probe::status(self).into()
+    }
+
+    fn channels(&self) -> usize {
+        Probe::channels(self)
+    }
+
+    fn levels(&self, out: &mut [f32]) -> usize {
+        Probe::levels(self, out)
+    }
+
+    fn scope(&self, channel: usize, out: &mut [f32]) -> usize {
+        Probe::scope(self, channel, out)
+    }
+
+    fn scope_position(&self, channel: usize) -> u64 {
+        Probe::scope_position(self, channel)
+    }
+
+    fn scopes_enabled(&self) -> bool {
+        Probe::scopes_enabled(self)
+    }
+
+    fn alive(&self) -> bool {
+        Probe::alive(self)
     }
 }

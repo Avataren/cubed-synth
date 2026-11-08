@@ -31,6 +31,7 @@ mod insert;
 mod mixer;
 pub mod sfx;
 mod smooth;
+mod song;
 mod source;
 mod spatial;
 mod synth;
@@ -56,6 +57,10 @@ pub use insert::{DspInsert, Insert};
 pub use mixer::{BusMeter, Mixer, MixerConfig, Stats, MAX_INSERTS, MAX_SENDS};
 pub use sfx::{Sfx, SfxPreset, SfxWave};
 pub use smooth::MIN_DB;
+pub use song::{
+    SongCell, SongControl, SongLoop, SongReader, SongStatus, WebSong, WebSongs, SONG_LEVEL_SLOTS,
+    SONG_MAX_CHANNELS, SONG_SCOPE_FRAMES, SONG_STATUS_WORDS,
+};
 pub use source::{Source, SourceEvent};
 pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};
 pub use synth::{swap_commands, HeldNote, SynthBuild, SynthSource, EFFECT_TAIL_BLOCKS};

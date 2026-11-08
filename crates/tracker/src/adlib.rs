@@ -130,7 +130,8 @@ impl AdlibDriver {
             gain: module.adlib_gain,
             cache: [0xfc; 256],
             channels: [OplChannel::default(); 9],
-            track_channel: vec![None; module.channels],
+            // One track more than the song's, for a note the host previews.
+            track_channel: vec![None; module.channels + 1],
             preset: module.adlib_channels.clone(),
             instruments,
             limits: if module.flags.amiga_limits {
@@ -282,6 +283,27 @@ impl AdlibDriver {
         };
         self.flush_channel(ch);
         self.key_off(ch);
+    }
+
+    /// Lets go of the OPL channel `track` holds, once its note is keyed off, so
+    /// the next track that wants one finds it free (a previewed note's).
+    pub(crate) fn release_track(&mut self, track: usize) {
+        if let Some(slot) = self.track_channel.get_mut(track) {
+            *slot = None;
+        }
+    }
+
+    /// How loud `track`'s note is, 0 to 1, from its key and volume: the chip
+    /// mixes its channels, so this is an estimate.
+    pub(crate) fn level(&self, track: usize) -> f32 {
+        self.existing(track).map_or(0.0, |ch| {
+            let c = &self.channels[ch];
+            if c.keyed {
+                c.avol as f32 / 63.0
+            } else {
+                0.0
+            }
+        })
     }
 
     pub(crate) fn all_notes_off(&mut self) {

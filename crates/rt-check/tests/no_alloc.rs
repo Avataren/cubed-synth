@@ -26,7 +26,7 @@ use cubed_opl::a2::player::A2Player;
 use cubed_rt_check::{allocations_during, trace_allocations, CountingAllocator};
 use cubed_sid::stream::SidChipPlayer;
 use cubed_sid::{SidModel, SidSong, SidSongPlayer};
-use cubed_tracker::{Player, PlayerOptions};
+use cubed_tracker::{Loop, Player, PlayerOptions, Probe, LEVEL_SLOTS, SCOPE_FRAMES};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -180,6 +180,188 @@ fn tracker_player() {
             );
         }
     }
+}
+
+/// A tracker module under live control: stop and play, seeks, every kind of
+/// loop, mutes and solos, note previews of every instrument (AdLib included),
+/// and a probe read every block with the channel scopes switched on and off.
+#[test]
+fn tracker_live_control() {
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    for name in ["demo.mod", "demo.s3m", "demo.xm"] {
+        let bytes = fixture(&format!("tracker/tests/fixtures/{name}"));
+        let module = cubed_tracker::load(&bytes).unwrap();
+        let instruments = module.samples.len().max(module.instruments.len()).max(1);
+        let mut player = Player::new(module, RATE as f32, PlayerOptions::default());
+        let probe = Probe::new(player.module().channels);
+        player.attach_probe(probe.clone());
+        let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+        let (mut levels, mut ring) = ([0f32; LEVEL_SLOTS], [0f32; SCOPE_FRAMES]);
+        let mut sounded = 0.0f32;
+        for block in 0..40 * BLOCKS_PER_SECOND {
+            let (second, in_second) = (block / BLOCKS_PER_SECOND, block % BLOCKS_PER_SECOND);
+            let events = allocations_during(|| {
+                if in_second == 0 {
+                    player.seek(second % 4, second % 7);
+                    probe.set_scopes(second % 6 < 4);
+                    match second {
+                        2 => player.set_mute_mask(0b10),
+                        3 => player.set_loop(Loop::Pattern(1)),
+                        4 => player.stop(),
+                        5 => player.play(),
+                        6 => player.set_loop(Loop::Range {
+                            order: 0,
+                            row0: 2,
+                            row1: 9,
+                        }),
+                        7 => player.set_solo_mask(0b101),
+                        8 => player.set_solo_mask(0),
+                        9 => player.set_loop(Loop::None),
+                        _ => {}
+                    }
+                }
+                if in_second == 10 {
+                    let duration = if second % 2 == 0 { 4_800 } else { 0 };
+                    player.preview_on(
+                        (1 + second % instruments) as u8,
+                        (36 + second * 5 % 48) as u8,
+                        0.8,
+                        duration,
+                    );
+                }
+                if in_second == 200 {
+                    player.preview_off();
+                }
+                player.render(&mut left, &mut right);
+                let _ = probe.status();
+                probe.levels(&mut levels);
+                for channel in 0..probe.channels() {
+                    probe.scope(channel, &mut ring);
+                }
+            });
+            sounded = sounded.max(levels.iter().fold(0.0, |m, &l| m.max(l)));
+            assert_eq!(
+                events, 0,
+                "{name}: block {block} made {events} allocations or frees"
+            );
+        }
+        assert!(sounded > 0.01, "{name} sounded");
+    }
+}
+
+/// A module song steered through the mixer: opened stopped, every `SongControl`
+/// applied from decoded wire bytes (as the worklet does), and read back.
+#[test]
+fn mixer_song_control() {
+    use cubed_mixer::songs::open_module_song;
+    use cubed_mixer::{wire, SongCell, SongControl, SongLoop, SONG_LEVEL_SLOTS, SONG_SCOPE_FRAMES};
+    let rate = RATE as f32;
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        max_block: BLOCK,
+        ..MixerConfig::default()
+    });
+    let music = BusId(1);
+    mixer.apply(Command::SetBus(music, BusSettings::default()));
+    let song = open_module_song(
+        SongFormat::Xm,
+        &fixture("tracker/tests/fixtures/demo.xm"),
+        rate,
+        SongOptions::default(),
+        true,
+    )
+    .unwrap();
+    let reader = song.song_reader().unwrap();
+    let voice = VoiceId(5);
+    mixer.apply(Command::PrepareSource(SourceId(0), song));
+    mixer.apply(Command::PlaySource(PlaySource::new(
+        voice,
+        SourceId(0),
+        music,
+    )));
+    let controls = [
+        SongControl::Scopes(true),
+        SongControl::Seek { order: 1, row: 8 },
+        SongControl::Play,
+        SongControl::SetCell(SongCell {
+            pattern: 1,
+            row: 9,
+            channel: 2,
+            note: 64,
+            instrument: 2,
+            volume: 0x30,
+            ..Default::default()
+        }),
+        SongControl::Loop(SongLoop::Range {
+            order: 1,
+            row0: 8,
+            row1: 15,
+        }),
+        SongControl::Mute {
+            channel: 2,
+            on: true,
+        },
+        SongControl::SoloMask(0b11),
+        SongControl::PreviewOn {
+            instrument: 2,
+            note: 64,
+            velocity: 1.0,
+            duration: 2_000,
+        },
+        SongControl::Stop,
+        SongControl::Seek { order: 0, row: 0 },
+        SongControl::Looped(false),
+        SongControl::Loop(SongLoop::Pattern { order: 2 }),
+        SongControl::Play,
+        SongControl::SoloMask(0),
+        SongControl::MuteMask(0),
+        SongControl::PreviewOn {
+            instrument: 1,
+            note: 48,
+            velocity: 0.5,
+            duration: 0,
+        },
+        SongControl::PreviewOff,
+        SongControl::Loop(SongLoop::None),
+        SongControl::Looped(true),
+        SongControl::Scopes(false),
+    ];
+    // The wire bytes are made here, off the audio thread; decoding and applying
+    // them is what the audio thread does.
+    let encoded: Vec<Vec<u8>> = controls
+        .iter()
+        .map(|&control| {
+            let mut bytes = Vec::new();
+            wire::encode(
+                &Command::SourceEvent {
+                    voice,
+                    event: SourceEvent::Song(control),
+                },
+                &mut bytes,
+            );
+            bytes
+        })
+        .collect();
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let (mut levels, mut ring) = ([0f32; SONG_LEVEL_SLOTS], [0f32; SONG_SCOPE_FRAMES]);
+    let per_control = BLOCKS_PER_SECOND / 2;
+    let events = allocations_during(|| {
+        for (i, bytes) in encoded.iter().enumerate() {
+            for command in wire::decode(bytes) {
+                mixer.apply(command.unwrap());
+            }
+            for _ in 0..per_control {
+                mixer.process(&mut left, &mut right);
+                mixer.drain_events(|_| {});
+                let _ = reader.status();
+                reader.levels(&mut levels);
+                reader.scope(i % 4, &mut ring);
+            }
+        }
+    });
+    assert_eq!(events, 0, "{events} allocations or frees");
+    assert!(reader.alive() && mixer.is_playing(voice));
 }
 
 /// The DAW's synth engine: 8 voices of an FM-into-subtractive patch (two

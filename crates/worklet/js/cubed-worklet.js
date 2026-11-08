@@ -6,12 +6,17 @@
 // outputChannelCount: [2]})` and talk to its port.
 //
 // From the page, in order (messages before 'ready' are queued):
-//   {type: 'init', wasm: ArrayBuffer, maxVoices, maxBuses, maxClips, seedLo, seedHi, tapHz?}
+//   {type: 'init', wasm: ArrayBuffer, maxVoices, maxBuses, maxClips, seedLo, seedHi, tapHz?, songHz?}
 //   {type: 'commands', bytes: ArrayBuffer}  cubed_mixer::wire commands
 //   {type: 'clip', id, sampleRate, left: Float32Array, right?: Float32Array}
 //   {type: 'song', source, format (0 AHX/HVL, 1 A2M, 2 SID, 3 MOD, 4 S3M, 5 XM), bytes: ArrayBuffer,
-//    subsong, looped, separation?}  prepares source slot `source` for a
-//    PlaySource command; separation (0-1) is a module's stereo width
+//    subsong, looped, separation?, stopped?, follow?}  prepares source slot `source` for a
+//    PlaySource command; separation (0-1) is a module's stereo width. For a module
+//    (3, 4, 5), `stopped` opens it under live control and stopped (silent until a
+//    SongControl 'Play' command, its voice never ends by itself) and `follow` (also
+//    implied by `stopped`) makes the worklet post its position, levels and channel
+//    scopes ('songpos', 'songscope'). The controls are ordinary 'commands': wire tag 30
+//    (`cubed_mixer::SongControl`: play, stop, seek, loop, mute, solo, note preview, scopes).
 //   {type: 'effect', bus, slot, kind (EffectKind index; -1 empties the slot),
 //    params: Float32Array}
 //   {type: 'tap', bus, enable}  switches the analysis tap of a bus on or off
@@ -49,6 +54,18 @@
 //    data: Float32Array}  about 40 times a second (init's `tapHz`) while a tap is
 //    on: for each bus in `buses`, its latest `frames` frames, left then right,
 //    in `data`; `written` is how many frames each tap had seen
+//   {type: 'songpos', frame, sources: Uint32Array, status: Uint32Array, levels: Float32Array}
+//    about 60 times a second (init's `songHz`) for the followed module songs that moved since
+//    the last one (and once more when one is gone): for song i, its source slot
+//    `sources[i]`, its status words `status[i * 12 ..]` (see `cubed_mixer::SongStatus::to_words`:
+//    flags playing/preview/alive/scopes, order, pattern, row, tick, speed, tempo, rows,
+//    frames lo and hi, version, channels) and its levels `levels[i * 33 ..]` (the channels'
+//    peaks, then the preview's). Not a reply to a 'song' message: that one has `ok`.
+//   {type: 'songscope', frame, frames: 512, sources: Uint32Array, channels: Uint32Array,
+//    written: Float64Array, data: Float32Array}  with each 'songpos', for the songs that
+//    have their scopes on (SongControl 'Scopes'): per song its channel count, then in `data`
+//    each channel's latest 512 mono frames, oldest first (`written` is how many frames each
+//    channel's ring had seen, for each channel of each song in order)
 //   {type: 'error', message}
 
 // Telemetry goes out every this many render quanta (about 21 ms at 48 kHz),
@@ -57,6 +74,7 @@ const TELEMETRY_BLOCKS = 8;
 const METER_FIELDS = 5;
 const TAP_FRAMES = 2048;
 const TAP_HZ = 40;
+const SONG_HZ = 60;
 
 class CubedMixerProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -65,8 +83,10 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
     this.pending = [];
     this.blocks = 0;
     this.tapsOn = false;
+    this.songsOn = false;
     this.warming = false;
     this.tapEvery = 1;
+    this.songEvery = 1;
     this.port.onmessage = (event) => this.receive(event.data);
   }
 
@@ -95,6 +115,7 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
       this.exports = x;
       // Taps go out about `tapHz` times a second (a render quantum is 128 frames).
       this.tapEvery = Math.max(1, Math.round(sampleRate / 128 / (message.tapHz > 0 ? message.tapHz : TAP_HZ)));
+      this.songEvery = Math.max(1, Math.round(sampleRate / 128 / (message.songHz > 0 ? message.songHz : SONG_HZ)));
       for (const queued of this.pending) this.handle(queued);
       this.pending = [];
       this.port.postMessage({ type: 'ready' });
@@ -128,13 +149,29 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         const bytes = new Uint8Array(message.bytes);
         const at = x.cw_file_buffer(bytes.length);
         new Uint8Array(x.memory.buffer, at, bytes.length).set(bytes);
-        const ok = x.cw_prepare_song(
-          message.source >>> 0,
-          message.format >>> 0,
-          (message.subsong ?? 0) >>> 0,
-          message.looped === false ? 0 : 1,
-          typeof message.separation === 'number' ? message.separation : -1,
-        ) === 1;
+        const separation = typeof message.separation === 'number' ? message.separation : -1;
+        const module = message.format >= 3 && message.format <= 5;
+        let ok;
+        if (module && (message.stopped || message.follow)) {
+          ok = x.cw_prepare_module(
+            message.source >>> 0,
+            message.format >>> 0,
+            (message.subsong ?? 0) >>> 0,
+            message.looped === false ? 0 : 1,
+            separation,
+            message.stopped ? 1 : 0,
+          ) === 1;
+          this.songsOn = x.cw_song_count() > 0;
+        } else {
+          ok = x.cw_prepare_song(
+            message.source >>> 0,
+            message.format >>> 0,
+            (message.subsong ?? 0) >>> 0,
+            message.looped === false ? 0 : 1,
+            separation,
+          ) === 1;
+          this.songsOn = x.cw_song_count() > 0;
+        }
         const reply = { type: 'song', source: message.source, ok };
         if (!ok) {
           // No TextDecoder in a worklet scope; the reason is ASCII.
@@ -252,6 +289,7 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
       );
     }
     if (this.tapsOn && this.blocks % this.tapEvery === 0) this.postTaps(x);
+    if (this.songsOn && this.blocks % this.songEvery === 0) this.postSongs(x);
     return true;
   }
 
@@ -265,6 +303,60 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
       this.port.postMessage({ type: 'swap', phase: 'done', old: x.cw_swap_old(), new: x.cw_swap_new(), frame: x.cw_frame() });
     } else {
       this.port.postMessage({ type: 'swap', phase: 'cancelled' });
+    }
+  }
+
+  // The followed module songs that moved: their position and levels, and the channel
+  // scopes of those that have them on. Once a song is gone there is nothing left to follow.
+  postSongs(x) {
+    const count = x.cw_songs_prepare();
+    if (count === 0) {
+      this.songsOn = x.cw_song_count() > 0;
+      return;
+    }
+    // Every pointer first, then the views (none of these calls allocates, but memory
+    // can grow on any call that does).
+    const words = x.cw_song_status_words();
+    const slots = x.cw_song_level_slots();
+    const at = {
+      sources: x.cw_song_sources(),
+      status: x.cw_song_status(),
+      levels: x.cw_song_levels(),
+      scopeSources: x.cw_song_scope_sources(),
+      channels: x.cw_song_scope_channels(),
+      written: x.cw_song_scope_written(),
+      data: x.cw_song_scope_data(),
+    };
+    const scoped = x.cw_song_scope_count();
+    const dataLen = x.cw_song_scope_len();
+    const frame = x.cw_frame();
+    const frames = x.cw_song_scope_frames();
+    const memory = x.memory.buffer;
+    const sources = new Uint32Array(memory, at.sources, count).slice();
+    const status = new Uint32Array(memory, at.status, count * words).slice();
+    const levels = new Float32Array(memory, at.levels, count * slots).slice();
+    this.port.postMessage(
+      { type: 'songpos', frame, sources, status, levels },
+      [sources.buffer, status.buffer, levels.buffer],
+    );
+    if (scoped > 0) {
+      const scopeSources = new Uint32Array(memory, at.scopeSources, scoped).slice();
+      const channels = new Uint32Array(memory, at.channels, scoped).slice();
+      const total = channels.reduce((a, b) => a + b, 0);
+      const written = new Float64Array(memory, at.written, total).slice();
+      const data = new Float32Array(memory, at.data, dataLen).slice();
+      this.port.postMessage(
+        {
+          type: 'songscope',
+          frame,
+          frames,
+          sources: scopeSources,
+          channels,
+          written,
+          data,
+        },
+        [scopeSources.buffer, channels.buffer, written.buffer, data.buffer],
+      );
     }
   }
 

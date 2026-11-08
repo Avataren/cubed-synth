@@ -302,6 +302,106 @@ async function bigSwap() {
   return { ok: phases === 'started,done', phases, replies };
 }
 
+// A module under live control in a real-time context: opened stopped and
+// followed, seeked while stopped, looped, previewed, muted, played and stopped by
+// wire commands; the page reads 'songpos' and 'songscope' messages.
+const SONG = { play: 0, stop: 1, seek: 2, loopNone: 3, loopPattern: 4, loopRange: 5, mute: 6, solo: 7,
+  muteMask: 8, soloMask: 9, previewOn: 10, previewOff: 11, looped: 12, scopes: 13 };
+function songCommand(voice, kind, ...rest) {
+  const v = new DataView(new ArrayBuffer(24));
+  v.setUint8(0, 30); v.setBigUint64(1, BigInt(voice), true); v.setUint8(9, kind);
+  const [a = 0, b = 0, c = 0, value = 0, frames = 0] = rest;
+  v.setUint16(10, a, true); v.setUint16(12, b, true); v.setUint16(14, c, true);
+  v.setFloat32(16, value, true); v.setUint32(20, frames, true);
+  return new Uint8Array(v.buffer);
+}
+
+// One song's entry of a 'songpos' message, decoded as WebSong does.
+function decodeSong(m, i) {
+  const w = m.status.subarray(i * 12, i * 12 + 12);
+  return {
+    source: m.sources[i], playing: !!(w[0] & 1), preview: !!(w[0] & 2), alive: !!(w[0] & 4),
+    scopes: !!(w[0] & 8), order: w[1], pattern: w[2], row: w[3], tick: w[4], speed: w[5], tempo: w[6],
+    rows: w[7], frames: w[8] + w[9] * 2 ** 32, version: w[10], channels: w[11],
+    levels: m.levels.subarray(i * 33, i * 33 + 33),
+  };
+}
+
+async function songControlled() {
+  const bytes = await (await fetch('../../tracker/tests/fixtures/demo.mod')).arrayBuffer();
+  const context = new AudioContext({ sampleRate: RATE });
+  const replies = [];
+  const positions = [];
+  const scopes = [];
+  const { node, ready } = await mixerNode(context, (m) => {
+    if (m.type === 'song') replies.push(m);
+    else if (m.type === 'songpos') for (let i = 0; i < m.sources.length; i++) positions.push({ at: performance.now(), ...decodeSong(m, i) });
+    else if (m.type === 'songscope') scopes.push(m);
+  });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const waitFor = async (predicate, ms = 3000, from = 0) => {
+    const start = performance.now();
+    while (performance.now() - start < ms) {
+      const found = positions.slice(from).find(predicate);
+      if (found) return found;
+      await sleep(15);
+    }
+    return null;
+  };
+  const send = (...parts) => {
+    const b = new Uint8Array(parts.flatMap((p) => [...p]));
+    node.port.postMessage({ type: 'commands', bytes: b.buffer }, [b.buffer]);
+  };
+  await ready;
+  node.port.postMessage({ type: 'song', source: 2, format: 3, bytes, subsong: 0, looped: true, stopped: true }, [bytes]);
+  node.port.postMessage({ type: 'song', source: 3, format: 3, bytes: new ArrayBuffer(8), stopped: true });
+  send(setBus(2, 0), playSource(5, 2, 2));
+  const results = {};
+  // Opened stopped: the first report says where it is.
+  const first = await waitFor((p) => p.source === 2);
+  results.first = first && { playing: first.playing, order: first.order, row: first.row, channels: first.channels, alive: first.alive, speed: first.speed, tempo: first.tempo };
+  const openedOk = replies.length === 2 && replies[0].ok && !replies[1].ok;
+  // A seek while stopped moves the position.
+  send(songCommand(5, SONG.seek, 2, 8));
+  const seeked = await waitFor((p) => p.order === 2 && p.row === 8 && !p.playing);
+  // Scopes on, a range loop, and play.
+  const mark = positions.length;
+  send(songCommand(5, SONG.scopes, 0, 1), songCommand(5, SONG.loopRange, 2, 8, 11), songCommand(5, SONG.play));
+  await sleep(900);
+  const during = positions.slice(mark);
+  const rows = [...new Set(during.map((p) => p.row))].sort((a, b) => a - b);
+  const loudest = Math.max(...during.map((p) => Math.max(...p.levels.subarray(0, 4))));
+  const ticks = new Set(during.map((p) => p.tick));
+  const rate = during.length / 0.9;
+  results.loop = { rows, loudest, ticks: ticks.size, count: during.length, rate };
+  const lastScope = scopes[scopes.length - 1];
+  const scopeOk = lastScope && lastScope.frames === 512 && lastScope.sources[0] === 2 && lastScope.channels[0] === 4
+    && lastScope.data.length === 4 * 512 && lastScope.written[0] > 512
+    && lastScope.data.some((s) => Math.abs(s) > 0.01);
+  results.scope = lastScope && { frames: lastScope.frames, channels: [...lastScope.channels], data: lastScope.data.length, written: lastScope.written[0] };
+  // A note preview over a muted song, held, then released.
+  const markPreview = positions.length;
+  send(songCommand(5, SONG.muteMask, 0, 0, 0, 0, 0b1111), songCommand(5, SONG.previewOn, 1, 60, 0, 1, 0));
+  const previewed = await waitFor((p) => p.preview && p.playing && p.levels[4] > 0.01, 3000, markPreview);
+  const markStop = positions.length;
+  send(songCommand(5, SONG.previewOff), songCommand(5, SONG.muteMask, 0, 0, 0, 0, 0), songCommand(5, SONG.stop));
+  const stopped = await waitFor((p) => !p.playing && !p.preview, 3000, markStop);
+  // Stopping the voice frees the source on the next message, and the song is reported gone once.
+  send(stop(5, 0));
+  await sleep(100);
+  send(setBus(3, 0));
+  const gone = await waitFor((p) => !p.alive);
+  await context.close();
+  results.checks = {
+    openedOk, first: !!first && !first.playing && first.order === 0 && first.row === 0 && first.channels === 4 && first.alive,
+    seeked: !!seeked, rowsInRange: rows.length > 0 && rows.every((r) => r >= 8 && r <= 11) && rows.length >= 3,
+    loud: loudest > 0.01, ticks: ticks.size >= 4, rate: rate > 25 && rate < 90, scopeOk: !!scopeOk,
+    previewed: !!previewed, stopped: !!stopped, gone: !!gone,
+  };
+  results.ok = Object.values(results.checks).every(Boolean);
+  return results;
+}
+
 async function run() {
   const clips = await clip();
   const songs = await song();
@@ -311,10 +411,11 @@ async function run() {
   const tapped = await taps();
   const swapped = await swap();
   const bigSwapped = await bigSwap();
+  const controlled = await songControlled();
   return {
     ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok && tapped.ok && swapped.ok
-      && bigSwapped.ok,
-    clips, songs, modules, synths, synthEdits, tapped, swapped, bigSwapped,
+      && bigSwapped.ok && controlled.ok,
+    clips, songs, modules, synths, synthEdits, tapped, swapped, bigSwapped, controlled,
   };
 }
 

@@ -10,10 +10,10 @@ in a browser AudioWorklet and in a native audio callback.
 | `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, GoatTracker 1 and 2 `.sng` import (`goattracker`, another_synth's importer ported byte for byte), and a register-stream chip player (`stream`) |
 | `cubed-ahx` | AHX / HivelyTracker (`.ahx`, `.hvl`) parser and replayer, bit-exact against `hvl_replay.c`, with a band-limited "hifi" path |
 | `cubed-opl` | Yamaha OPL2/OPL3 FM chip (a port of ymfm's OPL path) and an Adlib Tracker II (`.a2m`) parser and player |
-| `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. An `Observer` sees every row and command |
+| `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. An `Observer` sees every row and command; a `Probe` shows the position, per-channel levels and scopes of a playing player, which also takes live control (stop and play, seek, loops, mute and solo, note preview) |
 | `cubed-dsp` | The synth engine: audio graph, oscillators (analog, wavetable), envelopes, LFOs, filters, chorus, delay, reverb, convolver, compressor, limiter, EQ, voices, automation and patch loading; a catalogue of its node types, patch documents that are edited as data, and live parameter edits |
 | `cubed-simd` | The slice of `std::simd` the crates above use, on stable Rust |
-| `cubed-mixer` | A game audio mixer: named buses with faders, mute/solo, inserts (built-in `effects` with live parameters), sends and ducking; clip voices and sources (chip songs, streams, synth patches played by note events), 2D/3D placement with doppler, long fades, meters; nothing allocates while it runs. `native` adds a cpal output host and streams fed from another thread; `songs` plays AHX/HVL, A2M and SID songs and MOD/S3M/XM modules as sources; `wire` encodes its commands as bytes |
+| `cubed-mixer` | A game audio mixer: named buses with faders, mute/solo, inserts (built-in `effects` with live parameters), sends and ducking; clip voices and sources (chip songs, streams, synth patches played by note events), 2D/3D placement with doppler, long fades, meters; nothing allocates while it runs. `native` adds a cpal output host and streams fed from another thread; `songs` plays AHX/HVL, A2M and SID songs and MOD/S3M/XM modules as sources (a module can be steered and read while it plays); `wire` encodes its commands as bytes |
 | `cubed-worklet` | `cubed-mixer` as a wasm module for a browser AudioWorklet (raw exports, no JS glue) and its processor, `js/cubed-worklet.js` |
 | `cubed-rt-check` | Tests only: every render path checked for allocations with a counting allocator |
 
@@ -170,6 +170,111 @@ logarithmically spaced between the two frequencies with 0 to 1 (the bar's loudes
 dBFS, `floor_db` at 0, a full-scale sine at 1; silence is 0; a bar narrower than an FFT bin reads
 between its two nearest bins). It does not allocate. `smooth_bins(bins, &mut state, rise, fall)` is
 the usual fast-rise slow-fall smoothing for a display.
+
+## Live control of a playing module (a tracker editor's transport)
+
+A pattern editor plays a MOD, S3M or XM while the user works on it: it starts and stops the song
+from any row, loops a pattern or a few rows, mutes and solos channels, plays a note of an
+instrument on the side, follows the playhead, and shows each channel's level and waveform. All of
+it is in `cubed-tracker`'s `Player` and `cubed-mixer`, natively and in the worklet.
+
+**The player** (`cubed_tracker::Player`; plain Rust, nothing allocates after `Player::new`).
+
+| Call | What it does |
+|---|---|
+| `stop()` / `play()` | Stops where it is (notes die away in 3 ms, the position stays, a preview goes on) and starts again from that row. A song that has played to its end starts from the top. A new player is playing. |
+| `seek(order, row)` | Starts again from there in a clean state; speed and tempo are those the song reaches there. Works while stopped: the position moves, `play()` starts there. A live seek fades the notes. Sustained notes of earlier rows are not carried over (as in the DAW). |
+| `set_loop(Loop::{None, Pattern(order), Range{order,row0,row1}})` | Repeats a pattern, or rows `row0..=row1`, of the pattern at `order`. It does not move the playhead: seek first. The song plays on until it reaches the loop's pattern, then wraps there; a row sought to beyond the range plays once first. While a loop covers the pattern a position jump (`Bxx`) is ignored and a break (`Dxx`) goes to its row inside the loop (or the loop's first row); E6x and pattern delays work as usual. |
+| `set_mute(ch, bool)`, `set_solo(ch, bool)`, `set_mute_mask(u32)`, `set_solo_mask(u32)` | A muted channel keeps running unheard (an AdLib channel's note stops). With any solo, only soloed channels are heard, muted or not (the DAW's rule). Channels an S3M file switches off start muted (`mute_mask()`). |
+| `preview_on(instrument, midi, velocity, duration) -> bool` / `preview_off()` | Plays an instrument (a cell's 1-based number: a MOD or S3M sample, an XM instrument, whose keymap picks the sample by the note) at a MIDI note on a spare channel, over the song or alone while it is stopped, whatever is muted. `velocity` 0-1 scales the sample's own default volume (1 plays as in a song); `duration` frames after it starts it lets go (0 holds until `preview_off`); XM envelopes and fadeout run, other formats fade in 10 ms; a new preview cuts the last. AdLib instruments play on a free chip channel (none is free when a song uses all nine). Returns false when the instrument has no sample for the note. |
+| `set_cell(pattern, row, channel, Cell) -> bool` | A live edit of what the song will play when it reaches the cell. Shape changes (a pattern's rows, the order list, samples) need a new player. |
+| `status() -> Status` | `{playing, preview, order, pattern, row, tick, speed, tempo, rows, frames, version}`: the row playing (or the stopped song's), the tick of the row, ticks per row, BPM, rows started so far (a follower that polls slower than the song counts the rows it missed), frames rendered. |
+| `attach_probe(Arc<Probe>)` | Shares the state with other threads (below). |
+
+Notes are MIDI numbers in the player's API: a MOD plays the period its table has for the note (ProTracker's
+C-1 to B-3, or seven octaves when the file is not limited to them), an S3M C-0 to B-7, an XM C-0 to B-7.
+
+**The probe** (`cubed_tracker::Probe`, made with `Probe::new(channels)` off the audio thread, attached
+with `attach_probe`): every field is an atomic, so any thread reads it without waiting, and the position
+is one packed word, so a row, a tick and a tempo always belong together. `status()` is published at every
+tick; `levels(&mut [f32])` gives each channel's peak (the loudest frame of the latest block after the
+master volume and trim, falling 24 dB a second after it, 0 below -60 dB; a muted channel reads 0; an
+AdLib channel's is an estimate from its key and volume) and then the preview's; `scope(channel, &mut
+[f32])` gives the latest `SCOPE_FRAMES` = 512 frames of a channel (mono, oldest first, before the master
+volume; an AdLib channel's is flat) and `scope_position(channel)` how many it has written. The scope
+rings are written (one copy per channel per block) only while `set_scopes(true)`. `status().version`
+changes whenever anything shown has moved and stays put while everything is still.
+
+**In the mixer** (`cubed_mixer`, feature `songs`): `songs::open_module_song(format, bytes, rate,
+options, stopped)` (or `open_module(module, ...)` for a module the host holds) makes a source that
+takes `SourceEvent::Song(SongControl)`. With `stopped` it opens under transport control: silent until
+`Play`, and its voice never ends by itself (at the end of a song that does not repeat, the transport
+stops at the top). `open_song` is unchanged: it plays at once and ends with the song. The host asks the
+source for its reader before handing it over: `let reader: Arc<dyn SongReader> =
+source.song_reader().unwrap();`, then `PrepareSource` and `PlaySource` as for any source.
+
+```rust
+enum SongControl {
+    Play, Stop, Seek { order: u16, row: u16 },
+    Loop(SongLoop),                                   // None | Pattern { order } | Range { order, row0, row1 }
+    Mute { channel: u8, on: bool }, Solo { channel: u8, on: bool },
+    MuteMask(u32), SoloMask(u32),                     // every channel at once, a bit each
+    PreviewOn { instrument: u8, note: u8, velocity: f32, duration: u32 }, PreviewOff,
+    Looped(bool),                                     // restart at the end of the song
+    Scopes(bool),                                     // fill the channel scope rings
+    SetCell(SongCell),                                // a live cell edit
+}
+trait SongReader: Send + Sync {                       // natively: the song's probe; on the web: WebSong
+    fn status(&self) -> SongStatus;                   // as Player::status, plus `version`
+    fn channels(&self) -> usize;
+    fn levels(&self, out: &mut [f32]) -> usize;       // the channels' peaks, then the preview's
+    fn scope(&self, channel: usize, out: &mut [f32]) -> usize;   // mono frames, oldest first, <= 512
+    fn scope_position(&self, channel: usize) -> u64;
+    fn scopes_enabled(&self) -> bool;
+    fn alive(&self) -> bool;                          // false once the song's voice has been freed
+}
+```
+
+**Wire** (every control is an ordinary `Command::SourceEvent`, so a worklet takes it in a `'commands'`
+batch): tag 30, 24 bytes, little endian: `u8 tag, u64 voice, u8 kind, u16 a, u16 b, u16 c, f32 value,
+u32 frames`. Kinds: 0 Play, 1 Stop, 2 Seek (a order, b row), 3 Loop none, 4 Loop pattern (a order), 5 Loop
+range (a order, b row0, c row1), 6 Mute (a channel, b on), 7 Solo (a, b), 8 MuteMask (frames), 9 SoloMask
+(frames), 10 PreviewOn (a instrument, b note, value velocity, frames duration), 11 PreviewOff, 12 Looped
+(b on), 13 Scopes (b on). Tag 31, 21 bytes: `u8 tag, u64 voice, u16 pattern, u16 row, u8 channel, u8 note
+(0 none, 255 key off, else MIDI), u16 period, u8 instrument, u8 volume, u8 effect, u8 param` (SetCell). An
+unknown kind stops the batch at it (`WireError::UnknownTag(30)`); the other tags are unchanged.
+
+**The worklet.** The page opens a module with the processor's existing `'song'` message plus `stopped:
+true` (open it stopped and under control) or `follow: true` (follow it while it plays), for format 3, 4
+or 5; the reply is the usual `{type: 'song', source, ok, error?}`. Then it plays the source and steers it
+with `'commands'`. The worklet posts, about 60 times a second (init's `songHz`) and only for the followed
+songs that moved:
+
+- `{type: 'songpos', frame, sources: Uint32Array, status: Uint32Array, levels: Float32Array}`: for song i
+  its source slot, 12 status words (flags playing/preview/alive/scopes on, order, pattern, row, tick,
+  speed, tempo, rows, frames low and high, version, channels; `SongStatus::to_words`) and 33 levels. (The
+  type is not `'song'`, which is the reply to a prepare and has an `ok`.) A song gone is reported once
+  more with alive 0: its voice was freed by the first message handler after it ended; a page that tracks
+  its voices sees `Ended` sooner.
+- `{type: 'songscope', frame, frames: 512, sources, channels: Uint32Array, written: Float64Array, data:
+  Float32Array}`, with each `'songpos'` for the songs whose scopes are on: per song its channel count, in
+  `data` each channel's 512 latest frames, in `written` how many each ring has seen.
+
+On the page, `WebSongs` (one `WebSong` per source slot; `update_positions(sources, status, levels)`,
+`update_scopes(frames, sources, channels, written, data)`, `get(source) -> Option<&WebSong>`, `forget`)
+parses them, and a `WebSong` is a `SongReader`, so the editor reads natively and on the web the same
+way. Exports for hosts that drive the wasm themselves: `cw_prepare_module(source, format, subsong,
+looped, separation, flags)` (flags bit 0 = stopped), `cw_songs_prepare()` (call it in the render
+callback's thread: allocation-free) with `cw_song_sources`, `cw_song_status`, `cw_song_levels` and
+`cw_song_scope_*` pointers, `cw_song_count`, and the size getters `cw_song_status_words`,
+`cw_song_level_slots`, `cw_song_scope_frames`. As everywhere in the processor, every pointer is
+taken before a view of `memory.buffer` is built.
+
+**Editing while it plays.** A cell edit is a `SetCell`. Anything that changes the module's shape is
+a new song: build the edited module (`open_module(.., stopped = true)`), `PrepareSource` it in another
+slot, and send one batch: `swap_commands(old, PlaySource{..}, fade)` followed by `Seek` to the old
+song's position, the same `Loop`, mute and solo masks and `Play` for the new voice. The old voice
+fades out under the new one, which starts the row from a clean state.
 
 ## Building, testing, benchmarks
 

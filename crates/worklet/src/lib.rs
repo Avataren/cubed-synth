@@ -18,6 +18,11 @@
 //!    commands (notes, and parameter edits as wire tag 29). Effects arrive
 //!    as a kind and parameters: write them at `cw_effect_params()`, then
 //!    `cw_set_effect`.
+//!    A module (MOD, S3M, XM) under live control: `cw_prepare_module` opens it
+//!    stopped and registers it, `SourceEvent::Song` commands (wire tag 30) steer
+//!    it, and `cw_songs_prepare` (about 60 times a second) cuts the position,
+//!    levels and channel scopes of the songs that moved for the page, which
+//!    reads them with `cubed_mixer::WebSong`.
 //!    Analysis taps: `cw_set_tap(bus, on)` gives a bus a tap that keeps its latest
 //!    frames; `cw_taps_prepare(frames)` cuts them (about 40 times a second) into
 //!    `cw_tap_buses`, `cw_tap_written` and `cw_tap_data` for the page, which
@@ -38,7 +43,8 @@ mod swap;
 use cubed_mixer::effects::MAX_PARAMS;
 use cubed_mixer::{
     wire, BusId, Clip, ClipId, Command, Effect, EffectKind, HeldNote, Mixer, MixerConfig, Returned,
-    SynthBuild, SynthSource, TapSet, VoiceId, TAP_FRAMES,
+    SongReader, SynthBuild, SynthSource, TapSet, VoiceId, SONG_LEVEL_SLOTS, SONG_SCOPE_FRAMES,
+    SONG_STATUS_WORDS, TAP_FRAMES,
 };
 
 /// The Web Audio render quantum.
@@ -84,6 +90,28 @@ struct State {
     swaps: swap::Swaps,
     /// The voices of the last swap that finished, for `cw_swap_old`/`_new`.
     swapped: (f64, f64),
+    /// The module songs the page follows, by source slot, and what
+    /// `cw_songs_prepare` cut from them: each reported song's slot, status words
+    /// and levels; and for those with scopes on, the slot, channel count, frames
+    /// written per channel and the frames.
+    songs: Vec<Option<SongSlot>>,
+    song_sources: Vec<u32>,
+    song_status: Vec<u32>,
+    song_levels: Vec<f32>,
+    scope_sources: Vec<u32>,
+    scope_channels: Vec<u32>,
+    scope_written: Vec<f64>,
+    scope_data: Vec<f32>,
+}
+
+/// A module song the page follows.
+struct SongSlot {
+    reader: Arc<dyn SongReader>,
+    /// The version `cw_songs_prepare` last reported.
+    last_version: u32,
+    /// Reported as gone; dropped by the next message handler (freeing its probe
+    /// is not for the render callback).
+    gone: bool,
 }
 
 struct Global(UnsafeCell<Option<State>>);
@@ -122,6 +150,7 @@ pub extern "C" fn cw_init(
         ..defaults
     });
     let buses = mixer.config().max_buses;
+    let sources = mixer.config().max_sources;
     let released = mixer.config().max_returned;
     let state = State {
         mixer,
@@ -145,6 +174,14 @@ pub extern "C" fn cw_init(
         swap_play: Vec::new(),
         swaps: swap::Swaps::new(),
         swapped: (0.0, 0.0),
+        songs: (0..sources).map(|_| None).collect(),
+        song_sources: Vec::with_capacity(sources),
+        song_status: Vec::with_capacity(sources * SONG_STATUS_WORDS),
+        song_levels: Vec::with_capacity(sources * SONG_LEVEL_SLOTS),
+        scope_sources: Vec::with_capacity(sources),
+        scope_channels: Vec::with_capacity(sources),
+        scope_written: Vec::new(),
+        scope_data: Vec::new(),
     };
     // SAFETY: see `state`.
     unsafe { *STATE.0.get() = Some(state) };
@@ -222,6 +259,7 @@ pub extern "C" fn cw_apply(len: u32) -> u32 {
         ..
     } = state();
     released.clear();
+    // (A song reported gone is dropped by the next prepare, not here.)
     let mut applied = 0;
     let len = (len as usize).min(inbox.len());
     for command in wire::decode(&inbox[..len]) {
@@ -294,6 +332,7 @@ pub extern "C" fn cw_prepare_song(
     let s = state();
     s.released.clear();
     s.error.clear();
+    forget_song(s, source);
     let options = SongOptions {
         subsong: subsong as usize,
         looped: looped != 0,
@@ -309,6 +348,262 @@ pub extern "C" fn cw_prepare_song(
             0
         }
     }
+}
+
+/// Stops following the song in source slot `source` (the slot is about to hold
+/// something else), and drops the songs already reported gone. Runs in a message
+/// handler: freeing a song's probe is not for the render callback.
+fn forget_song(s: &mut State, source: u32) {
+    for slot in s.songs.iter_mut() {
+        if slot.as_ref().is_some_and(|song| song.gone) {
+            *slot = None;
+        }
+    }
+    if let Some(slot) = s.songs.get_mut(source as usize) {
+        *slot = None;
+    }
+}
+
+/// Builds the MOD, S3M or XM module written at `cw_file_buffer` as prepared
+/// source `source`, under live control, and follows it: `format` 3 is MOD, 4 S3M,
+/// 5 XM; `separation` as for `cw_prepare_song`. `flags` bit 0 opens it stopped and
+/// under transport control (no sound until a `SongControl::Play`; its voice never
+/// ends by itself). Play it with a `PlaySource` command, steer it with
+/// `SourceEvent::Song` commands (wire tag 30), and read it with `cw_songs_prepare`.
+/// Returns 1 on success; on failure 0, with the reason at `cw_error`.
+#[no_mangle]
+pub extern "C" fn cw_prepare_module(
+    source: u32,
+    format: u32,
+    subsong: u32,
+    looped: u32,
+    separation: f32,
+    flags: u32,
+) -> u32 {
+    let s = state();
+    s.released.clear();
+    s.error.clear();
+    forget_song(s, source);
+    let options = SongOptions {
+        subsong: subsong as usize,
+        looped: looped != 0,
+        stereo_separation: (separation >= 0.0).then_some(separation),
+    };
+    match prepare_module(s, source, format, options, flags & 1 != 0) {
+        Ok(()) => 1,
+        Err(why) => {
+            s.error.extend(
+                why.chars()
+                    .map(|c| if c.is_ascii() { c as u8 } else { b'?' }),
+            );
+            0
+        }
+    }
+}
+
+#[cfg(feature = "songs")]
+fn prepare_module(
+    s: &mut State,
+    source: u32,
+    format: u32,
+    options: SongOptions,
+    stopped: bool,
+) -> Result<(), String> {
+    use cubed_mixer::songs::{open_module_song, SongFormat};
+    let format = match format {
+        3 => SongFormat::Mod,
+        4 => SongFormat::S3m,
+        5 => SongFormat::Xm,
+        other => return Err(format!("format {other} is not a tracker module (3, 4, 5)")),
+    };
+    if source as usize >= s.songs.len() {
+        return Err(format!("no source slot {source}"));
+    }
+    let rate = s.mixer.config().sample_rate;
+    let options = cubed_mixer::songs::SongOptions {
+        subsong: options.subsong,
+        looped: options.looped,
+        stereo_separation: options.stereo_separation,
+    };
+    let song = open_module_song(format, &s.file, rate, options, stopped)?;
+    let reader = song.song_reader().ok_or("the module has no reader")?;
+    s.songs[source as usize] = Some(SongSlot {
+        reader,
+        last_version: u32::MAX,
+        gone: false,
+    });
+    s.mixer
+        .apply(Command::PrepareSource(cubed_mixer::SourceId(source), song));
+    // Room for the scopes of every song followed, so `cw_songs_prepare` fills
+    // them without allocating.
+    let channels: usize = s.songs.iter().flatten().map(|x| x.reader.channels()).sum();
+    s.scope_data.reserve(channels * SONG_SCOPE_FRAMES);
+    s.scope_written.reserve(channels);
+    Ok(())
+}
+
+#[cfg(not(feature = "songs"))]
+fn prepare_module(_: &mut State, _: u32, _: u32, _: SongOptions, _: bool) -> Result<(), String> {
+    Err("this build of cubed-worklet plays no songs".into())
+}
+
+/// Cuts what the page follows of its module songs into the buffers below, for
+/// every one whose state moved since the last call (and once more when one has
+/// gone), and returns how many that is. Call it from the render callback's thread
+/// about 60 times a second; it allocates and frees nothing. For each of those
+/// songs: its source slot (`cw_song_sources`, `u32`s), its status words
+/// (`cw_song_status`, `cw_song_status_words()` `u32`s each, see
+/// `cubed_mixer::SongStatus::to_words`) and its levels (`cw_song_levels`,
+/// `cw_song_level_slots()` floats each: the channels', then the preview's). Of
+/// those with their scopes on, also: how many there are
+/// (`cw_song_scope_count`), their slots (`cw_song_scope_sources`), channel counts
+/// (`cw_song_scope_channels`), frames written per channel (`cw_song_scope_written`,
+/// `f64`s) and the frames (`cw_song_scope_data`: for each song, each channel's
+/// `cw_song_scope_frames()` frames, oldest first).
+#[no_mangle]
+pub extern "C" fn cw_songs_prepare() -> u32 {
+    let State {
+        songs,
+        song_sources,
+        song_status,
+        song_levels,
+        scope_sources,
+        scope_channels,
+        scope_written,
+        scope_data,
+        ..
+    } = state();
+    song_sources.clear();
+    song_status.clear();
+    song_levels.clear();
+    scope_sources.clear();
+    scope_channels.clear();
+    scope_written.clear();
+    scope_data.clear();
+    for (source, slot) in songs.iter_mut().enumerate() {
+        let Some(slot) = slot.as_mut().filter(|slot| !slot.gone) else {
+            continue;
+        };
+        let alive = slot.reader.alive();
+        let status = slot.reader.status();
+        if alive && status.version == slot.last_version {
+            continue;
+        }
+        slot.last_version = status.version;
+        slot.gone = !alive;
+        let channels = slot.reader.channels();
+        let scopes = slot.reader.scopes_enabled();
+        // The capacities were reserved when the song was prepared, so none of
+        // these grows (a song that would not fit is left for the next call).
+        if song_sources.len() == song_sources.capacity() {
+            slot.last_version = u32::MAX;
+            continue;
+        }
+        song_sources.push(source as u32);
+        song_status.extend_from_slice(&status.to_words(channels, alive, scopes));
+        let at = song_levels.len();
+        song_levels.resize(at + SONG_LEVEL_SLOTS, 0.0);
+        slot.reader
+            .levels(&mut song_levels[at..at + SONG_LEVEL_SLOTS]);
+        let room = scope_data.capacity() - scope_data.len() >= channels * SONG_SCOPE_FRAMES
+            && scope_written.capacity() - scope_written.len() >= channels;
+        if scopes && alive && room {
+            scope_sources.push(source as u32);
+            scope_channels.push(channels as u32);
+            for channel in 0..channels {
+                let at = scope_data.len();
+                scope_data.resize(at + SONG_SCOPE_FRAMES, 0.0);
+                let frames = &mut scope_data[at..];
+                let got = slot.reader.scope(channel, frames);
+                if got < SONG_SCOPE_FRAMES {
+                    // Newest last, silence before.
+                    frames.copy_within(..got, SONG_SCOPE_FRAMES - got);
+                    frames[..SONG_SCOPE_FRAMES - got].fill(0.0);
+                }
+                scope_written.push(slot.reader.scope_position(channel) as f64);
+            }
+        }
+    }
+    song_sources.len() as u32
+}
+
+/// How many module songs are followed (and not yet reported gone).
+#[no_mangle]
+pub extern "C" fn cw_song_count() -> u32 {
+    state()
+        .songs
+        .iter()
+        .flatten()
+        .filter(|slot| !slot.gone)
+        .count() as u32
+}
+
+/// `u32`s per song in `cw_song_status`.
+#[no_mangle]
+pub extern "C" fn cw_song_status_words() -> u32 {
+    SONG_STATUS_WORDS as u32
+}
+
+/// Floats per song in `cw_song_levels`.
+#[no_mangle]
+pub extern "C" fn cw_song_level_slots() -> u32 {
+    SONG_LEVEL_SLOTS as u32
+}
+
+/// Frames per channel in `cw_song_scope_data`.
+#[no_mangle]
+pub extern "C" fn cw_song_scope_frames() -> u32 {
+    SONG_SCOPE_FRAMES as u32
+}
+
+/// The source slots `cw_songs_prepare` reported, as `u32`s.
+#[no_mangle]
+pub extern "C" fn cw_song_sources() -> *const u32 {
+    state().song_sources.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn cw_song_status() -> *const u32 {
+    state().song_status.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn cw_song_levels() -> *const f32 {
+    state().song_levels.as_ptr()
+}
+
+/// How many of the reported songs have scope frames in `cw_song_scope_data`.
+#[no_mangle]
+pub extern "C" fn cw_song_scope_count() -> u32 {
+    state().scope_sources.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn cw_song_scope_sources() -> *const u32 {
+    state().scope_sources.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn cw_song_scope_channels() -> *const u32 {
+    state().scope_channels.as_ptr()
+}
+
+/// Frames written to each channel's scope ring so far, as `f64`s, for every
+/// channel of every scope entry in order.
+#[no_mangle]
+pub extern "C" fn cw_song_scope_written() -> *const f64 {
+    state().scope_written.as_ptr()
+}
+
+/// How many floats `cw_song_scope_data` holds.
+#[no_mangle]
+pub extern "C" fn cw_song_scope_len() -> u32 {
+    state().scope_data.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn cw_song_scope_data() -> *const f32 {
+    state().scope_data.as_ptr()
 }
 
 /// How a song plays, as the exports pass it on.
@@ -392,6 +687,7 @@ fn prepare_synth(source: u32, one_shot: u32, warm_blocks: u32, held_count: u32) 
     let s = state();
     s.released.clear();
     s.error.clear();
+    forget_song(s, source);
     let held: Vec<HeldNote> = s
         .held
         .as_chunks::<2>()
@@ -1289,5 +1585,206 @@ mod tests {
         )));
         cw_process(128);
         assert_eq!(cw_voices(), 2);
+    }
+
+    /// A module file into `cw_file_buffer`.
+    fn put_module(name: &str) {
+        let module = std::fs::read(format!(
+            "{}/../tracker/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let at = cw_file_buffer(module.len() as u32);
+        // SAFETY: cw_file_buffer made room for the file.
+        unsafe { std::ptr::copy_nonoverlapping(module.as_ptr(), at, module.len()) };
+    }
+
+    fn song_control(voice: u64, control: cubed_mixer::SongControl) {
+        send(Command::SourceEvent {
+            voice: VoiceId(voice),
+            event: cubed_mixer::SourceEvent::Song(control),
+        });
+    }
+
+    /// What `cw_songs_prepare` cut: per song its slot, status and levels.
+    struct Reported {
+        source: u32,
+        status: cubed_mixer::SongStatus,
+        channels: usize,
+        alive: bool,
+        scopes: bool,
+        levels: Vec<f32>,
+    }
+
+    fn songs_prepare() -> Vec<Reported> {
+        let count = cw_songs_prepare() as usize;
+        let words = cw_song_status_words() as usize;
+        let slots = cw_song_level_slots() as usize;
+        // SAFETY: the buffers hold what `cw_songs_prepare` just cut.
+        let (sources, status, levels) = unsafe {
+            (
+                std::slice::from_raw_parts(cw_song_sources(), count),
+                std::slice::from_raw_parts(cw_song_status(), count * words),
+                std::slice::from_raw_parts(cw_song_levels(), count * slots),
+            )
+        };
+        (0..count)
+            .map(|i| {
+                let (status, channels, alive, scopes) =
+                    cubed_mixer::SongStatus::from_words(&status[i * words..]).unwrap();
+                Reported {
+                    source: sources[i],
+                    status,
+                    channels,
+                    alive,
+                    scopes,
+                    levels: levels[i * slots..(i + 1) * slots].to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_module_is_opened_stopped_followed_steered_and_reported() {
+        use cubed_mixer::{PlaySource, SongControl, SongLoop, SourceId};
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 5, 6);
+        send(Command::SetBus(BusId(2), BusSettings::default()));
+        put_module("demo.mod");
+        assert_eq!(cw_prepare_module(3, 3, 0, 1, -1.0, 1), 1);
+        assert_eq!(cw_song_count(), 1);
+        assert_eq!(cw_prepare_module(99, 3, 0, 1, -1.0, 1), 0, "no such slot");
+        assert_eq!(
+            cw_prepare_module(1, 0, 0, 1, -1.0, 1),
+            0,
+            "AHX is not a module"
+        );
+        assert_eq!(cw_song_count(), 1);
+        send(Command::PlaySource(PlaySource::new(
+            VoiceId(1),
+            SourceId(3),
+            BusId(2),
+        )));
+        // Opened stopped: nothing sounds, and the first report says where it is.
+        let mut energy = 0.0;
+        for _ in 0..40 {
+            cw_process(128);
+            let left = unsafe { std::slice::from_raw_parts(cw_left(), BLOCK) };
+            energy += left.iter().map(|s| s * s).sum::<f32>();
+        }
+        assert_eq!(energy, 0.0);
+        let first = songs_prepare();
+        assert_eq!(first.len(), 1);
+        let song = &first[0];
+        assert_eq!((song.source, song.channels, song.alive), (3, 4, true));
+        assert!(!song.status.playing && !song.scopes);
+        assert_eq!((song.status.order, song.status.row), (0, 0));
+        assert!(
+            songs_prepare().is_empty(),
+            "nothing moved: nothing to report"
+        );
+
+        // Seek while stopped, then play: the position and levels move.
+        song_control(1, SongControl::Scopes(true));
+        song_control(1, SongControl::Seek { order: 2, row: 8 });
+        let seeked = songs_prepare();
+        assert_eq!(seeked.len(), 1);
+        assert_eq!((seeked[0].status.order, seeked[0].status.row), (2, 8));
+        assert!(seeked[0].scopes);
+        song_control(1, SongControl::Play);
+        let mut rows = std::collections::BTreeSet::new();
+        let mut loudest = 0.0f32;
+        let mut scope_peak = 0.0f32;
+        for q in 0..600 {
+            cw_process(128);
+            if q % 5 == 0 {
+                for r in songs_prepare() {
+                    rows.insert(r.status.row);
+                    loudest = r.levels[..4].iter().fold(loudest, |m, &l| m.max(l));
+                    assert_eq!(r.source, 3);
+                    assert!(r.status.playing);
+                }
+                let scopes = cw_song_scope_count() as usize;
+                if scopes > 0 {
+                    let frames = cw_song_scope_frames() as usize;
+                    assert_eq!(scopes, 1);
+                    // SAFETY: the buffers hold one song of four channels.
+                    let (channels, written, data) = unsafe {
+                        (
+                            std::slice::from_raw_parts(cw_song_scope_channels(), 1),
+                            std::slice::from_raw_parts(cw_song_scope_written(), 4),
+                            std::slice::from_raw_parts(cw_song_scope_data(), 4 * frames),
+                        )
+                    };
+                    assert_eq!(channels, [4]);
+                    assert_eq!(cw_song_scope_len() as usize, 4 * frames);
+                    assert!(written[0] > 0.0);
+                    scope_peak = data.iter().fold(scope_peak, |m, s| m.max(s.abs()));
+                }
+            }
+        }
+        assert!(rows.len() > 8, "the rows move: {rows:?}");
+        assert!(loudest > 0.01, "levels: {loudest}");
+        assert!(scope_peak > 0.01, "scopes: {scope_peak}");
+
+        // A loop, a preview and mutes, all through the wire.
+        song_control(
+            1,
+            SongControl::Loop(SongLoop::Range {
+                order: 2,
+                row0: 8,
+                row1: 9,
+            }),
+        );
+        song_control(1, SongControl::MuteMask(0b1111));
+        song_control(
+            1,
+            SongControl::PreviewOn {
+                instrument: 1,
+                note: 60,
+                velocity: 1.0,
+                duration: 0,
+            },
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let mut preview = false;
+        for _ in 0..300 {
+            cw_process(128);
+            for r in songs_prepare() {
+                seen.insert(r.status.row);
+                preview |= r.status.preview && r.levels[4] > 0.0;
+            }
+        }
+        assert!(preview, "the preview is reported with a level of its own");
+        // The range loop wraps at the next row it reaches: at most the rows
+        // between the seek point's neighbours were seen before it caught on.
+        assert!(seen.contains(&8) && seen.contains(&9), "{seen:?}");
+        assert_eq!(cw_rejected(), 0);
+        assert_eq!(cw_bad_batches(), 0);
+
+        // Stop the voice: the song is reported gone once, then forgotten. The
+        // source is freed by the message handler after the voice ended (any
+        // message does), which is when the probe sees it go.
+        send(Command::Stop(VoiceId(1), 0));
+        cw_process(128);
+        send(Command::SetBusGain(BusId(2), 0.0));
+        let mut gone = None;
+        for _ in 0..4 {
+            cw_process(128);
+            if let Some(r) = songs_prepare().into_iter().find(|r| !r.alive) {
+                gone = Some(r.source);
+            }
+        }
+        assert_eq!(gone, Some(3), "reported gone");
+        assert!(songs_prepare().is_empty());
+        // The next prepare drops the song that went.
+        put_module("demo.xm");
+        assert_eq!(cw_prepare_module(0, 5, 0, 1, -1.0, 0), 1);
+        assert_eq!(cw_song_count(), 1, "only the new one");
+        // A song opened playing is followed too, and a plain prepare unfollows it.
+        assert_eq!(songs_prepare().len(), 1);
+        put_module("demo.mod");
+        assert_eq!(cw_prepare_song(0, 3, 0, 1, -1.0), 1);
+        assert_eq!(cw_song_count(), 0, "the slot holds another song now");
     }
 }
