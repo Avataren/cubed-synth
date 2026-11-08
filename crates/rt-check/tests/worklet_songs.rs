@@ -4,8 +4,8 @@
 //! its own, since the exports share one global mixer.
 
 use cubed_mixer::{
-    wire, BusId, BusSettings, Command, PlaySource, SongControl, SongLoop, SourceEvent, SourceId,
-    VoiceId,
+    wire, BusId, BusSettings, Command, PlaySource, SongCell, SongControl, SongInstrument, SongLoop,
+    SourceEvent, SourceId, VoiceId,
 };
 use cubed_rt_check::{allocations_during, trace_allocations, CountingAllocator};
 use cubed_worklet as w;
@@ -36,17 +36,20 @@ fn followed_songs_render_and_report_without_allocating() {
         assert_eq!(w::cw_apply(bytes.len() as u32), 1);
     };
     send(Command::SetBus(BusId(1), BusSettings::default()));
-    let names = ["demo.mod", "demo.s3m", "demo.xm"];
-    for (slot, name) in names.iter().enumerate() {
-        let module = std::fs::read(format!(
-            "{}/../tracker/tests/fixtures/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap();
+    // The modules (formats 3, 4, 5) and an Adlib song (format 1).
+    let names = [
+        ("tracker/tests/fixtures/demo.mod", 3),
+        ("tracker/tests/fixtures/demo.s3m", 4),
+        ("tracker/tests/fixtures/demo.xm", 5),
+        ("opl/tests/fixtures/a2m/NAB622/corridors of time.a2m", 1),
+    ];
+    for (slot, (name, format)) in names.iter().enumerate() {
+        let module = std::fs::read(format!("{}/../{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
         put(&module, w::cw_file_buffer(module.len() as u32));
         assert_eq!(
-            w::cw_prepare_module(slot as u32, 3 + slot as u32, 0, 1, -1.0, 1),
-            1
+            w::cw_prepare_module(slot as u32, *format, 0, 1, -1.0, 1),
+            1,
+            "{name}"
         );
         send(Command::PlaySource(PlaySource::new(
             VoiceId(10 + slot as u64),
@@ -62,7 +65,7 @@ fn followed_songs_render_and_report_without_allocating() {
     };
     // What the page sends, one batch every 200 quanta; the encoding is the page's.
     let mut script: Vec<Vec<u8>> = Vec::new();
-    for voice in 10..13 {
+    for voice in 10..14 {
         script.push(
             [
                 song(voice, SongControl::Scopes(true)),
@@ -121,6 +124,45 @@ fn followed_songs_render_and_report_without_allocating() {
             .concat(),
         );
     }
+    // What only an Adlib song takes: live edits of an instrument, a cell's second effect and
+    // the timing, as the page sends them (wire tags 32, 31 and 30).
+    script.push(
+        [
+            song(
+                13,
+                SongControl::SetInstrument(SongInstrument {
+                    number: 1,
+                    fm: [
+                        0x21, 0x31, 0x4f, 0x0b, 0xf2, 0xf1, 0x72, 0x7a, 0x03, 0x01, 0x0e,
+                    ],
+                    ..Default::default()
+                }),
+            ),
+            song(
+                13,
+                SongControl::SetCell(SongCell {
+                    pattern: 0,
+                    row: 6,
+                    channel: 1,
+                    note: 40,
+                    instrument: 1,
+                    effect: 0x0c,
+                    param: 0x20,
+                    period: 0x0a03,
+                    ..Default::default()
+                }),
+            ),
+            song(
+                13,
+                SongControl::Timing {
+                    tempo: 60,
+                    speed: 5,
+                },
+            ),
+            song(13, SongControl::Scopes(true)),
+        ]
+        .concat(),
+    );
     let mut reported = 0;
     let mut scoped = 0;
     for q in 0..(script.len() * 200) {

@@ -25,7 +25,7 @@ use crate::song::{SongControl, SongLoop, SongStatus};
 
 /// Output frames played (and thrown away) before the song starts, so the buffers that grow
 /// on first use have grown before the audio thread plays it.
-const WARM_UP_FRAMES: usize = 48_000;
+const WARM_UP_FRAMES: usize = 8_192;
 /// One operator's full swing on a tap is a quarter of the chip's full scale.
 const TAP_TO_OUTPUT: f32 = 0.25;
 /// Notes the preview plays at once.
@@ -40,7 +40,7 @@ pub struct A2mPlayer {
 }
 
 impl A2mPlayer {
-    /// A paused player at the start of `song`; the song's first second is played and thrown
+    /// A paused player at the start of `song`; the song's first 170 ms are played and thrown
     /// away to warm it up (make it off the audio thread).
     pub fn new(song: A2mSong, sample_rate: f32) -> Result<A2mPlayer, String> {
         let flags = song.flags;

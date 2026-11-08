@@ -167,7 +167,7 @@ pub fn open_controlled_song(
 
 /// An Adlib Tracker II song the host already holds (an edited one) as a song under live
 /// control: see [`open_controlled_song`]. `options.subsong` is the order to start at.
-/// Builds the player and plays its first second to warm it up: do it off the audio thread.
+/// Builds the player and plays its first moments to warm it up: do it off the audio thread.
 /// An error says why the song cannot play (its order list holds no pattern).
 pub fn open_a2m(
     song: cubed_opl::a2::A2mSong,

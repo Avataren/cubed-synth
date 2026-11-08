@@ -476,6 +476,173 @@ fn mixer_song_control() {
     assert!(reader.alive() && mixer.is_playing(voice));
 }
 
+/// An Adlib song steered through the mixer the same way, from its very first block (the
+/// song is built and warmed up off the audio thread): every control as decoded wire bytes,
+/// live edits of cells, an instrument and the timing, a preview over the song that an
+/// instrument edit reaches, the scopes switched on and off, and the readers read each block.
+#[test]
+fn mixer_a2m_song_control() {
+    use cubed_mixer::songs::{open_a2m, open_opl_audition};
+    use cubed_mixer::{
+        wire, SongCell, SongControl, SongInstrument, SongLoop, SONG_LEVEL_SLOTS, SONG_SCOPE_FRAMES,
+    };
+    let rate = RATE as f32;
+    let bytes = fixture("opl/tests/fixtures/a2m/NAB622/corridors of time.a2m");
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        max_block: BLOCK,
+        ..MixerConfig::default()
+    });
+    let music = BusId(1);
+    mixer.apply(Command::SetBus(music, BusSettings::default()));
+    let song = open_a2m(
+        cubed_opl::a2::parse(&bytes).unwrap(),
+        rate,
+        SongOptions::default(),
+        true,
+    )
+    .unwrap();
+    let reader = song.song_reader().unwrap();
+    let (voice, audition) = (VoiceId(5), VoiceId(6));
+    mixer.apply(Command::PrepareSource(SourceId(0), song));
+    mixer.apply(Command::PlaySource(PlaySource::new(
+        voice,
+        SourceId(0),
+        music,
+    )));
+    let plain = SongInstrument {
+        number: 1,
+        fm: [
+            0x21, 0x21, 0x3f, 0x00, 0xf2, 0xf4, 0x24, 0x27, 0x00, 0x00, 0x00,
+        ],
+        ..Default::default()
+    };
+    mixer.apply(Command::PrepareSource(
+        SourceId(1),
+        open_opl_audition(&plain, rate, 4),
+    ));
+    mixer.apply(Command::PlaySource(PlaySource::new(
+        audition,
+        SourceId(1),
+        music,
+    )));
+    let mut edited = plain;
+    edited.fm[4] = 0xa4;
+    edited.fm[9] = 3;
+    let controls = [
+        SongControl::Scopes(true),
+        SongControl::Seek { order: 1, row: 8 },
+        SongControl::Play,
+        SongControl::SetCell(SongCell {
+            pattern: 1,
+            row: 9,
+            channel: 2,
+            note: 49,
+            instrument: 2,
+            effect: 0x0c,
+            param: 0x20,
+            period: 0x0a03,
+            ..Default::default()
+        }),
+        SongControl::PreviewOn {
+            instrument: 2,
+            note: 60,
+            velocity: 1.0,
+            duration: 0,
+        },
+        SongControl::SetInstrument(SongInstrument {
+            number: 2,
+            ..edited
+        }),
+        SongControl::Loop(SongLoop::Range {
+            order: 1,
+            row0: 8,
+            row1: 15,
+        }),
+        SongControl::Mute {
+            channel: 2,
+            on: true,
+        },
+        SongControl::SoloMask(0b11),
+        SongControl::Timing {
+            tempo: 60,
+            speed: 5,
+        },
+        SongControl::PreviewOff,
+        SongControl::Stop,
+        SongControl::Seek { order: 0, row: 0 },
+        SongControl::Looped(false),
+        SongControl::Loop(SongLoop::Pattern { order: 2 }),
+        SongControl::Play,
+        SongControl::SoloMask(0),
+        SongControl::MuteMask(0),
+        SongControl::PreviewOn {
+            instrument: 1,
+            note: 48,
+            velocity: 0.5,
+            duration: 2_000,
+        },
+        SongControl::SetInstrument(plain),
+        SongControl::Loop(SongLoop::None),
+        SongControl::Looped(true),
+        SongControl::Scopes(false),
+        SongControl::Scopes(true),
+        SongControl::Seek { order: 3, row: 40 },
+    ];
+    let encode = |voice, event| {
+        let mut bytes = Vec::new();
+        wire::encode(&Command::SourceEvent { voice, event }, &mut bytes);
+        bytes
+    };
+    // The wire bytes are made here, off the audio thread; decoding and applying
+    // them is what the audio thread does.
+    let mut encoded: Vec<Vec<u8>> = controls
+        .iter()
+        .map(|&control| encode(voice, SourceEvent::Song(control)))
+        .collect();
+    // The audition voice's: a chord, an edit under it, the releases.
+    for event in [
+        SourceEvent::NoteOn {
+            note: 57,
+            velocity: 1.0,
+            duration: 0,
+        },
+        SourceEvent::NoteOn {
+            note: 64,
+            velocity: 0.7,
+            duration: 20_000,
+        },
+        SourceEvent::Song(SongControl::SetInstrument(edited)),
+        SourceEvent::NoteOff { note: 57 },
+        SourceEvent::AllNotesOff,
+    ] {
+        encoded.push(encode(audition, event));
+    }
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let (mut levels, mut ring) = ([0f32; SONG_LEVEL_SLOTS], [0f32; SONG_SCOPE_FRAMES]);
+    let per_control = BLOCKS_PER_SECOND / 3;
+    let mut sounded = 0.0f32;
+    let events = allocations_during(|| {
+        for (i, bytes) in encoded.iter().enumerate() {
+            for command in wire::decode(bytes) {
+                mixer.apply(command.unwrap());
+            }
+            for _ in 0..per_control {
+                mixer.process(&mut left, &mut right);
+                mixer.drain_events(|_| {});
+                let _ = reader.status();
+                reader.levels(&mut levels);
+                reader.scope(i % 18, &mut ring);
+                sounded = sounded.max(levels.iter().cloned().fold(0.0, f32::max));
+            }
+        }
+    });
+    assert_eq!(events, 0, "{events} allocations or frees");
+    assert!(sounded > 0.0, "the song sounded");
+    assert!(reader.alive() && mixer.is_playing(voice));
+}
+
 /// The DAW's synth engine: 8 voices of an FM-into-subtractive patch (two
 /// oscillators, 4-voice unison, a 24 dB low-pass, two envelopes; the
 /// `patch_render` bench's) through chorus, delay and reverb, with notes

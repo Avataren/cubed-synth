@@ -227,6 +227,8 @@ enum SongControl {
     Looped(bool),                                     // restart at the end of the song
     Scopes(bool),                                     // fill the channel scope rings
     SetCell(SongCell),                                // a live cell edit
+    SetInstrument(SongInstrument),                    // Adlib: a live instrument edit
+    Timing { tempo: u8, speed: u8 },                  // Adlib: tempo and speed now
 }
 trait SongReader: Send + Sync {                       // natively: the song's probe; on the web: WebSong
     fn status(&self) -> SongStatus;                   // as Player::status, plus `version`
@@ -244,13 +246,15 @@ batch): tag 30, 24 bytes, little endian: `u8 tag, u64 voice, u8 kind, u16 a, u16
 u32 frames`. Kinds: 0 Play, 1 Stop, 2 Seek (a order, b row), 3 Loop none, 4 Loop pattern (a order), 5 Loop
 range (a order, b row0, c row1), 6 Mute (a channel, b on), 7 Solo (a, b), 8 MuteMask (frames), 9 SoloMask
 (frames), 10 PreviewOn (a instrument, b note, value velocity, frames duration), 11 PreviewOff, 12 Looped
-(b on), 13 Scopes (b on). Tag 31, 21 bytes: `u8 tag, u64 voice, u16 pattern, u16 row, u8 channel, u8 note
-(0 none, 255 key off, else MIDI), u16 period, u8 instrument, u8 volume, u8 effect, u8 param` (SetCell). An
+(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
+number, u8 fm[11], u8 panning, i8 finetune, u8 voice_type`. Tag 31, 21 bytes: `u8 tag, u64 voice, u16 pattern, u16 row, u8 channel, u8 note
+(0 none, 255 key off, else MIDI; Adlib: the file's note byte), u16 period (Adlib: `effect2 << 8 | param2`), u8
+instrument, u8 volume, u8 effect, u8 param` (SetCell). An
 unknown kind stops the batch at it (`WireError::UnknownTag(30)`); the other tags are unchanged.
 
 **The worklet.** The page opens a module with the processor's existing `'song'` message plus `stopped:
 true` (open it stopped and under control) or `follow: true` (follow it while it plays), for format 3, 4
-or 5; the reply is the usual `{type: 'song', source, ok, error?}`. Then it plays the source and steers it
+or 5, or an Adlib song (format 1); the reply is the usual `{type: 'song', source, ok, error?}`. Then it plays the source and steers it
 with `'commands'`. The worklet posts, about 60 times a second (init's `songHz`) and only for the followed
 songs that moved:
 
@@ -279,6 +283,58 @@ a new song: build the edited module (`open_module(.., stopped = true)`), `Prepar
 slot, and send one batch: `swap_commands(old, PlaySource{..}, fade)` followed by `Seek` to the old
 song's position, the same `Loop`, mute and solo masks and `Play` for the new voice. The old voice
 fades out under the new one, which starts the row from a clean state.
+
+## Song formats under live control, and adding one
+
+Every format an editor can drive plays as the same kind of voice: a source that takes `SourceEvent::Song(SongControl)`
+and gives a `SongReader` (above). Modules are `songs::open_module` / `open_module_song`; every other format is a
+`songs::SongPlayer` and `songs::PlayerSong<P>` makes it the voice. `songs::open_controlled_song(format, bytes, rate,
+options, stopped)` opens whatever has an arm in it from a file (the worklet's `'song'` message does), so a host that
+holds the song as bytes needs nothing per format:
+
+| format | opened by | under control |
+|---|---|---|
+| MOD, S3M, XM | `open_module(module, ..)`, `open_module_song(format, bytes, ..)` | everything above |
+| Adlib Tracker II (`.a2m`) | `open_a2m(song, ..)` (an `A2mSong` the host holds), `open_controlled_song(SongFormat::A2m, bytes, ..)` | everything above; see below |
+| AHX/HVL, SID | `open_song` (plays at once, ends with the song) | not yet: `open_controlled_song` says so |
+
+**Adlib.** The channels are the song's tracks. `Play`/`Stop`, `Seek` (the song replays silently to the row: a far row costs
+a few thousand ticks of register writes on the audio thread, no allocation), `Loop`, `Mute`/`Solo` and their masks map
+to `A2Player`. `levels` are each track's OPL channel scaled to the output (the taps read one operator's full swing as 1,
+a quarter of the chip's full scale) and a scope is the same channel's frames (the chip's channels are separable here, unlike
+S3M's AdLib). `SetCell` carries the file's cell (note byte, instrument, effect and parameter in `effect`/`param`, the second
+effect and parameter in `period`); `SetInstrument` the 11 FM bytes, panning, fine-tune and voice type, for the notes that
+load the instrument from then on; `Timing` the tempo and speed (`status().tempo` is the timer tempo, the Hz of the timer at a
+macro speed-up of 1, not a BPM). Macro tables (255 entries) and everything that changes the song's shape are a new song:
+`open_a2m` the edited one, `swap_commands`, and the same `Seek`, `Loop`, masks and `Play` for the new voice, as for a module.
+The **preview** (`PreviewOn { instrument, note, velocity, duration }`, `PreviewOff`) is an `OplAudition` beside the song, a
+chip of its own clocked only while a note sounds, loaded with the song's instrument `instrument` (1-255; a note is MIDI,
+60 is middle C) and re-loaded by `SetInstrument` of the same number, so a slider moved under a held note is heard at
+once. `status().preview` says a note sounds or releases; the preview's level is the last slot of `levels`.
+`songs::open_opl_audition(&instrument, rate, voices)` is the same audition as a voice of its own, for an instrument with no
+song (`OplInstrumentDoc`): `SourceEvent::NoteOn`/`NoteOff`/`AllNotesOff` play it and `SongControl::SetInstrument` changes the
+instrument under the notes that sound.
+
+**Adding a song format** (AHX and SID are each one more of these):
+
+1. Make the format's player a `songs::SongPlayer` (a small struct in `crates/mixer/src/songs/<format>.rs`, so the format crate
+   needs no mixer): `channels()`; `render(left, right)` (silence while stopped; at most `PLAYER_CHUNK` = 256 frames);
+   `ended()` (the song came to its end, or round once: with `Looped(false)` the transport then stops at the top; reset by a
+   seek); `control(SongControl)` (Play, Stop, Seek, Loop, Mute, Solo and the masks, PreviewOn/Off, and the live edits the
+   format has; ignore the rest. `Looped` and `Scopes` never arrive: the adapter keeps the first and calls `set_scopes`);
+   `status()` (`SongStatus`: order, pattern, row, tick, speed, tempo, rows, frames; the adapter fills `version`);
+   `levels(&mut [f32]) -> f32` (each channel's recent peak, then the preview's); optionally `set_scopes` and `scope(channel,
+   out)` (the frames a channel made in the block just rendered; a format that cannot separate its channels returns 0).
+   Nothing in these may allocate: build and warm the player up where it is made (`A2mPlayer::new` plays 170 ms and resets).
+2. Open it: `PlayerSong::new(player, controlled, looped)` is the `Source`; add an arm to `open_controlled_song` and, for a
+   host that holds the song as data, an `open_<format>(data, ..)` like `open_a2m`.
+3. Edits that are small and fixed in size ride the wire as `SongControl` variants (a cell is tag 31, an Adlib instrument tag 32,
+   timing kind 14: add a variant, `song_fields`/`song_control` or a tag in `wire.rs`, and a round trip in its test); anything
+   bigger or that changes the song's shape is a new song swapped in (`swap_commands`), which the editor does for every format.
+4. The worklet needs nothing for a format that is in `open_controlled_song`: its page already sends `{type: 'song', format,
+   stopped: true}` and reads `'songpos'`/`'songscope'` (add the format number to the JS's list of controllable formats, `module`
+   in `cubed-worklet.js`). Tests: a rig like `tests/a2m_song.rs`, an allocation test in `rt-check` (`mixer_a2m_song_control`), and the
+   worklet page's (`crates/worklet/test/index.html`, `adlibControlled`).
 
 ## Editing and writing tracker modules (a pattern editor's data layer)
 
@@ -449,7 +505,8 @@ operations are pinned by hashes (`cargo run -p cubed-opl --release --example a2m
 Tracker II plays them as empty, or from the rest of the file's last block): the document shows them, so such a song
 saves with the larger count; no other song changes.
 
-**Live edits.** A playing `A2Player` takes what a document's `live_edits()` returns after an edit
+**Live edits.** (The mixer plays a document's song with `songs::open_a2m` and takes these as `SongControl`s: see "Song formats
+under live control".) A playing `A2Player` takes what a document's `live_edits()` returns after an edit
 (`Option<Vec<LiveEdit>>`) with `A2Player::apply_edit(&edit)`, in place and without allocating: cells (read when the row
 comes), instrument data (a track that holds the edited instrument loads it again at its next instrument cell), FM,
 arpeggio and vibrato macro tables (read as they run) and the tempo and speed. `None` means the shape moved (the
