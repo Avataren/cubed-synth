@@ -219,6 +219,7 @@ name = "cubed-tracker"
 version = "0.1.0"
 dependencies = [
  "cubed-opl",
+ "serde_json",
 ]
 
 [[package]]
