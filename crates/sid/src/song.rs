@@ -98,6 +98,76 @@ pub struct Tables {
     pub speed: Vec<TableRow>,
 }
 
+/// The four shared step tables of a GoatTracker song.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TableKind {
+    Wave,
+    Pulse,
+    Filter,
+    Speed,
+}
+
+impl TableKind {
+    pub const ALL: [TableKind; 4] = [
+        TableKind::Wave,
+        TableKind::Pulse,
+        TableKind::Filter,
+        TableKind::Speed,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TableKind::Wave => "wave",
+            TableKind::Pulse => "pulse",
+            TableKind::Filter => "filter",
+            TableKind::Speed => "speed",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<TableKind> {
+        TableKind::ALL.into_iter().find(|k| k.name() == name)
+    }
+
+    /// The row of this table instrument `ins` starts on (1-based, 0 = none).
+    pub fn pointer(self, ins: &Instrument) -> u8 {
+        match self {
+            TableKind::Wave => ins.wave_ptr,
+            TableKind::Pulse => ins.pulse_ptr,
+            TableKind::Filter => ins.filter_ptr,
+            TableKind::Speed => ins.speed_ptr,
+        }
+    }
+
+    pub fn set_pointer(self, ins: &mut Instrument, value: u8) {
+        match self {
+            TableKind::Wave => ins.wave_ptr = value,
+            TableKind::Pulse => ins.pulse_ptr = value,
+            TableKind::Filter => ins.filter_ptr = value,
+            TableKind::Speed => ins.speed_ptr = value,
+        }
+    }
+}
+
+impl Tables {
+    pub fn get(&self, kind: TableKind) -> &Vec<TableRow> {
+        match kind {
+            TableKind::Wave => &self.wave,
+            TableKind::Pulse => &self.pulse,
+            TableKind::Filter => &self.filter,
+            TableKind::Speed => &self.speed,
+        }
+    }
+
+    pub fn get_mut(&mut self, kind: TableKind) -> &mut Vec<TableRow> {
+        match kind {
+            TableKind::Wave => &mut self.wave,
+            TableKind::Pulse => &mut self.pulse,
+            TableKind::Filter => &mut self.filter,
+            TableKind::Speed => &mut self.speed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Instrument {
     pub name: Vec<u8>,
@@ -143,6 +213,25 @@ pub struct SidSong {
     pub patterns: Vec<Pattern>,
     pub instruments: Vec<Instrument>,
     pub tables: Tables,
+}
+
+/// One change a playing song takes without being opened again (`SidDoc::live_edits`,
+/// `SidSongPlayer::apply_live`): small, `Copy`-free of allocation when its
+/// instrument carries no name (the player ignores names).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveEdit {
+    /// Pattern `pattern` (a pattern number), row `row`.
+    Row { pattern: u8, row: u8, cell: Row },
+    /// Instrument `number` (1-based) with these fields (`name` is not read).
+    Instrument { number: u8, instrument: Instrument },
+    /// Row `row` (0-based) of a table; the table keeps its length.
+    TableRow {
+        table: TableKind,
+        row: u8,
+        value: TableRow,
+    },
+    /// The chip the song plays on.
+    Model(SidModel),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,5 +537,66 @@ impl SidSong {
             out.extend(table.iter().map(|r| r.right));
         }
         out
+    }
+
+    /// Whether the song is one the file layout can hold and `parse` accepts:
+    /// every count and field in range, every reference inside its list. A song
+    /// that passes round-trips through `to_bytes` and `parse` unchanged.
+    pub fn validate(&self) -> Result<(), SongError> {
+        for (what, len, max) in [
+            ("subsongs", self.subsongs.len(), MAX_SUBSONGS),
+            ("patterns", self.patterns.len(), MAX_PATTERNS),
+            ("instruments", self.instruments.len(), MAX_INSTRUMENTS),
+        ] {
+            if len > max {
+                return err(format!("a song has at most {max} {what}"));
+            }
+        }
+        for kind in TableKind::ALL {
+            if self.tables.get(kind).len() > 255 {
+                return err(format!("the {} table has more than 255 rows", kind.name()));
+            }
+        }
+        for ins in &self.instruments {
+            if ins.attack > 15 || ins.decay > 15 || ins.sustain > 15 || ins.release > 15 {
+                return err("an envelope value is not 0-15");
+            }
+            if ins.gate_timer > 63 {
+                return err("a gate timer is not 0-63");
+            }
+        }
+        let back = SidSong::parse(&self.to_bytes())?;
+        if back != *self {
+            return err("the song does not survive being written and read back");
+        }
+        Ok(())
+    }
+
+    /// The song rows (counted from the top of the subsong, as the player's
+    /// `song_row` counts them for one voice) that orderlist entries
+    /// `first..=last` of `voice` cover, repeats included, as `(start, end)`
+    /// with `end` exclusive. `None` when the subsong, voice or entries do not
+    /// exist.
+    pub fn order_rows(
+        &self,
+        subsong: usize,
+        voice: usize,
+        first: usize,
+        last: usize,
+    ) -> Option<(u64, u64)> {
+        let list = self.subsongs.get(subsong)?.orderlists.get(voice)?;
+        if first > last || last >= list.entries.len() {
+            return None;
+        }
+        let rows = |e: &OrderEntry| -> u64 {
+            let pattern = (e.pattern as usize).min(self.patterns.len().saturating_sub(1));
+            self.patterns
+                .get(pattern)
+                .map_or(0, |p| p.rows.len() as u64)
+                * e.repeat as u64
+        };
+        let start: u64 = list.entries[..first].iter().map(rows).sum();
+        let len: u64 = list.entries[first..=last].iter().map(rows).sum();
+        Some((start, start + len))
     }
 }
