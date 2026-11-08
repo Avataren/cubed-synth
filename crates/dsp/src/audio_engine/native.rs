@@ -1454,13 +1454,22 @@ impl AudioEngine {
             }
         }
 
-        // The instrument gain and the output's duck, a step per sample.
-        let (gain_from, gain_to) = (dip.0 * gain_ramp.0, dip.1 * gain_ramp.1);
-        if gain_from != 1.0 || gain_to != 1.0 {
+        // The instrument gain and the output's duck, per sample over the block.
+        // A change of either follows a raised cosine, so it has no corner at
+        // either end (a linear ramp's corners are a slope kink, a faint tick).
+        let (dip_from, dip_to) = dip;
+        let (inst_from, inst_to) = gain_ramp;
+        if dip_from != 1.0 || dip_to != 1.0 || inst_from != 1.0 || inst_to != 1.0 {
             let n = self.effect_left.len().min(self.effect_right.len());
-            let step = (gain_to - gain_from) / n as f32;
+            let moving = dip_from != dip_to || inst_from != inst_to;
             for i in 0..n {
-                let gain = gain_from + step * (i + 1) as f32;
+                let shape = if moving {
+                    0.5 - 0.5 * (std::f32::consts::PI * (i + 1) as f32 / n as f32).cos()
+                } else {
+                    0.0
+                };
+                let gain = (dip_from + (dip_to - dip_from) * shape)
+                    * (inst_from + (inst_to - inst_from) * shape);
                 self.effect_left[i] *= gain;
                 self.effect_right[i] *= gain;
             }
