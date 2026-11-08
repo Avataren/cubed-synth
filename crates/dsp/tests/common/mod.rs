@@ -88,6 +88,8 @@ pub fn play(engine: &mut AudioEngine, frequency: f32, held: usize, rest: usize) 
     let mut frame = AutomationFrame::with_dimensions(engine.num_voices(), 4, BLOCK);
     let (mut l, mut r) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
     let mut out = Vec::new();
+    // The patch's macros, as a host feeds them.
+    engine.fill_macro_values(&mut frame);
     for block in 0..held + rest {
         let gate = if block < held { 1.0 } else { 0.0 };
         frame.set_voice_values(0, gate, frequency, 1.0, 1.0);
@@ -172,4 +174,16 @@ pub fn note_stats(engine: &mut AudioEngine) -> (f32, f32, bool) {
     let out = play(engine, 261.63, 40, 20);
     let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     (peak, rms(&out), out.iter().all(|s| s.is_finite()))
+}
+
+/// FNV-1a over the bits of the samples, for pinning a render.
+pub fn hash(samples: &[f32]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for sample in samples {
+        for byte in sample.to_bits().to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
 }

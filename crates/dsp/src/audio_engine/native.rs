@@ -1,5 +1,6 @@
 use crate::audio_engine::patch::{
-    AudioAsset, GlideState, LfoState, PatchFile, PatchNode, VoiceLayout as PatchVoiceLayout,
+    AudioAsset, GlideState, LfoState, PatchFile, PatchNode, SynthState,
+    VoiceLayout as PatchVoiceLayout,
 };
 use crate::audio_engine::patch_loader::{
     effect_chain, for_each_node_in_creation_order, is_effect_id,
@@ -69,6 +70,11 @@ pub struct AudioEngine {
     effect_right: Vec<f32>,
     /// Each sampler's sample, shared by its node in every voice.
     sampler_data: FxHashMap<NodeId, Rc<RefCell<SampleData>>>,
+    /// The patch's macro values (0 to 1); the host puts them in its frames
+    /// (`fill_macro_values`).
+    macro_values: [f32; MACRO_COUNT],
+    /// The patch's output gain, which the host applies as the master gain.
+    instrument_gain: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +180,8 @@ impl AudioEngine {
             effect_left: vec![0.0; block_size],
             effect_right: vec![0.0; block_size],
             sampler_data: FxHashMap::default(),
+            macro_values: [0.0; MACRO_COUNT],
+            instrument_gain: 1.0,
         };
         engine.init(sample_rate, initial_voice_count);
         engine
@@ -188,6 +196,8 @@ impl AudioEngine {
 
         self.sample_rate = sample_rate;
         self.num_voices = voice_count;
+        self.macro_values = [0.0; MACRO_COUNT];
+        self.instrument_gain = 1.0;
         self.voices = (0..voice_count)
             .map(|id| Voice::new(id, self.block_size))
             .collect();
@@ -271,8 +281,117 @@ impl AudioEngine {
         self.connect_from_canonical_voice(canonical_voice)?;
         self.apply_patch_states(&patch, canonical_voice)?;
         self.import_audio_assets(&patch.audio_assets)?;
+        self.apply_patch_macros(&patch.synth_state);
 
         Ok(voice_count)
+    }
+
+    /// The patch's macro values and routes, and its output gain, as the DAW
+    /// applies them: each route is `connect_macro` on every voice.
+    fn apply_patch_macros(&mut self, synth: &SynthState) {
+        self.macro_values = [0.0; MACRO_COUNT];
+        self.instrument_gain = synth
+            .instrument_gain
+            .filter(|gain| gain.is_finite())
+            .map_or(1.0, |gain| gain.clamp(0.0, 2.0));
+        let Some(macros) = &synth.macros else { return };
+        for (slot, value) in self.macro_values.iter_mut().zip(&macros.values) {
+            if value.is_finite() {
+                *slot = value.clamp(0.0, 1.0);
+            }
+        }
+        for route in &macros.routes {
+            // A route the DAW would refuse (no such node, no such port, an
+            // effect) is left out, as a broken one leaves the rest alone.
+            let Ok(target) = parse_node_id(&route.target_id) else {
+                continue;
+            };
+            let Some(port) = PortId::try_from_u32(route.target_port) else {
+                continue;
+            };
+            for voice_index in 0..self.voices.len() {
+                if self.voices[voice_index].graph.get_node(target).is_none() {
+                    break;
+                }
+                let result = self.connect_macro(
+                    voice_index,
+                    route.macro_index,
+                    target,
+                    port,
+                    route.amount,
+                    ModulationType::from_i32(route.modulation_type),
+                    ModulationTransformation::from_i32(route.modulation_transform),
+                );
+                if let Err(err) = result {
+                    eprintln!("Skipped a macro route: {err}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Routes macro `macro_index` of one voice into `target_port` of a node, as
+    /// the DAW does: a route the macro already has to that input is replaced,
+    /// and an `amount` of 0 or less only removes it.
+    pub fn connect_macro(
+        &mut self,
+        voice_index: usize,
+        macro_index: usize,
+        target_node: NodeId,
+        target_port: PortId,
+        amount: f32,
+        modulation_type: ModulationType,
+        modulation_transform: ModulationTransformation,
+    ) -> Result<(), String> {
+        if macro_index >= MACRO_COUNT {
+            return Err(format!("Invalid macro index: {macro_index}"));
+        }
+        let voice = self
+            .voices
+            .get_mut(voice_index)
+            .ok_or_else(|| "Invalid voice index".to_string())?;
+        let _ = voice.remove_macro_route(macro_index, target_node, target_port);
+        if amount <= 0.0 {
+            return Ok(());
+        }
+        voice.add_macro_modulation(
+            macro_index,
+            target_node,
+            target_port,
+            amount,
+            modulation_type,
+            modulation_transform,
+        )
+    }
+
+    /// The patch's macro values (0 to 1).
+    pub fn macro_values(&self) -> [f32; MACRO_COUNT] {
+        self.macro_values
+    }
+
+    /// Sets a macro's value (0 to 1) for later `fill_macro_values`.
+    pub fn set_macro_value(&mut self, index: usize, value: f32) {
+        if let Some(slot) = self.macro_values.get_mut(index) {
+            if value.is_finite() {
+                *slot = value.clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    /// The patch's output gain (`instrumentGain`; 1 when it has none): the host
+    /// plays the engine through it as the master gain.
+    pub fn instrument_gain(&self) -> f32 {
+        self.instrument_gain
+    }
+
+    /// Writes the macros' values into every voice's lanes of `frame`, which is
+    /// how the engine hears them.
+    pub fn fill_macro_values(&self, frame: &mut AutomationFrame) {
+        for voice in 0..frame.num_voices() {
+            for (index, value) in self.macro_values.iter().enumerate() {
+                frame.set_macro_value(voice, index, *value);
+            }
+        }
     }
 
     /// The patch's embedded samples and impulse responses (base64 WAVs keyed
@@ -659,6 +778,102 @@ impl AudioEngine {
         found
     }
 
+    /// Creates a node of `node_type` with this id in every voice, and, for the
+    /// voice's own nodes (pitch, glide, velocity, gate mixer, mixer), makes it
+    /// the voice's.
+    fn add_node_to_voices(&mut self, node_type: &str, id: NodeId) -> Result<(), String> {
+        // Call create_node_from_type *before* mutably borrowing self.voices
+        // to avoid aliasing (&self for creation vs &mut self.voices for insertion).
+        for voice_index in 0..self.voices.len() {
+            let node = self.create_node_from_type(node_type, &id)?;
+            let voice = &mut self.voices[voice_index];
+            voice.graph.add_node_with_id(id, node);
+
+            // If the node is a global node, store its ID for this voice
+            match node_type {
+                "global_frequency" => voice.graph.global_frequency_node = Some(id),
+                "glide" => {
+                    voice.graph.global_glide_node = Some(id);
+                    if let Some(global_freq) = voice.graph.global_frequency_node {
+                        voice.graph.add_connection(Connection {
+                            from_node: global_freq,
+                            from_port: PortId::GlobalFrequency,
+                            to_node: id,
+                            to_port: PortId::AudioInput0,
+                            amount: 1.0,
+                            modulation_type: ModulationType::Additive,
+                            modulation_transform: ModulationTransformation::None,
+                        });
+                    }
+                    if let Some(gate_mixer) = voice.graph.global_gatemixer_node {
+                        voice.graph.add_connection(Connection {
+                            from_node: gate_mixer,
+                            from_port: PortId::CombinedGate,
+                            to_node: id,
+                            to_port: PortId::CombinedGate,
+                            amount: 1.0,
+                            modulation_type: ModulationType::Additive,
+                            modulation_transform: ModulationTransformation::None,
+                        });
+                    }
+                }
+                "global_velocity" => voice.graph.global_velocity_node = Some(id),
+                "gatemixer" => voice.graph.global_gatemixer_node = Some(id),
+                "mixer" => voice.graph.set_output_node(id),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates a node of any type the loader builds (`catalog::NODES`) in every
+    /// voice and returns its id. Its settings are the type's defaults; set
+    /// them with the `update_*` methods or by building the engine from a patch.
+    pub fn create_node(&mut self, node_type: &str) -> Result<NodeId, String> {
+        self.ensure_global_nodes()?;
+        let id = NodeId::new();
+        self.add_node_to_voices(node_type, id)?;
+        Ok(id)
+    }
+
+    /// Deletes a node, with its connections, from every voice. The voice's own
+    /// nodes (pitch, velocity, gate mixer, glide, mixer) cannot be deleted.
+    pub fn delete_node(&mut self, node_id: NodeId) -> Result<(), String> {
+        if let Some(voice) = self.voices.first() {
+            let graph = &voice.graph;
+            let own = [
+                graph.global_frequency_node,
+                graph.global_velocity_node,
+                graph.global_gatemixer_node,
+                graph.global_glide_node,
+                graph.output_node,
+            ];
+            if own.contains(&Some(node_id)) {
+                return Err("Cannot delete a node the voice needs".to_string());
+            }
+        }
+        for voice in &mut self.voices {
+            voice.graph.delete_node(node_id);
+        }
+        self.sampler_data.remove(&node_id);
+        Ok(())
+    }
+
+    /// Removes the connections from one node to an input port of another, in
+    /// every voice.
+    pub fn remove_specific_connection(
+        &mut self,
+        from_node: NodeId,
+        to_node: NodeId,
+        to_port: PortId,
+    ) {
+        for voice in &mut self.voices {
+            voice
+                .graph
+                .remove_specific_connection(from_node, to_node, to_port);
+        }
+    }
+
     fn build_nodes_from_canonical_voice(
         &mut self,
         canonical_voice: &PatchVoiceLayout,
@@ -668,52 +883,7 @@ impl AudioEngine {
         for_each_node_in_creation_order(canonical_voice, |node_type, patch_node| {
             let id = parse_node_id(&patch_node.id)?;
 
-            // IMPORTANT: Call create_node_from_type *before* mutably borrowing self.voices
-            // to avoid aliasing (&self for creation vs &mut self.voices for insertion).
-            for voice_index in 0..self.voices.len() {
-                let node = self.create_node_from_type(node_type, &id)?;
-
-                {
-                    let voice = &mut self.voices[voice_index];
-                    voice.graph.add_node_with_id(id, node);
-
-                    // If the node is a global node, store its ID for this voice
-                    match node_type {
-                        "global_frequency" => voice.graph.global_frequency_node = Some(id),
-                        "glide" => {
-                            voice.graph.global_glide_node = Some(id);
-                            if let Some(global_freq) = voice.graph.global_frequency_node {
-                                voice.graph.add_connection(Connection {
-                                    from_node: global_freq,
-                                    from_port: PortId::GlobalFrequency,
-                                    to_node: id,
-                                    to_port: PortId::AudioInput0,
-                                    amount: 1.0,
-                                    modulation_type: ModulationType::Additive,
-                                    modulation_transform: ModulationTransformation::None,
-                                });
-                            }
-                            if let Some(gate_mixer) = voice.graph.global_gatemixer_node {
-                                voice.graph.add_connection(Connection {
-                                    from_node: gate_mixer,
-                                    from_port: PortId::CombinedGate,
-                                    to_node: id,
-                                    to_port: PortId::CombinedGate,
-                                    amount: 1.0,
-                                    modulation_type: ModulationType::Additive,
-                                    modulation_transform: ModulationTransformation::None,
-                                });
-                            }
-                        }
-                        "global_velocity" => voice.graph.global_velocity_node = Some(id),
-                        "gatemixer" => voice.graph.global_gatemixer_node = Some(id),
-                        "mixer" => voice.graph.set_output_node(id),
-                        _ => {}
-                    }
-                }
-            }
-
-            Ok::<(), String>(())
+            self.add_node_to_voices(node_type, id)
         })?;
         // Ensure the glide hears the combined gate even though the gate mixer is created later.
         for voice in &mut self.voices {
