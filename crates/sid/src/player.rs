@@ -131,8 +131,28 @@
 //!     `preview_note_on` / `preview_note_off` with the song's instruments,
 //!     tables and vibrato running as they do for a song note;
 //!   - per-voice taps and mute/solo (`render_taps`, `Chip::set_voice_mask`).
+//!
+//! The editor's controls (the SID song document's transport, `edit::SidDoc`),
+//! all allocation-free, safe to call between audio blocks:
+//!   - `seek(subsong, voice, order, row)`: the song replayed silently to the moment a
+//!     voice is about to read a row of an orderlist position, so the tempo, the other
+//!     voices, the tables and the filter are where the song has them there; `seek_row`
+//!     is the same by song row, in place (about 0.02 us a frame replayed, release);
+//!   - `set_loop(SidLoop { voice, start, end })`: a range of one voice's rows repeated
+//!     from a copy of the sequencer taken when the player first passes `start`, so a
+//!     repeat costs nothing and plays the moment exactly (`SidSong::order_rows` turns
+//!     orderlist positions into rows);
+//!   - `set_mute_solo(mute, solo)`, `audition_on(voice, instrument, note)` /
+//!     `audition_off(voice)` (an instrument with its tables running, with no song in
+//!     preview mode, or taking a voice over a playing one), `status()` (per voice the
+//!     orderlist position, pattern, row and tick), `peaks()` (per voice, falling 24 dB a
+//!     second) and `attach_probe` (the same, shared with other threads, `probe.rs`);
+//!   - `apply_live(&LiveEdit)`: the edits `SidDoc::live_edits` says a playing song can
+//!     take (rows, instrument fields, the content of table rows, the chip model).
 
-use super::chip::{Chip, REG_FC_HI, REG_FC_LO, REG_MODE_VOL, REG_RES_FILT};
+use super::chip::{Chip, ALL_VOICES, REG_FC_HI, REG_FC_LO, REG_MODE_VOL, REG_RES_FILT};
+use super::probe::{SidProbe, SidStatus};
+use std::sync::Arc;
 
 /// Chip cycles between two register writes of a frame (GT: `lda $xxxx,x` 4 +
 /// `sta $d400,x` 5, gsid.h `SIDWRITEDELAY`).
@@ -146,7 +166,7 @@ const CONTROL_EXTRA: u64 = 4;
 /// note at level for ~33 ms before it releases: GT's audible tail after a hit.
 const HARD_RESTART_AD: u8 = 0x0F;
 use super::song::{
-    Instrument, Row, SidSong, TableRow, NOTE_FIRST, NOTE_KEY_OFF, NOTE_KEY_ON, NOTE_LAST,
+    Instrument, LiveEdit, Row, SidSong, TableRow, NOTE_FIRST, NOTE_KEY_OFF, NOTE_KEY_ON, NOTE_LAST,
     SID_CHANNELS,
 };
 use super::waveform::GATE;
@@ -227,6 +247,13 @@ struct Channel {
     period: u8,
     /// This frame started a row.
     at_row_start: bool,
+    // Where the channel is, for display (`SidSongPlayer::status`): the row it
+    // started last (the sequencer fields above run a frame ahead on the last
+    // frame of a row), and the frames it has played of it.
+    play_order: usize,
+    play_pattern: usize,
+    play_row: usize,
+    row_tick: u8,
 }
 
 /// What a note trigger reads from its instrument. It is `Copy`, so taking it
@@ -266,8 +293,8 @@ pub struct SidSongPlayer {
     funk: [u8; 2],
     /// The channel whose rows the song row counts: the longest first pass.
     ref_channel: usize,
-    /// The reference channel's row ended on the frame just played.
-    row_ended: bool,
+    /// The voices (a bit each) whose row ended on the frame just played.
+    rows_ended: u8,
     frames: u64,
     looped: bool,
     samples_per_frame: f64,
@@ -287,9 +314,87 @@ pub struct SidSongPlayer {
     filter_regs: [u8; 4],
     // Transport (S4).
     song_rows: u64,
-    rows_played: u64,
-    loop_rows: Option<(u64, u64)>,
+    /// Rows each voice has moved on to since the top (`song_row` is the
+    /// reference voice's).
+    rows: [u64; SID_CHANNELS],
+    loop_range: Option<SidLoop>,
+    /// The sequencer as it stood at the start of the loop's range, so a loop
+    /// goes back without replaying the song from the top.
+    rewind: Option<Rewind>,
     preview: bool,
+    /// The voices a note audition holds (`audition_on`): their rows are not read.
+    audition: u8,
+    /// The voices that have been auditioned since preview mode began: the ones
+    /// a filter routed to any voice is heard on.
+    audition_seen: u8,
+    mute: u8,
+    solo: u8,
+    /// The most frames a seek replays (`SEEK_MAX_FRAMES`).
+    seek_limit: u64,
+    /// Per voice, the loudest recent sample of its tap, falling 24 dB a second.
+    peaks: [f32; SID_CHANNELS],
+    /// ln of the per-sample factor of that fall.
+    peak_ln_fall: f32,
+    probe: Option<Arc<SidProbe>>,
+}
+
+/// A range of rows of one voice to play over and over (`SidSongPlayer::set_loop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidLoop {
+    /// The voice whose rows are counted (0-2).
+    pub voice: u8,
+    /// The first row of the range, counted from the top of the subsong.
+    pub start: u64,
+    /// The row after the last (exclusive).
+    pub end: u64,
+}
+
+/// Why a seek did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekError {
+    /// The subsong, voice, orderlist position or row does not exist.
+    NoSuchPlace,
+    /// The place is not reached within [`SEEK_MAX_FRAMES`] of the song.
+    TooFar,
+}
+
+impl std::fmt::Display for SeekError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SeekError::NoSuchPlace => "there is no such place in the song",
+            SeekError::TooFar => "the place is too far into the song to reach",
+        })
+    }
+}
+
+impl std::error::Error for SeekError {}
+
+/// The most frames a seek replays (silently, without the chip) before it gives
+/// up: about 23 hours of a 50 Hz song.
+pub const SEEK_MAX_FRAMES: u64 = 1 << 22;
+
+/// Samples a tap chunk the peaks are taken over (the player's stack buffers).
+const PEAK_CHUNK: usize = 256;
+
+/// The sequencer's state at one moment (everything a seek replay builds), copied
+/// whole: no allocation.
+#[derive(Debug, Clone)]
+struct Rewind {
+    subsong: usize,
+    ref_channel: usize,
+    song_rows: u64,
+    channels: [Channel; SID_CHANNELS],
+    funk: [u8; 2],
+    looped: bool,
+    filter_ptr: u8,
+    filter_time: u8,
+    filter_speed: i8,
+    cutoff: u16,
+    res_filt: u8,
+    mode: u8,
+    volume: u8,
+    filter_regs: [u8; 4],
+    rows: [u64; SID_CHANNELS],
 }
 
 /// GT's stored tempo for a tempo value (gplay.c:496-498): the row length
@@ -311,6 +416,11 @@ fn gt_tempo(value: u8) -> u8 {
 /// (`sidNoteIndex`) still clamps: a grid cell can only name C-0..G#7.
 pub fn note_index(note: u8, transpose: i8) -> u8 {
     (note as i32 - NOTE_FIRST as i32 + transpose as i32) as u8
+}
+
+/// The loudest sample of a tap chunk.
+fn tap_peak(tap: &[f32]) -> f32 {
+    tap.iter().fold(0.0f32, |m, s| m.max(s.abs()))
 }
 
 fn table_row(table: &[TableRow], ptr: u8) -> Option<TableRow> {
@@ -338,37 +448,16 @@ impl SidSongPlayer {
     ) -> Result<SidSongPlayer, SidError> {
         let chip = Chip::with_sample_rate(model, sample_rate)?;
         let subsong = subsong.min(song.subsongs.len().saturating_sub(1));
-        let mut channels: [Channel; SID_CHANNELS] = Default::default();
-        for (c, ch) in channels.iter_mut().enumerate() {
-            ch.order = usize::MAX;
-            let list = &song.subsongs[subsong].orderlists[c];
-            Self::enter_order(ch, list, 0, &song);
-        }
         let samples_per_frame =
             frame_cycles(song.speed_multiplier) as f64 * sample_rate / PAL_CLOCK_HZ;
-        let mult = song.speed_multiplier.max(1);
-        let start = Self::start_tempo(&song);
-        for ch in channels.iter_mut() {
-            // GT starts every channel on instrument 1 (gplay.c:62), so its
-            // gate timer brings the hard restart before a channel's first note.
-            ch.instrument = if song.instruments.is_empty() { 0 } else { 1 };
-            // The first frame decrements to 0 and starts the first row.
-            ch.tick = 1;
-            ch.fixed = start;
-            ch.period = start;
-        }
-        let (song_rows, ref_channel) = Self::first_pass_rows(&song, subsong);
-        Ok(SidSongPlayer {
+        let mut player = SidSongPlayer {
             song,
             subsong,
             chip,
-            channels,
-            funk: [
-                9u8.wrapping_mul(mult).wrapping_sub(1),
-                6u8.wrapping_mul(mult).wrapping_sub(1),
-            ],
-            ref_channel,
-            row_ended: false,
+            channels: Default::default(),
+            funk: [0; 2],
+            ref_channel: 0,
+            rows_ended: 0,
             frames: 0,
             looped: false,
             samples_per_frame,
@@ -381,11 +470,110 @@ impl SidSongPlayer {
             mode: 0,
             volume: 15,
             filter_regs: [0, 0, 0, 15],
-            song_rows,
-            rows_played: 0,
-            loop_rows: None,
+            song_rows: 0,
+            rows: [0; SID_CHANNELS],
+            loop_range: None,
+            rewind: None,
             preview: false,
-        })
+            audition: 0,
+            audition_seen: 0,
+            mute: 0,
+            solo: 0,
+            seek_limit: SEEK_MAX_FRAMES,
+            peaks: [0.0; SID_CHANNELS],
+            // 24 dB a second: 10^(-24/20) per second.
+            peak_ln_fall: -(24.0 / 20.0) * std::f32::consts::LN_10 / sample_rate as f32,
+            probe: None,
+        };
+        player.reset_sequencer(subsong);
+        Ok(player)
+    }
+
+    /// Puts the sequencer, the voices' own state and the filter's where a new
+    /// player has them, on `subsong` (in place: nothing is allocated, the chip
+    /// keeps running).
+    fn reset_sequencer(&mut self, subsong: usize) {
+        self.subsong = subsong;
+        let mult = self.song.speed_multiplier.max(1);
+        let start = Self::start_tempo(&self.song);
+        let first_instrument = if self.song.instruments.is_empty() {
+            0
+        } else {
+            1
+        };
+        for c in 0..SID_CHANNELS {
+            let ch = &mut self.channels[c];
+            *ch = Channel::default();
+            ch.order = usize::MAX;
+            let list = &self.song.subsongs[subsong].orderlists[c];
+            Self::enter_order(ch, list, 0, &self.song);
+            // GT starts every channel on instrument 1 (gplay.c:62), so its
+            // gate timer brings the hard restart before a channel's first note.
+            ch.instrument = first_instrument;
+            // The first frame decrements to 0 and starts the first row.
+            ch.tick = 1;
+            ch.fixed = start;
+            ch.period = start;
+            ch.play_order = ch.order;
+            ch.play_pattern = ch.pattern;
+        }
+        self.funk = [
+            9u8.wrapping_mul(mult).wrapping_sub(1),
+            6u8.wrapping_mul(mult).wrapping_sub(1),
+        ];
+        let (song_rows, ref_channel) = Self::first_pass_rows(&self.song, subsong);
+        self.song_rows = song_rows;
+        self.ref_channel = ref_channel;
+        self.rows_ended = 0;
+        self.looped = false;
+        self.filter_ptr = 0;
+        self.filter_time = 0;
+        self.filter_speed = 0;
+        self.cutoff = 0;
+        self.res_filt = 0;
+        self.mode = 0;
+        self.volume = 15;
+        self.filter_regs = [0, 0, 0, 15];
+        self.rows = [0; SID_CHANNELS];
+        self.rewind = None;
+    }
+
+    fn snapshot(&self) -> Rewind {
+        Rewind {
+            subsong: self.subsong,
+            ref_channel: self.ref_channel,
+            song_rows: self.song_rows,
+            channels: self.channels.clone(),
+            funk: self.funk,
+            looped: self.looped,
+            filter_ptr: self.filter_ptr,
+            filter_time: self.filter_time,
+            filter_speed: self.filter_speed,
+            cutoff: self.cutoff,
+            res_filt: self.res_filt,
+            mode: self.mode,
+            volume: self.volume,
+            filter_regs: self.filter_regs,
+            rows: self.rows,
+        }
+    }
+
+    fn restore(&mut self, r: &Rewind) {
+        self.subsong = r.subsong;
+        self.ref_channel = r.ref_channel;
+        self.song_rows = r.song_rows;
+        self.channels = r.channels.clone();
+        self.funk = r.funk;
+        self.looped = r.looped;
+        self.filter_ptr = r.filter_ptr;
+        self.filter_time = r.filter_time;
+        self.filter_speed = r.filter_speed;
+        self.cutoff = r.cutoff;
+        self.res_filt = r.res_filt;
+        self.mode = r.mode;
+        self.volume = r.volume;
+        self.filter_regs = r.filter_regs;
+        self.rows = r.rows;
     }
 
     /// The frames per row every channel starts at, until a tempo command
@@ -436,7 +624,7 @@ impl SidSongPlayer {
     /// The row the player is on, counted from the top of the subsong (it
     /// keeps counting past `song_rows` as the song loops on).
     pub fn song_row(&self) -> u64 {
-        self.rows_played
+        self.rows[self.ref_channel]
     }
 
     /// The subsong this player plays.
@@ -444,35 +632,159 @@ impl SidSongPlayer {
         self.subsong
     }
 
+    /// The voice whose rows `song_row` counts: the one with the longest first pass.
+    pub fn ref_voice(&self) -> usize {
+        self.ref_channel
+    }
+
+    /// Plays one frame without the chip: the sequencer, the voices' state and the
+    /// tables move on, no register is written (a seek's replay).
+    fn replay_frame(&mut self) {
+        let frames = self.frames;
+        self.frame_core(false);
+        self.frames = frames;
+    }
+
     /// Moves to the start of song row `row` (see the header: sequencer replay,
     /// same chip). The next frame reads that row. A row loop stays set.
+    /// Nothing is allocated; the replay costs about a microsecond a frame of
+    /// the song before the row (`SEEK_MAX_FRAMES` bounds it).
     pub fn seek_row(&mut self, row: u64) {
-        let sample_rate = self.chip.sample_rate();
-        let model = self.chip.model();
-        let Ok(mut fresh) =
-            SidSongPlayer::with_model(self.song.clone(), model, sample_rate, self.subsong)
-        else {
-            return;
-        };
-        while fresh.rows_played < row {
-            fresh.frame();
+        self.reset_sequencer(self.subsong);
+        let voice = self.ref_channel;
+        self.replay_until(|p| p.rows[voice] >= row);
+        self.samples_to_frame = 0.0;
+        self.loop_boundary();
+    }
+
+    /// Replays frames until `done` holds, at most `SEEK_MAX_FRAMES`; whether it did.
+    fn replay_until(&mut self, done: impl Fn(&SidSongPlayer) -> bool) -> bool {
+        let mut n = 0;
+        while !done(self) {
+            if n >= self.seek_limit {
+                return false;
+            }
+            self.replay_frame();
+            n += 1;
         }
-        fresh.loop_rows = self.loop_rows;
-        fresh.preview = self.preview;
-        std::mem::swap(&mut fresh.chip, &mut self.chip);
-        *self = fresh;
+        true
     }
 
-    /// Loops song rows `start..end` (`end` exclusive): reaching `end`, the
-    /// player seeks back to `start`. `None` (or an empty range) plays on.
+    /// Changes the most frames a seek replays before it gives up (`SEEK_MAX_FRAMES`).
+    pub fn set_seek_limit(&mut self, frames: u64) {
+        self.seek_limit = frames;
+    }
+
+    /// Moves to the moment voice `voice` is about to read row `row` of the
+    /// pattern at orderlist position `order` (its first play, when the entry
+    /// repeats) in subsong `subsong`: the song is replayed silently from the top
+    /// to there, so the tempo, the other voices, the tables and the filter are
+    /// where the song has them at that moment. The chip keeps running: notes that
+    /// sounded carry on until a row retriggers them. Nothing is allocated; the
+    /// replay costs about a microsecond a frame of the song before the place. On
+    /// error nothing moved. A loop stays set; preview mode and auditions stay.
+    pub fn seek(
+        &mut self,
+        subsong: usize,
+        voice: usize,
+        order: usize,
+        row: usize,
+    ) -> Result<(), SeekError> {
+        let entry = self
+            .song
+            .subsongs
+            .get(subsong)
+            .and_then(|s| s.orderlists.get(voice))
+            .and_then(|l| l.entries.get(order))
+            .ok_or(SeekError::NoSuchPlace)?;
+        let rows = self
+            .song
+            .patterns
+            .get(entry.pattern as usize)
+            .map_or(0, |p| p.rows.len());
+        if row >= rows {
+            return Err(SeekError::NoSuchPlace);
+        }
+        let before = self.snapshot();
+        self.reset_sequencer(subsong);
+        // About to read it: the channel's counter stands at 1 with the place named.
+        let reached = self.replay_until(|p| {
+            let ch = &p.channels[voice];
+            ch.tick == 1 && ch.order == order && ch.row == row
+        });
+        if !reached {
+            self.restore(&before);
+            return Err(SeekError::TooFar);
+        }
+        self.samples_to_frame = 0.0;
+        self.loop_boundary();
+        Ok(())
+    }
+
+    /// Loops song rows `start..end` (`end` exclusive) of the reference voice:
+    /// reaching `end`, the player goes back to `start`. `None` (or an empty
+    /// range) plays on. See [`set_loop`](Self::set_loop).
     pub fn set_loop_rows(&mut self, range: Option<(u64, u64)>) {
-        self.loop_rows = range.filter(|(start, end)| end > start);
+        let voice = self.ref_channel as u8;
+        self.set_loop(range.map(|(start, end)| SidLoop { voice, start, end }));
     }
 
-    /// Preview mode: the sequencer stops; `preview_note_on` plays channel 1.
+    /// Loops a range of rows of one voice (counted from the top of the subsong:
+    /// `SidSong::order_rows` gives the rows of orderlist entries): reaching
+    /// `end`, every voice goes back to where it was when `voice` reached `start`,
+    /// so the loop repeats the moment exactly, tempo and tables included. The
+    /// player remembers that moment when it first passes `start` (or, for a range
+    /// it is already inside or past, replays to it once, at the first `end`), so a
+    /// loop costs nothing per repeat. `None` or an empty range plays on.
+    pub fn set_loop(&mut self, range: Option<SidLoop>) {
+        self.loop_range = range.filter(|l| l.end > l.start && (l.voice as usize) < SID_CHANNELS);
+        self.rewind = None;
+        self.loop_boundary();
+    }
+
+    /// The loop in force, if any.
+    pub fn loop_range(&self) -> Option<SidLoop> {
+        self.loop_range
+    }
+
+    /// Remembers the sequencer now when it stands at the start of the loop's range.
+    fn loop_boundary(&mut self) {
+        let Some(l) = self.loop_range else { return };
+        let v = l.voice as usize;
+        if self.rewind.is_none() && self.rows[v] == l.start && self.channels[v].tick == 1 {
+            self.rewind = Some(self.snapshot());
+        }
+    }
+
+    /// Mutes and solos voices, a bit each (bit 0 voice 1): muted voices are not
+    /// heard and read 0 in the peaks and taps; with any solo, only the soloed
+    /// voices are heard (a voice both soloed and muted is not). The song keeps
+    /// playing all three.
+    pub fn set_mute_solo(&mut self, mute: u8, solo: u8) {
+        self.mute = mute & ALL_VOICES;
+        self.solo = solo & ALL_VOICES;
+        let heard = if self.solo != 0 {
+            self.solo
+        } else {
+            ALL_VOICES
+        };
+        self.chip.set_voice_mask(heard & !self.mute);
+    }
+
+    /// The (mute, solo) masks last set.
+    pub fn mute_solo(&self) -> (u8, u8) {
+        (self.mute, self.solo)
+    }
+
+    /// Preview mode: the sequencer stops; auditions (`audition_on`, and
+    /// `preview_note_on` on voice 1) play the song's instruments with its tables
+    /// running, no song needed. Leaving it, the voices read their rows again from
+    /// their next row.
     pub fn set_preview(&mut self, on: bool) {
         self.preview = on;
         if on {
+            self.audition = 0;
+            self.audition_seen = 0;
             for ch in self.channels.iter_mut() {
                 ch.gate = false;
                 ch.cmd = 0;
@@ -480,6 +792,8 @@ impl SidSongPlayer {
                 ch.run_cmd = 0;
                 ch.run_param = 0;
             }
+        } else {
+            self.audition = 0;
         }
     }
 
@@ -487,27 +801,63 @@ impl SidSongPlayer {
         self.preview
     }
 
+    /// Plays instrument `instrument` (1-based) at note table index `note`
+    /// (0 = C-0 .. 92 = G#7) on voice `voice` (0-2), as a song note of it: its
+    /// envelope, first-frame waveform and wave, pulse, filter and speed tables
+    /// run, its vibrato after its delay. In preview mode that is all the player
+    /// does; over a playing song the voice is taken: its rows are not read (its
+    /// row counter runs on) until [`audition_off`](Self::audition_off). Several
+    /// voices can be auditioned at once (a chord). `false` (nothing changed) for a
+    /// voice or an instrument that does not exist.
+    pub fn audition_on(&mut self, voice: usize, instrument: usize, note: u8) -> bool {
+        if voice >= SID_CHANNELS || instrument == 0 || instrument > self.song.instruments.len() {
+            return false;
+        }
+        let note = note.min(GT_NOTE_COUNT - 1);
+        self.audition |= 1 << voice;
+        self.audition_seen |= 1 << voice;
+        let ch = &mut self.channels[voice];
+        ch.instrument = instrument;
+        ch.cmd = 0;
+        ch.param = 0;
+        ch.run_cmd = 0;
+        ch.run_param = 0;
+        self.new_note(voice, note);
+        self.trigger(voice, note);
+        true
+    }
+
+    /// Releases an audition (the instrument's release plays out) and gives the
+    /// voice back to the song from its next row.
+    pub fn audition_off(&mut self, voice: usize) {
+        if voice < SID_CHANNELS {
+            self.channels[voice].gate = false;
+            self.audition &= !(1 << voice);
+        }
+    }
+
+    /// The voices an audition holds, a bit each.
+    pub fn auditioning(&self) -> u8 {
+        self.audition
+    }
+
     /// Preview mode: triggers instrument `instrument` (1-based) at note table
     /// index `note` on channel 1. `false` (nothing changed) outside preview
     /// mode or for an instrument the song lacks.
     pub fn preview_note_on(&mut self, instrument: usize, note: u8) -> bool {
-        if !self.preview || instrument == 0 || instrument > self.song.instruments.len() {
-            return false;
-        }
-        let ch = &mut self.channels[0];
-        ch.instrument = instrument;
-        ch.cmd = 0;
-        ch.param = 0;
-        self.new_note(0, note.min(GT_NOTE_COUNT - 1));
-        self.trigger(0, note.min(GT_NOTE_COUNT - 1));
-        true
+        self.preview && self.audition_on(0, instrument, note)
     }
 
     /// Preview mode: releases the preview note (the instrument's release).
     pub fn preview_note_off(&mut self) {
         if self.preview {
-            self.channels[0].gate = false;
+            self.audition_off(0);
         }
+    }
+
+    /// Whether voice `c` is not reading rows (preview mode, or an audition holds it).
+    fn suspended(&self, c: usize) -> bool {
+        self.preview || self.audition & (1 << c) != 0
     }
 
     fn enter_order(ch: &mut Channel, list: &super::song::Orderlist, index: usize, song: &SidSong) {
@@ -584,6 +934,130 @@ impl SidSongPlayer {
         self.channels[c].base_note
     }
 
+    /// Where the player is, for a display: per voice the orderlist position, the
+    /// pattern and the row of the row it started last, and the frames played of
+    /// it (0 on its first); see [`SidStatus`]. Reads the state as of the last frame.
+    pub fn status(&self) -> SidStatus {
+        let mut s = SidStatus {
+            subsong: self.subsong as u8,
+            tempo: self.tempo(),
+            preview: self.preview,
+            audition: self.audition,
+            looping: self.loop_range.is_some(),
+            looped: self.looped,
+            mute: self.mute,
+            solo: self.solo,
+            song_row: self.song_row(),
+            song_rows: self.song_rows,
+            frames: self.frames,
+            ..SidStatus::default()
+        };
+        for (c, ch) in self.channels.iter().enumerate() {
+            s.order[c] = ch.play_order.min(255) as u8;
+            s.pattern[c] = ch.play_pattern.min(255) as u8;
+            s.row[c] = ch.play_row.min(255) as u8;
+            s.tick[c] = ch.row_tick;
+        }
+        s
+    }
+
+    /// Each voice's recent peak: the loudest sample of its own signal in the
+    /// latest blocks (the tap: after the voice's gain, before the filter), falling
+    /// 24 dB a second after it, so a display that polls slower than the song does
+    /// not miss a hit. A muted voice reads 0. The scale is the mix's
+    /// (`chip().tap_full_scale()` is a full voice's).
+    pub fn peaks(&self) -> [f32; SID_CHANNELS] {
+        self.peaks
+    }
+
+    /// Shares the player's position and peaks with other threads: the probe is
+    /// written at every frame and block (atomics, no lock, no allocation) and any
+    /// thread reads it. Make the probe off the audio thread (`SidProbe::new`).
+    pub fn attach_probe(&mut self, probe: Arc<SidProbe>) {
+        probe.publish(&self.status(), &self.peaks);
+        self.probe = Some(probe);
+    }
+
+    /// Applies one change of the song the player is playing without making it
+    /// again, for what [`LiveEdit`] covers; `false` (nothing changed) when the
+    /// place does not exist or the change is not valid for the song. A row edit is
+    /// heard when the voice next reads the row. An instrument's fields are read
+    /// when a note starts (the envelope, the tables it points at, the vibrato) or
+    /// as the gate timer runs, so it is heard from the next note; a table row is
+    /// heard at once where the table next reads it. An instrument's name is not
+    /// read. The start tempo and the multispeed are read when the player is made:
+    /// a change of them needs a new player. Nothing is allocated (an instrument
+    /// edit carries no name).
+    pub fn apply_live(&mut self, edit: &LiveEdit) -> bool {
+        match edit {
+            LiveEdit::Row { pattern, row, cell } => {
+                if cell.instrument as usize > self.song.instruments.len() || cell.command > 0x0F {
+                    return false;
+                }
+                match self
+                    .song
+                    .patterns
+                    .get_mut(*pattern as usize)
+                    .and_then(|p| p.rows.get_mut(*row as usize))
+                {
+                    Some(r) => {
+                        *r = *cell;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            LiveEdit::Instrument { number, instrument } => {
+                let t = &self.song.tables;
+                if instrument.wave_ptr as usize > t.wave.len()
+                    || instrument.pulse_ptr as usize > t.pulse.len()
+                    || instrument.filter_ptr as usize > t.filter.len()
+                    || instrument.speed_ptr as usize > t.speed.len()
+                    || instrument.attack > 15
+                    || instrument.decay > 15
+                    || instrument.sustain > 15
+                    || instrument.release > 15
+                {
+                    return false;
+                }
+                let Some(i) = (*number as usize)
+                    .checked_sub(1)
+                    .and_then(|n| self.song.instruments.get_mut(n))
+                else {
+                    return false;
+                };
+                // Every field but the name (which would allocate).
+                i.attack = instrument.attack;
+                i.decay = instrument.decay;
+                i.sustain = instrument.sustain;
+                i.release = instrument.release;
+                i.first_wave = instrument.first_wave;
+                i.gate_timer = instrument.gate_timer & 0x3F;
+                i.hard_restart = instrument.hard_restart;
+                i.no_gate_off = instrument.no_gate_off;
+                i.vibrato_delay = instrument.vibrato_delay;
+                i.wave_ptr = instrument.wave_ptr;
+                i.pulse_ptr = instrument.pulse_ptr;
+                i.filter_ptr = instrument.filter_ptr;
+                i.speed_ptr = instrument.speed_ptr;
+                true
+            }
+            LiveEdit::TableRow { table, row, value } => {
+                match self.song.tables.get_mut(*table).get_mut(*row as usize) {
+                    Some(r) => {
+                        *r = *value;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            LiveEdit::Model(model) => {
+                self.song.model = *model;
+                self.chip.set_model(*model).is_ok()
+            }
+        }
+    }
+
     /// Fill `out` with the song, frame by frame.
     pub fn render(&mut self, out: &mut [f32]) {
         self.render_inner(out, None);
@@ -597,34 +1071,92 @@ impl SidSongPlayer {
 
     fn render_inner(&mut self, out: &mut [f32], mut taps: Option<[&mut [f32]; 3]>) {
         let mut i = 0;
+        // The peaks come from the voices' taps: the caller's, or ours on the stack.
+        let mut local = [[0.0f32; PEAK_CHUNK]; SID_CHANNELS];
         while i < out.len() {
             if self.samples_to_frame <= 0.0 {
                 self.frame_with_loop();
                 self.samples_to_frame += self.samples_per_frame;
             }
             let n = (self.samples_to_frame.ceil() as usize).clamp(1, out.len() - i);
-            match taps.as_mut() {
-                Some([a, b, c]) => self.chip.render_taps(
-                    &mut out[i..i + n],
-                    [&mut a[i..i + n], &mut b[i..i + n], &mut c[i..i + n]],
-                ),
-                None => self.chip.render(&mut out[i..i + n]),
+            let mut done = 0;
+            while done < n {
+                let m = (n - done).min(PEAK_CHUNK);
+                let at = i + done;
+                let peak = match taps.as_mut() {
+                    Some([a, b, c]) => {
+                        let t = [&mut a[at..at + m], &mut b[at..at + m], &mut c[at..at + m]];
+                        self.chip.render_taps(&mut out[at..at + m], t);
+                        [
+                            tap_peak(&a[at..at + m]),
+                            tap_peak(&b[at..at + m]),
+                            tap_peak(&c[at..at + m]),
+                        ]
+                    }
+                    None => {
+                        let [a, b, c] = &mut local;
+                        let t = [&mut a[..m], &mut b[..m], &mut c[..m]];
+                        self.chip.render_taps(&mut out[at..at + m], t);
+                        [tap_peak(&a[..m]), tap_peak(&b[..m]), tap_peak(&c[..m])]
+                    }
+                };
+                let fall = (self.peak_ln_fall * m as f32).exp();
+                for (held, now) in self.peaks.iter_mut().zip(peak) {
+                    *held = (*held * fall).max(now);
+                }
+                done += m;
             }
             self.samples_to_frame -= n as f64;
             i += n;
         }
+        if let Some(p) = &self.probe {
+            p.publish_levels(&self.peaks);
+        }
     }
 
-    /// One frame; then, when it ended the row loop's last row, straight back
-    /// to the loop's start (so `song_row` never reports the row past it).
+    /// One frame; then, when it ended the loop's last row, straight back to the
+    /// loop's start (so `song_row` never reports the row past it).
     fn frame_with_loop(&mut self) {
-        self.frame_core();
-        if let Some((start, end)) = self.loop_rows {
-            if self.row_ended && !self.preview && self.rows_played >= end {
-                let carried = self.samples_to_frame;
-                self.seek_row(start);
-                self.samples_to_frame = carried;
+        self.frame_core(true);
+        if let Some(l) = self.loop_range {
+            let v = l.voice as usize;
+            if !self.preview && self.rows_ended & (1 << v) != 0 {
+                if self.rows[v] >= l.end {
+                    let carried = self.samples_to_frame;
+                    // What the display shows now: a voice that is about to start its row
+                    // at the loop's start keeps showing the loop's last row for this frame,
+                    // rather than the row before the range.
+                    let shown: [(usize, usize, usize, u8); SID_CHANNELS] =
+                        std::array::from_fn(|c| {
+                            let ch = &self.channels[c];
+                            (ch.play_order, ch.play_pattern, ch.play_row, ch.row_tick)
+                        });
+                    match self.rewind.take() {
+                        Some(r) => {
+                            self.restore(&r);
+                            self.rewind = Some(r);
+                        }
+                        None => {
+                            // Not seen the start yet (the loop was set inside or past
+                            // its range): replay to it once.
+                            self.reset_sequencer(self.subsong);
+                            self.replay_until(|p| p.rows[v] >= l.start);
+                            self.loop_boundary();
+                        }
+                    }
+                    for (ch, shown) in self.channels.iter_mut().zip(shown) {
+                        if ch.tick == 1 {
+                            (ch.play_order, ch.play_pattern, ch.play_row, ch.row_tick) = shown;
+                        }
+                    }
+                    self.samples_to_frame = carried;
+                } else {
+                    self.loop_boundary();
+                }
             }
+        }
+        if let Some(p) = &self.probe {
+            p.publish(&self.status(), &self.peaks);
         }
     }
 
@@ -632,17 +1164,25 @@ impl SidSongPlayer {
     /// the writes are applied on return (for a caller that does not render).
     /// `render` uses `frame_core`, whose writes stay spaced (`write_registers`).
     pub fn frame(&mut self) {
-        self.frame_core();
+        self.frame_core(true);
         self.chip.flush_writes();
     }
 
-    fn frame_core(&mut self) {
-        self.row_ended = false;
+    /// One frame of the song. `write`: the registers are written (a replay for a
+    /// seek leaves them alone).
+    fn frame_core(&mut self, write: bool) {
+        self.rows_ended = 0;
         self.filter_step();
         // The preview voice is always channel 1, whichever voice an
         // instrument's filter table routes: it is heard filtered when any is.
+        // (Auditions on other voices are filtered where they play.)
         let res_filt = if self.preview && self.res_filt & 0x07 != 0 {
-            (self.res_filt & 0xF8) | 0x01
+            let voices = if self.audition_seen == 0 {
+                0x01
+            } else {
+                self.audition_seen
+            };
+            (self.res_filt & 0xF8) | voices
         } else {
             self.res_filt
         };
@@ -658,8 +1198,15 @@ impl SidSongPlayer {
             // this very frame, and of earlier ones from their next reload.
             for c in 0..SID_CHANNELS {
                 if self.tick_step(c) {
-                    let row = self.current_row(c);
-                    self.read_row(c, row);
+                    let ch = &mut self.channels[c];
+                    ch.play_order = ch.order;
+                    ch.play_pattern = ch.pattern;
+                    ch.play_row = ch.row;
+                    // A voice an audition holds does not read its row.
+                    if self.audition & (1 << c) == 0 {
+                        let row = self.current_row(c);
+                        self.read_row(c, row);
+                    }
                 }
             }
         }
@@ -675,7 +1222,9 @@ impl SidSongPlayer {
             }
             self.hard_restart(c);
         }
-        self.write_registers();
+        if write {
+            self.write_registers();
+        }
         for ch in self.channels.iter_mut() {
             ch.first_frame = false;
         }
@@ -695,10 +1244,8 @@ impl SidSongPlayer {
             }
             if ch.tick == 1 {
                 self.advance_row(c);
-                if c == self.ref_channel {
-                    self.rows_played += 1;
-                    self.row_ended = true;
-                }
+                self.rows[c] += 1;
+                self.rows_ended |= 1 << c;
             }
         }
     }
@@ -712,6 +1259,11 @@ impl SidSongPlayer {
         let ch = &mut self.channels[c];
         ch.tick = ch.tick.wrapping_sub(1);
         ch.at_row_start = ch.tick == 0;
+        ch.row_tick = if ch.at_row_start {
+            0
+        } else {
+            ch.row_tick.saturating_add(1)
+        };
         if ch.tick >= 0x80 {
             if ch.fixed != 0 {
                 ch.tick = ch.fixed - 1;
@@ -1064,9 +1616,11 @@ impl SidSongPlayer {
         // every row (goattrk2.c:55, gplay.c:728): the vibratos (S5.10) and
         // the slides 1-2 and the portamento 3 (S5.12), so a slide steps
         // tempo - 1 times per row. The preview voice has no rows.
-        let tick0 = self.channels[c].at_row_start && !self.preview;
-        // Not on a row's first frame; and never in preview, which has no rows.
-        let ticking = !self.preview && !self.channels[c].at_row_start;
+        let sequenced = !self.suspended(c);
+        let tick0 = self.channels[c].at_row_start && sequenced;
+        // Not on a row's first frame; and never in preview or an audition, which
+        // have no rows.
+        let ticking = sequenced && !self.channels[c].at_row_start;
         match cmd {
             // The slides wrap the 16-bit register as GT's do (gplay.c:744, 760).
             0x1 if !tick0 => {
@@ -1275,7 +1829,7 @@ impl SidSongPlayer {
         if ch.first_frame {
             return true;
         }
-        if self.preview {
+        if self.suspended(c) {
             return false;
         }
         let timer = self.instrument(c).map(|i| i.gate_timer).unwrap_or(0);
@@ -1391,7 +1945,7 @@ impl SidSongPlayer {
         };
         // GT compares its countdown with the gate timer (gplay.c:898):
         // `timer` frames before the row ends.
-        if timer == 0 || self.preview || self.channels[c].tick != timer {
+        if timer == 0 || self.suspended(c) || self.channels[c].tick != timer {
             return;
         }
         let next = self.next_row(c);

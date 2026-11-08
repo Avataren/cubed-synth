@@ -57,3 +57,7 @@ opt-level = 1
 
 [profile.dev.package.cubed-simd]
 opt-level = 1
+
+# The chip is cycle-counted: unoptimized, a second of song takes seconds to test.
+[profile.dev.package.cubed-sid]
+opt-level = 1

@@ -26,6 +26,23 @@ serde_json.workspace = true
 [lints]
 workspace = true
 
+# The document tests need the edit layer.
+[[test]]
+name = "edit"
+required-features = ["edit"]
+
+[[test]]
+name = "edit_soak"
+required-features = ["edit"]
+
+[[test]]
+name = "ops_oracle"
+required-features = ["edit"]
+
+[[test]]
+name = "controls"
+required-features = ["edit"]
+
 [[bench]]
 name = "sid_render"
 harness = false
