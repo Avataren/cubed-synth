@@ -8,7 +8,7 @@ in a browser AudioWorklet and in a native audio callback.
 | Crate | What it is |
 |---|---|
 | `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, GoatTracker 1 and 2 `.sng` import (`goattracker`, another_synth's importer ported byte for byte), and a register-stream chip player (`stream`) |
-| `cubed-ahx` | AHX / HivelyTracker (`.ahx`, `.hvl`) parser and replayer, bit-exact against `hvl_replay.c`, with a band-limited "hifi" path |
+| `cubed-ahx` | AHX / HivelyTracker (`.ahx`, `.hvl`) parser and replayer, bit-exact against `hvl_replay.c`, with a band-limited "hifi" path. The writer (`write`: `.ahx` and `.hvl`, byte-identical to the DAW's on all 127 fixtures) and `edit::AhxDoc`, which edits a song as data with JSON operations, format limits and undo; the player takes live control (seek, loops, mute and solo, an audition voice, levels, a `AhxProbe`) and live edits |
 | `cubed-opl` | Yamaha OPL2/OPL3 FM chip (a port of ymfm's OPL path) and an Adlib Tracker II (`.a2m`) parser and player |
 | `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. The writers (`write_mod`, `write_s3m`, `write_xm`) and `edit::ModuleDoc`, which edits a module as data with JSON operations, format limits and undo. An `Observer` sees every row and command; a `Probe` shows the position, per-channel levels and scopes of a playing player, which also takes live control (stop and play, seek, loops, mute and solo, note preview) |
 | `cubed-dsp` | The synth engine: audio graph, oscillators (analog, wavetable), envelopes, LFOs, filters, chorus, delay, reverb, convolver, compressor, limiter, EQ, voices, automation and patch loading; a catalogue of its node types, patch documents that are edited as data, and live parameter edits |
@@ -33,8 +33,9 @@ in a browser AudioWorklet and in a native audio callback.
   chip-music and module players as mixer sources.
 - `adlib` (`cubed-tracker`, on by default): S3M AdLib instruments, on a `cubed-opl`
   chip.
-- `edit` (`cubed-tracker`, on by default): `cubed_tracker::edit`, the module edit layer
-  (needs `serde_json`; nothing in a player calls it, so a worklet drops it at link time).
+- `edit` (`cubed-tracker`, `cubed-ahx`, on by default): `cubed_tracker::edit` and `cubed_ahx::edit`, the
+  module and song edit layers (need `serde_json`; nothing in a player calls them, so a worklet drops them
+  at link time).
 
 Every crate builds for `wasm32-unknown-unknown` with its default features and no JS
 glue. There `cubed-dsp` seeds its random number generators from
@@ -386,6 +387,122 @@ S3M drum channels (channel settings 25-29 load as plain channels); the points of
 `vblank_timing` and `amiga_limits` are not in the file (loading derives them from the song, so an edit can make a
 reload differ in those flags; `info().flags` and `set_flag` show and set them); an S3M pan that is not on the
 pan table's 16 steps (or ST3's default left/right) is written as the nearest step.
+
+## Editing and writing AHX / HVL songs (a tracker editor's data layer)
+
+`cubed_ahx::edit::AhxDoc` holds a `format::Song` (AHX `THX` or HivelyTracker `HVL`) and edits it the way the trackers
+do, in the style of `ModuleDoc`: typed methods and one JSON entry point, `apply(&Value) -> Result<Value, String>`.
+Every change is checked against the format's limits and a change that does not fit is refused with a message and
+leaves the song as it was (a failed `batch` leaves none of its operations). `to_bytes()` writes the song,
+`from_bytes` reads one, `AhxDoc::new(format)` / `create(&json)` make an empty one, `song()` borrows the `Song` to play
+(`AhxPlayer::from_song(doc.song().clone(), rate, stereo)`).
+
+**The model.** A song is a list of *positions*; each names, for every channel (AHX 4, HVL 4 to 16), a *track* and a
+*transpose* (-128..127 semitones). A track is `track_length` (1-64) rows of steps; tracks are shared, so two positions
+can play one and editing it edits both (`make_unique`, or `"unique": true` on an edit, gives a cell a track of its
+own). Track 0 is the track every empty cell points at: while it is blank it takes no writes. *Instruments* (1 to 63,
+numbered without gaps) have a volume, wave length, envelope (attack, decay, sustain, release as frames and levels),
+filter sweep limits and speed, square sweep limits and speed, vibrato, hard cut, and a *PList* (up to 255 rows, one
+program of rows that picks pitch, waveform and two commands per tick, with its own speed). Limits: 1000 positions, 256
+tracks, 63 instruments, 255 subsongs and the file's 16-bit string table offset, which caps the whole song at 65,535
+bytes before its names (`info().size`; growth past it is refused, shrinking never is).
+
+Positions, tracks, rows, channels and PList rows count from 0; instruments from 1 (0 is none). Ranges include both
+ends. **A step** is `[note, instrument, fx, param, fxb, fxb_param]`, always six numbers (`fxb`, HVL's second effect
+column, is 0 in AHX, which refuses anything else): `note` 0 none, 1-60 C-1 to B-5 (MIDI is `note + 23`), 61-63 C-6 to
+D-6 (the engine plays them as 60; an HVL step cannot hold 63, that byte marks a blank step in the file); `fx` 0-F,
+`param` 0-255. Operations take `"C-3"`, `"C#2"`, `"---"` as well as numbers (`note_name`, `parse_note`). **A PList row**
+is `[note, waveform, fixed, fx0, param0, fx1, param1]`: waveform 0 (keep) to 4 (triangle, sawtooth, square, noise),
+commands 0-5, C, F in AHX and 0-F in HVL (a version-0 AHX file keeps only the low nibble of command 4's parameter).
+
+Reads: `info()` (format, version, name, channels, counts, speed multiplier, `limits`, `size`, history state),
+`rows(track, row0, count, flat)`, `position_rows(position, row0, count, flat)` (`cells[row][channel]` plus the tracks and
+transposes: what the pattern grid draws), `positions(first, count)`, `tracks()` (usage and blank flags),
+`instruments()` (with how many steps play each), `instrument(n)`, `plist(n, row0, count, flat)`, `validate()`,
+`instrument_bytes(n)` (the wire form `AhxPlayer::replace_instrument` takes). Every JSON edit returns `{"changed":
+{"tracks": [{track, row0, row1}], "positions": {first, last}, "position_list", "layout", "header", "restart",
+"instruments": [n], "plists": [{instrument, row0, row1}], "instrument_list"}}` and its own fields.
+
+**Operations** (`{"op": ..., fields}`; `<track>` is `"track": n` or `"position": p, "channel": c`, optionally with
+`"unique": true`):
+
+| group | ops |
+|---|---|
+| steps | `set_step` (`<track>`, `row`, `cell` or any of `note`, `instrument`, `fx`, `param`, `fxb`, `fxb_param`), `clear_range` (+ `columns`), `insert_row` / `delete_row` (rows pushed off the end are lost), `transpose` (range, `semitones`, `clamp`, `instrument`; a note outside C-1 to B-5 refuses the edit unless `clamp`), `copy_range` -> clip, `paste` (`cells`, `mode` `overwrite` or `mix`; a step the format cannot hold refuses the paste, rows past the end are cut and `clipped` says so) |
+| tracks | `set_track_length` (shortening over steps needs `force`), `alloc_track` (`copy_of`, `append`: reuses an unused blank track unless `append`), `compact_tracks` (drops the unused ones and renumbers) |
+| positions | `assign_track`, `set_transpose`, `make_unique`, `insert_position` (`blank`, `duplicate`, `duplicate_unique`) / `delete_position` / `move_position` (each returns `map`: how old positions moved, and the restart and subsong starts follow), `set_restart`, `set_subsongs` |
+| song | `set_name` (Latin-1: NUL removed, anything above U+00FF becomes `?`), `set_speed_multiplier` (1-4), `set_mix` (HVL: `mixgain`, `defstereo`) |
+| instruments | `add_instrument` (fields over the DAW's default saw note), `set_instrument` (`n` and any fields, the envelope as an object), `copy_instrument` (`from`, `to` or a new one), `clear_instrument`, `rename_instrument` |
+| PList | `set_plist_row`, `insert_plist_row` / `delete_plist_row` / `duplicate_plist_row`, `clear_plist_range`, `copy_plist` / `paste_plist` (rows past the end are appended), `transpose_plist`, and the editor's shortcuts `set_start_waveform` (row 0's waveform is "the instrument's waveform"), `set_start_filter`, `enable_sweep` (PList command 4 on row 0, and the square wave for a square sweep) |
+| history | `begin_group`, `end_group`, `undo`, `redo`, `batch` (one undo step, all or none; a multi-channel selection is a batch of one op per channel) |
+
+**Undo and redo** are an inverse-change log (`edit/history.rs`), as in `ModuleDoc`: before an edit overwrites anything it
+records the change that puts it back (rows of a track, a position's entry, the header, an instrument's fields,
+rows of a PList), so typing a note costs one step, not the song. `begin_group` / `end_group` nest; `undo()` /
+`redo()` return a `Changes` to redraw; the log is bounded by steps (1000) and bytes (128 MiB), the oldest dropped first
+(`set_history_limits`).
+
+**Live edits.** After an edit, `doc.live_edits() -> Option<LiveEdits>` says whether a player that holds the song as it
+was can follow without being reopened, and `doc.apply_live(&mut player, &edits)` does it (call it from a message
+handler: it allocates what it appends):
+
+| what changed | live? | what the player does |
+|---|---|---|
+| a step (typed, cleared, pasted, transposed, rows inserted or deleted) | yes | `AhxPlayer::set_step`: read when the song reaches the row (the row playing now is not retriggered) |
+| a position's track or transpose | yes | `set_position_entry`: refreshed at the next row |
+| the restart position | yes | `set_restart` |
+| an instrument's fields, envelope, sweeps, vibrato, PList | yes | `replace_instrument`: a voice holding it takes the PList rows and the envelope's stage lengths and levels at once, what a trigger copies (volume, wave length, vibrato, hard cut, PList speed, sweep set-up) at its next trigger |
+| a track or an instrument added at the end (a cell given its own track), and their undo | yes | `push_track` / `pop_track`, `push_instrument` / `pop_instrument` (room for 256 tracks and 64 instruments is reserved when the engine is made) |
+| a rename, the song's name | yes, nothing to do | names make no sound |
+| the track length, `compact_tracks`, positions inserted, deleted or moved, the speed multiplier, the HVL mix, the subsong list, or more than 1024 steps at once | no (`None`) | `AhxPlayer::reload_song(doc.song().clone(), place)` swaps the edited song in place and carries the playhead through `PositionMap::apply`; or open a new player |
+
+A test keeps a player level with the document through an edit session (every kind of edit, its undo and redo) and checks
+that after a seek it renders what a fresh player of the edited song renders.
+
+**Writers** (`write::write(&song, base)`, `write_with(&song, &Origin)`, `write_instrument`, `convert_hvl_to_ahx`) are
+the parser read in reverse, and port another_synth's `serializeAhx` and `convertHvlToAhx`. HVL is read and written by
+the same model as AHX (`Song::format`), so `AhxDoc` edits both and `to_bytes()` writes the song's own format;
+`to_ahx_bytes()` converts an HVL song to AHX when it fits (4 tracks, one effect column, notes and instruments up to 63,
+AHX-writable instruments, no `EF1` in a version-1 song) and says why when not. `Origin` holds what the parse forgets
+(the blank-first-track flag, the loader-ignored instrument bits) and is read from the file a song came from
+(`AhxDoc::from_bytes` does it); without one the writer guesses. A parse normalisation is not undone: a restart at or past
+the position count is stored as the last position, an AHX subsong start past the end as 0, a version-0 filter-toggle
+parameter loses its high nibble, an HVL step written out in full but all zero becomes the one-byte blank escape. Names
+are Latin-1 (the parser used `from_utf8_lossy` before, which turned every byte over 0x7f into U+FFFD and read the next
+instrument names from the wrong place).
+
+*Checked* (`tests/ahx_write.rs`, `tests/ahx_edit.rs`): `parse(write(parse(x))) == parse(x)` on all 127 fixtures with and
+without the file, and 124 of 127 come back byte for byte (the rest differ in a trailing byte, a missing final NUL, and a
+version-0 filter nibble); a random-operation soak (every operation kind, grouped and not, refused ones included) on a new
+AHX, a new HVL, `karma.ahx` and an HVL fixture saves and reads back as itself after every step, undoes to the start and
+redoes to the end. Against the DAW's `ahx-writer.ts` (`examples/ahx_write_check` writes a directory; the DAW's writer was
+run over the same files with its own esbuild bundle and `cmp`): all 127 outputs are byte-identical, both with the base
+file and without it, and the conversion refuses the same 22 HVL songs with the same words. `CUBED_AHX_SONGS=<dir>` adds
+your songs to the round-trip tests.
+
+*Not covered*: the DAW's instrument presets (`ahx-presets.ts`; a host adds one with `add_instrument` and its fields);
+removing or swapping instruments (they would renumber every step: clear the slot instead); changing an HVL song's
+channel count; HVL songs wider than 16 channels have no document (the engine never plays past 16; they still parse and
+write); subsongs are a list of start positions only.
+
+## Live control of a playing AHX / HVL song
+
+Everything below is in `cubed-ahx` (`AhxPlayer`, `AhxEngine`); `cubed-mixer` and the worklet do not forward it yet.
+Nothing allocates after the first block of a size (`tests/ahx_control.rs` in `cubed-rt-check` runs every control
+through blocks, with and without hi-fi, and counts).
+
+| Call | What it does |
+|---|---|
+| `play()` / `pause()` / `resume()` | `resume` starts a song that has played to its end from the top. A paused song is silent apart from an audition |
+| `seek(position, row)` | (existing) replays the subsong to there without mixing, now in place: no allocation |
+| `loop_positions(first, last)`, `loop_rows(position, row0, row1)`, `loop_off()`; `set_loop(Loop::{None, Position, Positions, Rows})` | Repeats a position, a run of positions (the last wraps to the first) or rows of one position. It does not move the playhead: seek first. The song plays on until it reaches the loop. A `Bxx` out of the loop wraps to its start, one inside it is kept, `Dxx` keeps its row inside a rows loop, and a looping song never reaches its end. Kept across seeks and rewinds. (The old `set_loop_position(true)`, loop whatever position is playing, is unchanged.) |
+| `set_mute(ch, on)`, `set_solo(ch, on)` (and the existing mask call) | A muted channel keeps running unheard; with any solo only soloed channels are heard |
+| `play_position()`, `play_row()`, `play_tick()`, `rows_started()`, `status() -> AhxStatus` | Where the tick rendered last was (the transport itself has already moved on at a row's last tick). `status`: playing, audition, song end, position, row, tick, speed (ticks per row), speed multiplier, rows started, frames, version |
+| `set_levels(true)`, `levels(&mut [f32])` | Each channel's peak, linear (1.0 full scale), then the audition's: the loudest wave sample the channel could make of its volume, pan and the mix gain at the latest tick (a bound), falling 24 dB a second; a muted channel reads 0 |
+| `audition_on(instrument, midi, velocity, duration_frames) -> bool`, `audition_off()`, `audition_active()`, `audition_plist_row()` | Plays an instrument (1-based) at a MIDI note (24 is C-1, 83 is B-5) on a voice of its own, mixed over the song or alone while it is stopped, whatever is muted. It has its own tick clock, plays through the plain oscillators (hi-fi or not), is centred, runs the envelope, sweeps, vibrato and PList, and ends after its release; `duration_frames` 0 holds it until `audition_off`; a new note cuts the last |
+| `attach_probe(Arc<AhxProbe>)` | `render` publishes the status and levels at the end of every block into atomics (`AhxProbe::status()`, `levels()`, `alive()`), readable from any thread; the position is one packed word so a row, tick and speed always belong together |
+| `set_step`, `set_position_entry`, `set_restart`, `push_track`, `pop_track`, `push_instrument`, `pop_instrument`, `replace_instrument` | The live edits above |
+| `reload_song(song, place)` | The rebuild: a new engine for an edited song, keeping mute and solo, loop, levels, hi-fi and the transport state, put at `place` |
 
 ## Building, testing, benchmarks
 

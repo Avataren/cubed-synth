@@ -7,6 +7,8 @@
 
 #![cfg_attr(feature = "nightly-simd", feature(portable_simd))]
 
+#[cfg(feature = "edit")]
+pub mod edit;
 pub mod engine;
 pub mod envelope;
 pub mod filter_sweep;
