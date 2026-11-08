@@ -948,11 +948,15 @@ impl SidDoc {
     }
 
     /// Moves the start tempo into the song, where a `.sng` can say it: the tempo
-    /// becomes GoatTracker's 6 and row 0 of voice 1's first pattern gets an `F`
-    /// command with the frames per row the song started at (`tempo` times the
-    /// speed multiplier, as the player starts it). Refused when that row already
-    /// has a command or the tempo does not fit an F command (3-127). The song
-    /// plays as it did.
+    /// becomes GoatTracker's 6 and row 0 of voice 1's first pattern of every
+    /// subsong gets an `F` command with the frames per row the song started at
+    /// (`tempo` times the speed multiplier, as the player starts it). A subsong
+    /// whose first row already sets the tempo for every voice (an `F` of 3-7F) keeps
+    /// it; any other command on that row refuses the edit (clear it first, then the
+    /// tempo can go there), as does a tempo that does not fit an F command (3-127).
+    /// The first pass plays as it did; when the orderlists wrap, the command sets the
+    /// tempo again (as GoatTracker plays a song whose tempo is in its first row),
+    /// where the start tempo is set once.
     pub fn bake_tempo(&mut self) -> Res<Changes> {
         let tempo = self.song.tempo;
         if tempo == SNG_TEMPO {
@@ -965,26 +969,41 @@ impl SidDoc {
                 self.song.speed_multiplier
             ));
         }
-        let first = self.song.subsongs[self.subsong].orderlists[0].entries[0].pattern as usize;
-        let row = self.song.patterns[first].rows[0];
-        if row.command != 0 || row.param != 0 {
-            return Err(format!(
-                "row 0 of pattern {first} (voice 1's first) already has the command {:X}{:02X}: clear it first, then the tempo can go there",
-                row.command, row.param
+        let mut firsts: Vec<usize> = self
+            .song
+            .subsongs
+            .iter()
+            .map(|s| s.orderlists[0].entries[0].pattern as usize)
+            .collect();
+        firsts.sort_unstable();
+        firsts.dedup();
+        let mut writes = Vec::new();
+        for p in firsts {
+            let row = self.song.patterns[p].rows[0];
+            if row.command == 0xF && (3..0x80).contains(&row.param) {
+                continue;
+            }
+            if row.command != 0 || row.param != 0 {
+                return Err(format!(
+                    "row 0 of pattern {p} (a voice 1's first) already has the command {:X}{:02X}: clear it first, then the tempo can go there",
+                    row.command, row.param
+                ));
+            }
+            writes.push((
+                p,
+                Row {
+                    command: 0xF,
+                    param: frames as u8,
+                    ..row
+                },
             ));
         }
         let mut h = HeaderState::of(&self.song);
         h.tempo = SNG_TEMPO;
         self.edit(|d| {
-            d.put_rows(
-                first,
-                0,
-                vec![Row {
-                    command: 0xF,
-                    param: frames as u8,
-                    ..row
-                }],
-            );
+            for (p, row) in writes {
+                d.put_rows(p, 0, vec![row]);
+            }
             d.put_header(h);
             Ok(())
         })

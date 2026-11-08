@@ -319,6 +319,28 @@ fn a_loop_repeats_its_moment_exactly() {
     }
     assert!(q.status().song_row >= 16 && q.status().song_row < 32);
     assert!(lo < 32);
+    // The editor's way: loop an orderlist position.
+    let mut r = player(&s);
+    assert!(r.loop_orders(0, 1, 1));
+    assert_eq!(
+        r.loop_range(),
+        Some(SidLoop {
+            voice: 0,
+            start,
+            end
+        })
+    );
+    assert!(!r.loop_orders(0, 5, 5), "no entry 5");
+    assert!(!r.loop_orders(3, 0, 0), "no voice 3");
+    assert_eq!(
+        r.loop_range(),
+        Some(SidLoop {
+            voice: 0,
+            start,
+            end
+        }),
+        "a refused loop changes nothing"
+    );
     // Clearing the loop lets the song play on to its end and round again.
     q.set_loop(None);
     assert!(q.loop_range().is_none());
@@ -756,4 +778,43 @@ fn a_player_kept_in_step_with_a_document_through_random_edits() {
         assert_eq!(unplayed(p.song()), unplayed(d.song()), "step {step}: {op}");
     }
     assert!(live > 50 && rebuilt > 5, "{live} live, {rebuilt} rebuilt");
+}
+
+#[test]
+fn a_baked_tempo_plays_as_the_start_tempo_did() {
+    // tempo 5 at 2x: 10 frames a row from the start; baked, an F command says the same.
+    let mut d = SidDoc::from_song(song()).unwrap();
+    ok(
+        &mut d,
+        json!({"op": "batch", "ops": [
+            {"op": "set_speed_multiplier", "multiplier": 2},
+            {"op": "set_tempo", "tempo": 5},
+            {"op": "set_instrument", "instrument": 1, "gate_timer": 3},
+            {"op": "set_instrument", "instrument": 2, "gate_timer": 3},
+        ]}),
+    );
+    let before = d.song().clone();
+    ok(&mut d, json!({"op": "bake_tempo"}));
+    let after = d.song().clone();
+    assert_eq!(after.tempo, 6);
+    let (mut a, mut b) = (player(&before), player(&after));
+    let mut compared = 0;
+    // The first pass: once a voice wraps, the baked F command sets the tempo again on row 0, as
+    // GoatTracker plays a song whose tempo is in its first row (the start tempo is not set again).
+    for f in 0..400 {
+        a.frame();
+        b.frame();
+        if a.status().looped {
+            break;
+        }
+        compared += 1;
+        let (sa, sb) = (a.status(), b.status());
+        assert_eq!(
+            (sa.row, sa.tick, sa.order),
+            (sb.row, sb.tick, sb.order),
+            "frame {f}"
+        );
+        assert_eq!(regs(&a), regs(&b), "frame {f}");
+    }
+    assert!(compared > 200, "{compared} frames compared");
 }

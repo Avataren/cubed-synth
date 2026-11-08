@@ -445,10 +445,10 @@ pub(crate) struct History {
     pub max_bytes: usize,
 }
 
-/// A default bound on the log: 1000 steps and 64 MiB (a whole song is far
-/// smaller: a step is rarely more than a pattern's 512 bytes).
+/// A default bound on the log, as `cubed_tracker::edit` has it: 1000 steps and
+/// 128 MiB (a song is far smaller: a step is rarely more than a pattern's 512 bytes).
 pub const DEFAULT_MAX_STEPS: usize = 1000;
-pub const DEFAULT_MAX_BYTES: usize = 64 << 20;
+pub const DEFAULT_MAX_BYTES: usize = 128 << 20;
 
 impl History {
     pub fn new() -> History {

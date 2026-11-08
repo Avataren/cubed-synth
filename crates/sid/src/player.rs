@@ -742,6 +742,24 @@ impl SidSongPlayer {
         self.loop_boundary();
     }
 
+    /// Loops orderlist entries `first..=last` of `voice` (all their repeats): the
+    /// editor's "play pattern" for the position the cursor is on. The rows are
+    /// those of the subsong playing (`SidSong::order_rows`). `false` (no loop set)
+    /// when the voice or the entries do not exist.
+    pub fn loop_orders(&mut self, voice: usize, first: usize, last: usize) -> bool {
+        match self.song.order_rows(self.subsong, voice, first, last) {
+            Some((start, end)) if end > start => {
+                self.set_loop(Some(SidLoop {
+                    voice: voice as u8,
+                    start,
+                    end,
+                }));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The loop in force, if any.
     pub fn loop_range(&self) -> Option<SidLoop> {
         self.loop_range
@@ -972,7 +990,8 @@ impl SidSongPlayer {
 
     /// Shares the player's position and peaks with other threads: the probe is
     /// written at every frame and block (atomics, no lock, no allocation) and any
-    /// thread reads it. Make the probe off the audio thread (`SidProbe::new`).
+    /// thread reads it. Make the probe off the audio thread (`SidProbe::new`). (A
+    /// clone of the player shares it.)
     pub fn attach_probe(&mut self, probe: Arc<SidProbe>) {
         probe.publish(&self.status(), &self.peaks);
         self.probe = Some(probe);

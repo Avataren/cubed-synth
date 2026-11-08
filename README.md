@@ -7,7 +7,7 @@ in a browser AudioWorklet and in a native audio callback.
 
 | Crate | What it is |
 |---|---|
-| `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, GoatTracker 1 and 2 `.sng` import (`goattracker`, another_synth's importer ported byte for byte), and a register-stream chip player (`stream`) |
+| `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, GoatTracker 1 and 2 `.sng` import (`goattracker`, another_synth's importer ported byte for byte) and a GTS5 `.sng` writer, `edit::SidDoc` (the song as data: JSON operations, GoatTracker's limits, undo), player controls for an editor (seek by place, loops, mute and solo, instrument audition, position and peaks, live edits), and a register-stream chip player (`stream`) |
 | `cubed-ahx` | AHX / HivelyTracker (`.ahx`, `.hvl`) parser and replayer, bit-exact against `hvl_replay.c`, with a band-limited "hifi" path |
 | `cubed-opl` | Yamaha OPL2/OPL3 FM chip (a port of ymfm's OPL path) and an Adlib Tracker II (`.a2m`) parser and player |
 | `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. The writers (`write_mod`, `write_s3m`, `write_xm`) and `edit::ModuleDoc`, which edits a module as data with JSON operations, format limits and undo. An `Observer` sees every row and command; a `Probe` shows the position, per-channel levels and scopes of a playing player, which also takes live control (stop and play, seek, loops, mute and solo, note preview) |
@@ -33,8 +33,9 @@ in a browser AudioWorklet and in a native audio callback.
   chip-music and module players as mixer sources.
 - `adlib` (`cubed-tracker`, on by default): S3M AdLib instruments, on a `cubed-opl`
   chip.
-- `edit` (`cubed-tracker`, on by default): `cubed_tracker::edit`, the module edit layer
-  (needs `serde_json`; nothing in a player calls it, so a worklet drops it at link time).
+- `edit` (`cubed-tracker`, `cubed-sid`, on by default): `cubed_tracker::edit` and
+  `cubed_sid::edit`, the edit layers (need `serde_json`; nothing in a player calls them,
+  so a worklet drops them at link time).
 
 Every crate builds for `wasm32-unknown-unknown` with its default features and no JS
 glue. There `cubed-dsp` seeds its random number generators from
@@ -387,12 +388,142 @@ S3M drum channels (channel settings 25-29 load as plain channels); the points of
 reload differ in those flags; `info().flags` and `set_flag` show and set them); an S3M pan that is not on the
 pan table's 16 steps (or ST3's default left/right) is written as the nearest step.
 
+## Editing and writing SID songs (a GoatTracker-style editor's data layer)
+
+`cubed_sid::edit::SidDoc` holds a `SidSong` (the DAW's `.asid` document) and edits it in GoatTracker's
+own model, in the style of `ModuleDoc`: typed methods and one JSON entry point, `apply(&Value) ->
+Result<Value, String>`. A song is **three orderlists per subsong over one pool of patterns**: an
+orderlist entry is `(pattern, transpose, repeat)`, the voices run independently, patterns are shared by
+number, and **instruments point into four shared step tables** (wave, pulse, filter, speed). Every change
+is checked against GoatTracker's limits (1-128 rows in a pattern, 208 patterns, 63 instruments, 255 rows
+per table, 254 orderlist entries, 32 subsongs, repeat 1-16, commands 0-F, envelope nibbles 0-15, gate
+timer 0-63) and a change that does not fit is refused with a message and leaves the song as it was (a
+failed `batch` leaves none of its operations). Three voices only: the crate does not play GoatTracker's
+six-channel (dual SID) songs and refuses to read them. `from_bytes` reads a `.asid` or a GoatTracker
+`.sng` (GTS5, GTS!) by its magic (`from_sng` takes the chip and speed a `.sng` cannot say),
+`to_asid_bytes()` and `to_sng_bytes()` write them, `SidDoc::new()` / `with_options` make GoatTracker's new
+song (one subsong, a blank 64-row pattern per voice, instrument 1 a plain pulse), `song()` borrows the
+`SidSong` to play (`SidSongPlayer::new(doc.song().clone(), rate)`).
+
+**Numbers.** Patterns, rows, voices (0-2), subsongs, orderlist entries and **table rows count from 0**;
+instruments count from 1, as a pattern row names them (0 is none). **Table pointers are GoatTracker's, 1-based
+with 0 meaning none** (instruments' `wave_ptr`/`pulse_ptr`/`filter_ptr`/`speed_ptr`, the parameter of commands
+8/9/A and 1-4/E, wave-table commands, `FF xx` jumps): table row 0 is what a pointer calls 1. Ranges include
+both ends. **A pattern row** is `[note, instrument, command, param]`: `note` 0 none, 1-93 C-0 to G#7 (the note
+table index plus one), 126 key off, 127 key on (a MIDI number is `note + 11`, `info().note.midi_offset`;
+operations also take `"C-4"`, `"off"`, `"on"` or `midi`); `command` 0-15 (`info().commands` names them and says
+what the parameter means; operations also take the hex digit as text); `param` 0-255.
+
+Reads: `info()` (texts, chip, speed multiplier, tempo, counts, the note numbering, limits, command names,
+history state), `rows(pattern, row0, count, flat)`, `patterns()` (length and how many entries play each),
+`orderlist(subsong, voice)` / `orderlists(subsong)` (entries, restart and the rows each plays),
+`instruments()` / `instrument(n)` (every field, and `uses`, the rows that name it), `tables()` /
+`table(kind, row0, count)` (the tables belong to the song, not to a subsong), `validate()` (what the writers
+refuse, and warnings for what plays oddly: a command naming a table row past the table, a volume above F),
+`copy_range`. Every JSON edit returns `{"changed": {"patterns": [{pattern, row0, row1}], "layout", "orders":
+[{subsong, voice}], "subsongs", "header", "instruments": [n], "instrument_list", "tables": [{table, row0, row1}],
+"table_layout"}}` and its own fields.
+
+**Operations** (`{"op": ..., fields}`; `subsong` defaults to the one shown, `select_subsong`; `voice` is 0-2
+or `"all"`, and with `"all"` a `pattern` list gives one per voice):
+
+| group | ops |
+|---|---|
+| cells | `set_cell` (`pattern`, `row`, `cell: [n,i,c,p]` or any of `note`, `midi`, `instrument`, `command`, `param`), `clear_range` (+ `columns`: `note`, `instrument`, `command`), `insert_row` / `delete_row` (`row`, `count`; rows shift inside the pattern and fall off the end, or with `grow` / `shrink` the pattern gets longer or shorter), `transpose` (range, `semitones`, `clamp`, `instrument`; a note that would leave C-0..G#7 refuses the edit unless `clamp`), `copy_range` -> clip, `paste` (`cells`, `mode`: `overwrite` or `mix` which fills only what is empty; cut at the pattern's end, `clipped` says so) |
+| patterns | `set_pattern_rows` (1-128; cutting rows that hold data needs `force`), `new_pattern` (appends), `duplicate_pattern`, `delete_pattern` (later patterns shift down and every orderlist entry follows; refused while an orderlist plays it unless `force`, which removes those entries) |
+| orderlists | `set_order` (`index`, any of `pattern`, `transpose` -64..63, `repeat`), `insert_order`, `delete_order`, `move_order` (`from`, `to`), `set_restart` (the entry a voice loops back to: GoatTracker's `RST`); the restart stays on its entry when entries come and go |
+| subsongs | `add_subsong` (a copy of `copy_of`, or a new one with three blank patterns), `remove_subsong`, `select_subsong` (not an edit) |
+| instruments | `set_instrument` (`name`, `attack`, `decay`, `sustain`, `release`, `first_wave`, `gate_timer`, `hard_restart`, `no_gate_off`, `vibrato_delay`, the four pointers), `rename_instrument`, `clear_instrument` (GoatTracker's new instrument, no tables), `add_instrument` (with a plain pulse's wave and pulse rows appended for it, or `tables: false`), `clone_instrument` (appended, or over `to`; its table rows are copied too, jumps inside the copy moved with it, so editing the copy never changes the original), `delete_instrument` (rows naming it refuse the delete unless `clear_uses`; later ones are renumbered in every pattern) |
+| tables | `set_table_row` (`row` = the length appends), `insert_table_row` / `delete_table_row` (every instrument pointer, `FF xx` jump, wave-table command ($F1-F4, $F8-$FA, $FE) and pattern command (8/9/A, 1-4, E) that names a later row follows its data, as GoatTracker's table editor and the DAW's do; a reference to a deleted row names the row that took its place), `clear_table_row`, `remove_unused_table_rows` (rows nothing reaches go, the rest is renumbered) |
+| header | `set_title` / `set_author` / `set_copyright` / `set_texts` (latin-1, 32 characters), `set_model` (`"6581"`, `"8580"`), `set_speed_multiplier` (1-16), `set_tempo` (1-127), `bake_tempo` (below) |
+| history | `begin_group`, `end_group`, `undo`, `redo`, `clear_history`, `batch` (`ops`: one undo step, all or none) |
+
+**Undo and redo** are an inverse-change log (`edit/history.rs`, as `ModuleDoc`'s): before an edit overwrites
+anything it records the change that puts it back (a run of rows, one pattern, one orderlist, one instrument,
+one table, the header), so typing a note stores one row and a table row insert the tables, instruments and
+patterns it moved. Applying a change returns its own inverse, which is how redo comes for free. `begin_group` /
+`end_group` nest; `undo()` / `redo()` return a `Changes` to redraw and do nothing while a group is open. Bounded
+by steps (1000) and bytes (128 MiB); `revision()` counts every change. Choosing the subsong shown is not undone.
+
+**Live edits.** A song that is playing the document takes some edits in place and needs a new player for the
+rest. After an edit, `doc.live_edits() -> Option<Vec<LiveEdit>>` is `Some` when the change was one of these:
+
+| live (give each to `SidSongPlayer::apply_live`) | needs a new player (`None`) |
+|---|---|
+| a pattern row (typing, clear, paste, transpose, insert or delete rows that keep the pattern's length, and their undos), heard when the voice next reads it | a pattern's length (`set_pattern_rows`, `grow`, `shrink`), the pattern count, an orderlist (entries, repeats, transposes, restart), a subsong |
+| an instrument's fields (not its name), heard from the next note that starts (envelope, tables, vibrato) | the instrument list (an instrument added or deleted, which also moves rows) |
+| the content of a table row, heard where the table next reads it | a table's length (rows inserted, deleted, appended, removed) |
+| the chip model (switched in place) | the start tempo or the speed multiplier (read when the player is made) |
+| the texts (nothing is played: `Some(vec![])`) | more than 1024 changed rows |
+
+To rebuild: `SidSongPlayer::new(doc.song().clone(), rate)`, `seek(subsong, voice, order, row)` to the old player's
+`status()` and swap it in (the old voice fades out under it, as with modules). `{"op": "live_edits"}` returns the
+same as `{"edits": [..] | null}`. A test keeps a player in step with a document through 300 random edits this way.
+
+**The `.sng` writer** (`goattracker::export(&SidSong) -> Result<GtExport {bytes, notes}, SongError>`,
+`SidDoc::to_sng_bytes()`; GTS5, a port of the DAW's `gt-sng-write.ts`). A `.sng` is GoatTracker's memory image, so
+nothing is repacked: the tables are written whole (count, left column, right column) and every pointer is written
+as it is; patterns shared by number with a pattern-end row; instruments in number order (25 bytes: AD, SR, the
+four pointers, vibrato delay, gate timer with its two flags, first-frame wave, name); orderlists compiled to
+GoatTracker's byte stream, where a transpose is written when it changes (and at the restart entry, when the end of
+the list would otherwise leave another transpose running into the loop: GoatTracker keeps it), a repeat when above 1,
+then the pattern, the end mark and the restart byte. **What is lost or refused**, relative to the `.asid`: the chip
+model and the speed multiplier have no field (written anyway; `notes` says so: GoatTracker takes them from `-E` and
+`-S`); a start tempo other than 6 is refused (GoatTracker starts every song at 6), and `bake_tempo` moves it into
+an `F` command on row 0 of voice 1's first pattern of every subsong (frames per row = tempo x multiplier, as the player starts it;
+refused if that row has a command or the value does not fit 3-127; the first pass plays as before, and where a voice wraps the command sets the tempo again, as GoatTracker plays it); a transpose beyond -16..+14 is refused (the
+document holds -64..63); an orderlist that needs more than 254 bytes with its repeats and transposes is refused; a
+NUL in a text is refused; a text of the full 32 characters is written with no terminator (`notes`); a song that
+breaks the model is refused first. Nothing else is lost: `import(export(song)) == song` given the two hints.
+
+*Checked* (`tests/sng_write.rs`, `tests/ops_oracle.rs`, `tests/edit.rs`, `tests/edit_soak.rs`): the written bytes
+are **byte-identical to the DAW's writer on every one of its 194 demo and fixture songs** and on the synthetic
+fixtures and `.asid` songs here (`fixtures/goattracker/oracle_write.ts`, `expected_sng.json`;
+`CUBED_SNG_WRITE_ORACLE=<json>` runs a corpus the same way), with the DAW's refusals; `load(write(load(x)))`
+equals `load(x)` on the fixtures and on a corpus (`CUBED_GT_SONGS=<dir>`: 194 songs) and the bytes are pinned by
+hashes; the table and instrument edits (insert/delete rows, clone, delete, new instrument, remove unused rows) save
+the same `.asid` as the DAW's own edits on 24 cases x 194 songs (`oracle_ops.ts`, `ops_cases.json`,
+`CUBED_OPS_ORACLE=<json>`): 4644 byte-identical, and 12 differ for two reasons that are fixes, not gaps: the DAW
+remaps `FF xx` in the *speed* table as if it were a jump (there it is data: a fast slide), and on deleting a row it
+clamps a pattern command that names a row past the table's end to the last row, which would give it a meaning
+it did not have; a random-operation soak (every operation kind, grouped and not, valid and not, on the fixtures, on
+empty songs and, with `CUBED_GT_SONGS`, on every song) checks after every step that the song saves as a `.asid` and
+a `.sng` and loads back equal (or is refused for a reason a `.sng` really has), that a refused operation changed
+nothing, and that undoing everything lands on every state between and redoing lands on the end.
+
+**Playing it, and controlling the player** (`SidSongPlayer`, plain Rust, nothing allocates after
+`SidSongPlayer::new`: `crates/rt-check/tests/sid_controls.rs` counts every audio block of a run that calls each of
+these):
+
+| Call | What it does |
+|---|---|
+| `seek(subsong, voice, order, row) -> Result<(), SeekError>` | Moves to the moment `voice` is about to read `row` of the pattern at orderlist position `order` (its first play): the song is replayed silently from the top, so the tempo, the other voices (they are where the song has them at that moment), the tables and the filter are right; the chip keeps running, so sounding notes carry on until a row retriggers them. About 0.02 us a frame replayed (a 5-minute song's end in 0.4 ms, release); `SEEK_MAX_FRAMES` bounds it. A place that does not exist, or is too far, moves nothing. `seek_row(song_row)` is the same by song row; both keep loops, masks and auditions |
+| `set_loop(SidLoop {voice, start, end})`, `loop_orders(voice, first, last)`, `set_loop_rows`, `set_loop(None)` | Repeats a range of one voice's rows (`SidSong::order_rows` gives the rows of orderlist entries): at `end` every voice goes back to where it was when `voice` reached `start`, from a copy of the sequencer taken when the player first passes `start`, so a repeat is free and exact, tempo and tables included. A loop set inside or past its range replays to its start once. It does not move the playhead: seek first |
+| `set_mute_solo(mute, solo)` | Masks of the three voices, a bit each; with any solo only soloed voices are heard (a voice both soloed and muted is not); muted voices read 0 in the taps and peaks; the song keeps playing all three |
+| `audition_on(voice, instrument, note)` / `audition_off(voice)`, `set_preview(bool)` | Plays instrument `instrument` (1-based) at note table index `note` (0 = C-0 .. 92 = G#7) on a voice, as a song note: envelope, first-frame wave and its wave, pulse, filter and speed tables running, vibrato after its delay, then released by `audition_off`. In preview mode the sequencer is off and any voices can be auditioned at once (a chord): no song needed. Over a playing song the voice is taken (its rows are not read, its counter runs on) until `audition_off` |
+| `status() -> SidStatus` | Per voice the orderlist position, pattern, row and tick (frames played of the row, 0 on its first) of the row it started last; the tempo (frames per row of the reference voice), `song_row` / `song_rows` (counted for the reference voice, `ref_voice()`), subsong, loop / preview / audition / mute / solo, frames played |
+| `peaks() -> [f32; 3]` | Per voice the loudest recent sample of its own signal (the tap: after its gain, before the filter), falling 24 dB a second after it; the mix's scale (`chip().tap_full_scale()` is a full voice's) |
+| `attach_probe(Arc<SidProbe>)` | Shares the status and peaks with other threads: `SidProbe::new()` (off the audio thread), then `probe.status()` and `probe.levels()` from anywhere; atomics, no lock; a sequence counter keeps a frame's three voices together; `status().version` changes whenever anything shown moved |
+| `apply_live(&LiveEdit) -> bool` | One live edit (above) in place; `false` when the place does not exist or the change is not valid for the song |
+
+`render_taps` hands the voices' taps to the caller (the channel scopes): the player always renders with taps,
+which costs nothing measurable (47.9 against 47.8 us a block). The mixer and the worklet do not call these yet:
+`SidSongSource` in `cubed-mixer` owns a player and can pass them on (as `ModuleSong` does for modules).
+
+*Not covered*: dual SID (six orderlists per subsong); GoatTracker 1 (`GTS!`) is read but not written; the
+`.sng` of a song with a start tempo other than 6 (refused, `bake_tempo`); the DAW's flat "song-wide pattern"
+view of a GoatTracker song (`flat.ts`, a UI projection that the DAW compiles back to orderlists): this layer is
+GoatTracker's own orderlists, which a Lua editor can show per voice; PSID/C64 playback (a later agent's).
+
 ## Building, testing, benchmarks
 
 ```sh
 cargo test --workspace
 cargo test -p cubed-dsp --no-default-features --features wasm   # another_synth's configuration
 cargo bench -p cubed-sid --bench sid_render
+cargo test -p cubed-sid --test edit_soak            # CUBED_GT_SONGS=<dir> soaks a corpus too
+cargo test -p cubed-sid --test sng_write            # CUBED_SNG_WRITE_ORACLE=<json>, CUBED_GT_SONGS=<dir>
+cargo test -p cubed-rt-check --test sid_controls    # the controls allocate nothing
 cargo bench -p cubed-opl --bench opl_render
 cargo bench -p cubed-ahx --bench ahx_render
 cargo bench -p cubed-dsp --bench patch_render

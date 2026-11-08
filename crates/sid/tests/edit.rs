@@ -1445,6 +1445,37 @@ fn the_header_edits_and_a_tempo_moves_into_the_song_for_a_sng() {
     let mut d = doc();
     let r = ok(&mut d, json!({"op": "bake_tempo"}));
     assert_eq!(r["changed"], json!({}));
+    // Every subsong starts at the song's tempo: each gets the command (a shared first pattern once);
+    // one that sets its own tempo on its first row keeps it.
+    let mut d = doc();
+    ok(
+        &mut d,
+        json!({"op": "batch", "ops": [
+            {"op": "add_subsong", "copy_of": 0},
+            {"op": "add_subsong"},
+            {"op": "add_subsong"},
+            {"op": "set_cell", "pattern": 6, "row": 0, "command": 15, "param": 9},
+            {"op": "set_tempo", "tempo": 4},
+        ]}),
+    );
+    ok(&mut d, json!({"op": "bake_tempo"}));
+    let first = |p: usize| {
+        (
+            d.song().patterns[p].rows[0].command,
+            d.song().patterns[p].rows[0].param,
+        )
+    };
+    assert_eq!(first(0), (0xF, 4), "subsongs 0 and 1 share pattern 0");
+    assert_eq!(first(3), (0xF, 4));
+    assert_eq!(first(6), (0xF, 9), "an F of its own stays");
+    d.to_sng_bytes().unwrap();
+    d.undo().unwrap();
+    assert_eq!(d.song().tempo, 4);
+    ok(
+        &mut d,
+        json!({"op": "set_cell", "pattern": 3, "row": 0, "command": 7, "param": 1}),
+    );
+    assert!(refused(&mut d, json!({"op": "bake_tempo"})).contains("row 0 of pattern 3"));
 }
 
 #[test]
