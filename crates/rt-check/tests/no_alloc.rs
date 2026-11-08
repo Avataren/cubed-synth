@@ -502,6 +502,108 @@ fn mixer_taps() {
     });
 }
 
+/// A rebuilt synth swapped in for a playing one through the worklet's exports:
+/// each render quantum's warm-up slice, the events copied to the warming synth
+/// and the swap itself (a crossfade, notes arriving) allocate nothing; the
+/// begin (which builds the synth and its event log) is outside the count, as it
+/// is in the message handler.
+#[test]
+fn worklet_swap() {
+    use cubed_dsp::patch_edit::PatchDoc;
+    use cubed_worklet as w;
+    use serde_json::json;
+    let _ = trace_allocations;
+    let mut doc = PatchDoc::new("swap");
+    let env = doc
+        .nodes()
+        .into_iter()
+        .find(|n| n.type_name == "envelope")
+        .unwrap()
+        .id;
+    doc.set_param(&env, "decay", &json!(0.4)).unwrap();
+    let patch = doc.to_json().into_bytes();
+    let put = |bytes: &[u8], at: *mut u8| {
+        // SAFETY: the export just made room for the bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len()) }
+    };
+    let send = |command: Command| {
+        let mut bytes = Vec::new();
+        assert!(cubed_mixer::wire::encode(&command, &mut bytes));
+        put(&bytes, w::cw_inbox(bytes.len() as u32));
+        assert_eq!(w::cw_apply(bytes.len() as u32), 1);
+    };
+    w::cw_init(RATE as f32, 0, 0, 0, 1, 2);
+    send(Command::SetBus(BusId(1), BusSettings::default()));
+    put(&patch, w::cw_file_buffer(patch.len() as u32));
+    assert_eq!(w::cw_prepare_synth(0, 0), 1);
+    send(Command::PlaySource(PlaySource::new(
+        VoiceId(1),
+        SourceId(0),
+        BusId(1),
+    )));
+    let note = |voice: u64, note: u8| Command::SourceEvent {
+        voice: VoiceId(voice),
+        event: SourceEvent::NoteOn {
+            note,
+            velocity: 0.9,
+            duration: 0,
+        },
+    };
+    send(note(1, 57));
+    for _ in 0..WARMUP_BLOCKS {
+        w::cw_warm_step(128);
+        w::cw_process(128);
+    }
+
+    put(&patch, w::cw_file_buffer(patch.len() as u32));
+    let mut play = Vec::new();
+    cubed_mixer::wire::encode(
+        &Command::PlaySource(PlaySource::new(VoiceId(2), SourceId(1), BusId(1))),
+        &mut play,
+    );
+    put(&play, w::cw_swap_play_buffer(play.len() as u32));
+    let held = w::cw_held_buffer(1);
+    // SAFETY: room for two floats.
+    unsafe { std::slice::from_raw_parts_mut(held, 2) }.copy_from_slice(&[57.0, 0.9]);
+    assert_eq!(w::cw_swap_begin(1, 0, 1.0, 1_200, 2_000, 6, 1), 1);
+
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    let mut done = false;
+    let mut bytes = Vec::with_capacity(64);
+    for q in 0..2_000 {
+        // Notes and edits keep arriving for the old voice (the command encoding
+        // is the page's, outside the audio thread: made before counting).
+        bytes.clear();
+        if q % 40 == 0 {
+            cubed_mixer::wire::encode(&note(1, 50 + (q / 40 % 12) as u8), &mut bytes);
+            put(&bytes, w::cw_inbox(bytes.len() as u32));
+        }
+        let n = bytes.len() as u32;
+        let events = allocations_during(|| {
+            if n > 0 {
+                w::cw_apply(n);
+            }
+            if w::cw_warm_step(128) == 2 {
+                done = true;
+            }
+            w::cw_process(128);
+        });
+        assert_eq!(events, 0, "quantum {q}: {events} allocations or frees");
+        if done && q > 0 {
+            // A few more after the swap, through the crossfade.
+            for _ in 0..40 {
+                let events = allocations_during(|| {
+                    w::cw_warm_step(128);
+                    w::cw_process(128);
+                });
+                assert_eq!(events, 0);
+            }
+            break;
+        }
+    }
+    assert!(done, "the swap finished");
+}
+
 /// Songs through the mixer, counted from their first block (the songs are
 /// built and warmed up off the audio thread): two at a time crossfading on
 /// a music bus that ducks under effects, through every built-in effect with

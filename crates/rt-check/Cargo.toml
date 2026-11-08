@@ -16,6 +16,7 @@ cubed-mixer = { path = "../mixer", features = ["songs", "native"] }
 cubed-opl = { path = "../opl" }
 cubed-sid = { path = "../sid" }
 cubed-tracker = { path = "../tracker" }
+cubed-worklet = { path = "../worklet" }
 serde_json.workspace = true
 
 [lints]

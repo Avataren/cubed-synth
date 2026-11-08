@@ -85,12 +85,35 @@ is the patch (parameter 0 the instrument gain, 1 to 4 the macros).
 **Structural changes** (a node or a connection added or removed, an effect moved) build a new
 synth from the edited document where allocating is allowed, and swap it in:
 `SynthSource::from_patch_with(json, rate, &SynthBuild { held, warm_blocks, one_shot })` starts
-the notes the old synth holds and renders a few blocks so their envelopes are past the attack,
-`PrepareSource` puts it in a slot, and `swap_commands(old, PlaySource, fade_frames)` gives the
-batch `PlaySource` (gain 0), `FadeVoice` and `Stop(old)`; 1,500 to 2,500 frames hide it. The crossfade
-is linear, so two voices playing one note in different phases thin out for a moment. On the web
-the build runs in the worklet's message handler, on the audio thread (about 6 ms, more with warm-up
-blocks): do it with a short fade and few warm-up blocks.
+the notes the old synth holds and renders `warm_blocks` blocks of 128 frames so their envelopes
+are as far along as the old ones (a bass that decayed a second ago must not attack again; the
+effects are skipped for all but the last `EFFECT_TAIL_BLOCKS`, which makes a long warm-up about
+twice as fast), `PrepareSource` puts it in a slot, and `swap_commands(old, PlaySource,
+fade_frames)` gives the batch `PlaySource` (gain 0), `FadeVoice` and `Stop(old)`; 1,500 to 2,500
+frames hide it. The crossfade is linear, so two voices playing one note in different phases thin
+out for a moment. Natively build and warm up on a thread. In a worklet the render callback is the
+only thread, so the swap is sliced (below).
+
+**Swapping in a worklet without a stall.** Send `{type: 'swap', source, bytes, play, oldVoice,
+fadeFrames, held: [[note, velocity], ...], warmBlocks, sliceBlocks}`: `bytes` is the edited
+patch JSON, `play` the wire-encoded `PlaySource` of the voice that takes over (its voice id, the
+slot `source`, bus, gain, pan: `wire::encode` it), `oldVoice` the voice to replace (a number), `held` the
+notes the old synth holds and `warmBlocks` how long they have been held, in blocks of 128 frames
+(10 s is 3,750; the page can cap it where the patch has settled). The worklet builds the synth at
+once (one build, a few milliseconds, in the message handler) and answers `{type: 'swap', phase:
+'started'}` (or `'failed'` with `error`, e.g. the old voice is not playing). Then, each render
+quantum, before rendering it, it warms the new synth `sliceBlocks` blocks (default 4, at most 32)
+while the old voice plays on; the new synth renders faster than real time, so it catches up with
+the clock in about `warmBlocks / (sliceBlocks - 1)` quanta (4 blocks a quantum: 10 s of notes in
+3.3 s). Heavy patches want a small slice: there is no clock in a worklet to measure the load.
+When it has caught up it takes over, in one batch at a block boundary (`swap_commands`), and the
+page gets `{type: 'swap', phase: 'done', old, new, frame}`. In the meantime the page keeps
+sending notes and edits for the old voice as usual: the worklet copies them to the warming
+synth at the moment they would sound there, and after the swap commands that name the old id
+(events, `Stop`, gain, ...) are rewritten to reach the new voice, so the page may keep using
+the old id or switch to `new`. A newer `'swap'` replaces a pending one; `Stop` of the old voice,
+or the old voice ending, gives it up (`{phase: 'cancelled'}` if the voice ended). Natively the
+same pieces are `SynthSource::from_patch_with` and `swap_commands`.
 
 **Wire and worklet.** New: command tag 29, `SOURCE_PARAM` (voice `u64`, node `u128`, param `u16`,
 value `f32`, little endian); tag 24 (`SOURCE_EVENT`, notes) is unchanged, so older senders keep
@@ -98,7 +121,10 @@ working. `cw_held_buffer(count)` gives room for held notes (a note number and a 
 floats each) and `cw_prepare_synth_held(source, one_shot, warm_blocks, held_count)` builds the
 synth with them (`cw_prepare_synth` is unchanged). The processor's `'synth'` message takes
 `held: [[note, velocity], ...]` and `warmBlocks` (at most 32 are used). Parameter edits and the
-swap's `PlaySource`, `FadeVoice` and `Stop` are ordinary `'commands'`.
+native swap's `PlaySource`, `FadeVoice` and `Stop` are ordinary `'commands'`. For the sliced swap:
+`cw_swap_play_buffer`, `cw_swap_begin(source, one_shot, old_voice: f64, fade_frames, warm_blocks,
+slice_blocks, held_count)`, `cw_warm_step(frames)` (call it ahead of `cw_process` each quantum:
+0 idle, 1 warming, 2 took over, 3 given up), `cw_swap_old`, `cw_swap_new`, `cw_swap_pending`.
 
 ## Analysis: taps, spectrum, levels
 

@@ -198,6 +198,7 @@ dependencies = [
  "cubed-opl",
  "cubed-sid",
  "cubed-tracker",
+ "cubed-worklet",
  "serde_json",
 ]
 
@@ -226,6 +227,7 @@ version = "0.1.0"
 dependencies = [
  "cubed-dsp",
  "cubed-mixer",
+ "serde_json",
 ]
 
 [[package]]

@@ -38,6 +38,9 @@ struct VoiceState {
     release_in: Option<u64>,
 }
 
+/// Blocks at the end of a warm-up that run the effects (about 1.6 s at 48 kHz).
+pub const EFFECT_TAIL_BLOCKS: u32 = 600;
+
 /// A note that is held, to carry over to a rebuilt synth.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HeldNote {
@@ -100,13 +103,31 @@ impl SynthSource {
         for held in &build.held {
             source.note_on(held.note, held.velocity, 0);
         }
-        // The first block sizes the engine's buffers and plans its graphs; the
-        // warm-up blocks go on from there.
-        for _ in 0..build.warm_blocks.max(1) {
-            source.render_block();
-        }
+        // The first block (effects and all) sizes the engine's buffers and plans
+        // its graphs; the warm-up blocks go on from there.
+        source.render_block();
+        let rest = build.warm_blocks.saturating_sub(1);
+        source.advance(rest, EFFECT_TAIL_BLOCKS);
         source.read = ENGINE_BLOCK;
         Ok(source)
+    }
+
+    /// Renders `blocks` engine blocks (128 frames each) and throws them away, so
+    /// the synth is that much further into the notes it holds, and any
+    /// envelope or LFO has got there. The effects are skipped except for the
+    /// last `effect_tail` blocks (their tails matter, their history does not),
+    /// which makes a long warm-up about twice as fast.
+    pub fn advance(&mut self, blocks: u32, effect_tail: u32) {
+        let bypassed = blocks.saturating_sub(effect_tail);
+        self.engine.set_effects_bypassed(true);
+        for _ in 0..bypassed {
+            self.render_block();
+        }
+        self.engine.set_effects_bypassed(false);
+        for _ in bypassed..blocks {
+            self.render_block();
+        }
+        self.read = ENGINE_BLOCK;
     }
 
     /// An engine already set up (by code, or from a patch). Build it off the

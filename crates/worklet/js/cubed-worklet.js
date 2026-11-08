@@ -24,11 +24,27 @@
 //    block's render time, here on the audio thread: at most 32 are used), then
 //    send one 'commands' batch with PlaySource (gain 0), FadeVoice and Stop for
 //    the old voice. Parameter edits are SourceEvent commands too (wire tag 29).
+//   {type: 'swap', source, bytes (patch JSON), play: ArrayBuffer (the wire-encoded
+//    PlaySource command of the voice that takes over: its voice id, `source`, bus,
+//    gain, pan), oldVoice (the voice to replace), fadeFrames, held: [[note, velocity],
+//    ...], warmBlocks, sliceBlocks?}  swaps a rebuilt synth in for a playing one
+//    without stalling the render: the synth is built now, warmed up `sliceBlocks`
+//    (default 4, at most 32) blocks of 128 frames per render quantum while the old
+//    voice plays on, and takes over with a crossfade when it has caught up with the
+//    clock, as if its notes had been held `warmBlocks` blocks longer than the old
+//    synth's were when this message came. Commands for the old voice keep working
+//    meanwhile (a pending swap hears its events) and, afterwards, reach the new voice
+//    under the old id. A newer 'swap' replaces a pending one; stopping the old voice
+//    gives it up.
 // To the page:
 //   {type: 'ready'}
 //   {type: 'song', source, ok, error?}  after each 'song' or 'synth' message
 //   {type: 'telemetry', frame, voices, rejected, badBatches,
 //    events: ArrayBuffer (wire events), meters: Float32Array (5 per bus)}
+//   {type: 'swap', phase: 'started' | 'failed' | 'done' | 'cancelled', error?, old?,
+//    new?, frame?}  'started' (the synth is built, warming begins) or 'failed' answers
+//    a 'swap' message at once; 'done' (with the voices) comes when the new voice took
+//    over, 'cancelled' if the old voice ended first
 //   {type: 'taps', frame, frames: 2048, buses: Uint32Array, written: Float64Array,
 //    data: Float32Array}  about 40 times a second (init's `tapHz`) while a tap is
 //    on: for each bus in `buses`, its latest `frames` frames, left then right,
@@ -49,6 +65,7 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
     this.pending = [];
     this.blocks = 0;
     this.tapsOn = false;
+    this.warming = false;
     this.tapEvery = 1;
     this.port.onmessage = (event) => this.receive(event.data);
   }
@@ -152,6 +169,35 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
           reply.error = String.fromCharCode(...why);
         }
         this.port.postMessage(reply);
+      } else if (message.type === 'swap') {
+        const patch = new Uint8Array(message.bytes);
+        new Uint8Array(x.memory.buffer, x.cw_file_buffer(patch.length), patch.length).set(patch);
+        const play = new Uint8Array(message.play);
+        new Uint8Array(x.memory.buffer, x.cw_swap_play_buffer(play.length), play.length).set(play);
+        const held = message.held ?? [];
+        const room = x.cw_held_buffer(held.length);
+        const view = new Float32Array(x.memory.buffer, room, held.length * 2);
+        held.forEach(([note, velocity], i) => {
+          view[i * 2] = note;
+          view[i * 2 + 1] = velocity;
+        });
+        const ok = x.cw_swap_begin(
+          message.source >>> 0,
+          message.oneShot ? 1 : 0,
+          message.oldVoice,
+          message.fadeFrames >>> 0,
+          message.warmBlocks >>> 0,
+          message.sliceBlocks >>> 0,
+          held.length,
+        ) === 1;
+        // A refused swap leaves one that is pending where it was.
+        this.warming = x.cw_swap_pending() === 1;
+        const reply = { type: 'swap', phase: ok ? 'started' : 'failed' };
+        if (!ok) {
+          const why = new Uint8Array(x.memory.buffer, x.cw_error(), x.cw_error_len());
+          reply.error = String.fromCharCode(...why);
+        }
+        this.port.postMessage(reply);
       } else if (message.type === 'tap') {
         const ok = x.cw_set_tap(message.bus >>> 0, message.enable ? 1 : 0) === 1;
         this.tapsOn = x.cw_tap_count() > 0;
@@ -174,6 +220,7 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
     const out = outputs[0];
     if (!x || !out || out.length === 0) return true;
     const frames = out[0].length;
+    if (this.warming) this.warm(x, frames);
     x.cw_process(frames);
     const memory = x.memory.buffer;
     out[0].set(new Float32Array(memory, x.cw_left(), frames));
@@ -200,6 +247,19 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
     }
     if (this.tapsOn && this.blocks % this.tapEvery === 0) this.postTaps(x);
     return true;
+  }
+
+  // A pending swap's slice of warm-up, ahead of the quantum; tells the page how
+  // it ended.
+  warm(x, frames) {
+    const step = x.cw_warm_step(frames);
+    if (step === 1) return;
+    this.warming = false;
+    if (step === 2) {
+      this.port.postMessage({ type: 'swap', phase: 'done', old: x.cw_swap_old(), new: x.cw_swap_new(), frame: x.cw_frame() });
+    } else {
+      this.port.postMessage({ type: 'swap', phase: 'cancelled' });
+    }
   }
 
   postTaps(x) {

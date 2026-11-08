@@ -22,5 +22,8 @@ songs = ["cubed-mixer/songs"]
 cubed-mixer = { path = "../mixer" }
 cubed-dsp = { path = "../dsp" }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

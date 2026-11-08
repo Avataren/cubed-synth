@@ -81,6 +81,9 @@ pub struct AudioEngine {
     instrument_gain: f32,
     /// Edits in flight and the typed state they act on (see `live`).
     live: live::Live,
+    /// The effect chain is skipped (a synth being warmed up has no use for it
+    /// until its tails matter).
+    effects_bypassed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +192,7 @@ impl AudioEngine {
             macro_values: [0.0; MACRO_COUNT],
             instrument_gain: 1.0,
             live: live::Live::new(),
+            effects_bypassed: false,
         };
         engine.init(sample_rate, initial_voice_count);
         engine
@@ -743,6 +747,13 @@ impl AudioEngine {
     /// The patch ids of the effects in the stack, in processing order.
     pub fn effect_ids(&self) -> &[usize] {
         &self.effect_ids
+    }
+
+    /// Skips the effect chain (`true`) or runs it again. For rendering that is
+    /// thrown away, such as warming a synth up: the effects' state does not
+    /// follow while they are skipped, so run them for the last seconds.
+    pub fn set_effects_bypassed(&mut self, bypassed: bool) {
+        self.effects_bypassed = bypassed;
     }
 
     /// The effects in the stack by type name (`chorus`, `delay`, ...), in the
@@ -1437,12 +1448,17 @@ impl AudioEngine {
         }
 
         // Process effects with full block_size buffers
-        self.effect_stack.process_audio(
-            &self.mix_left,
-            &self.mix_right,
-            &mut self.effect_left,
-            &mut self.effect_right,
-        );
+        if self.effects_bypassed {
+            self.effect_left.copy_from_slice(&self.mix_left);
+            self.effect_right.copy_from_slice(&self.mix_right);
+        } else {
+            self.effect_stack.process_audio(
+                &self.mix_left,
+                &self.mix_right,
+                &mut self.effect_left,
+                &mut self.effect_right,
+            );
+        }
 
         // Apply master gain
         if master_gain != 1.0 {

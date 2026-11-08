@@ -33,10 +33,12 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
+mod swap;
+
 use cubed_mixer::effects::MAX_PARAMS;
 use cubed_mixer::{
     wire, BusId, Clip, ClipId, Command, Effect, EffectKind, HeldNote, Mixer, MixerConfig, Returned,
-    SynthBuild, SynthSource, TapSet, TAP_FRAMES,
+    SynthBuild, SynthSource, TapSet, VoiceId, TAP_FRAMES,
 };
 
 /// The Web Audio render quantum.
@@ -77,6 +79,11 @@ struct State {
     tap_buses: Vec<u32>,
     tap_written: Vec<f64>,
     tap_data: Vec<f32>,
+    /// A swap's PlaySource command on its way to `cw_swap_begin`.
+    swap_play: Vec<u8>,
+    swaps: swap::Swaps,
+    /// The voices of the last swap that finished, for `cw_swap_old`/`_new`.
+    swapped: (f64, f64),
 }
 
 struct Global(UnsafeCell<Option<State>>);
@@ -135,6 +142,9 @@ pub extern "C" fn cw_init(
         tap_buses: Vec::with_capacity(buses),
         tap_written: Vec::with_capacity(buses),
         tap_data: Vec::new(),
+        swap_play: Vec::new(),
+        swaps: swap::Swaps::new(),
+        swapped: (0.0, 0.0),
     };
     // SAFETY: see `state`.
     unsafe { *STATE.0.get() = Some(state) };
@@ -208,6 +218,7 @@ pub extern "C" fn cw_apply(len: u32) -> u32 {
         inbox,
         released,
         bad_batches,
+        swaps,
         ..
     } = state();
     released.clear();
@@ -215,7 +226,10 @@ pub extern "C" fn cw_apply(len: u32) -> u32 {
     let len = (len as usize).min(inbox.len());
     for command in wire::decode(&inbox[..len]) {
         match command {
-            Ok(command) => {
+            Ok(mut command) => {
+                // Commands for a voice that was swapped reach its replacement,
+                // and a swap that is warming up hears its old voice's events.
+                swaps.route(&mut command);
                 mixer.apply(command);
                 applied += 1;
             }
@@ -413,6 +427,134 @@ fn prepare_synth(source: u32, one_shot: u32, warm_blocks: u32, held_count: u32) 
             0
         }
     }
+}
+
+/// Room for the `PlaySource` command (wire bytes, as `cubed_mixer::wire`
+/// encodes it) of the voice that will take over, for `cw_swap_begin`.
+#[no_mangle]
+pub extern "C" fn cw_swap_play_buffer(len: u32) -> *mut u8 {
+    let play = &mut state().swap_play;
+    play.resize(len as usize, 0);
+    play.as_mut_ptr()
+}
+
+/// Starts swapping a rebuilt synth in for voice `old_voice` without stalling
+/// the render callback. The patch is at `cw_file_buffer`, the `PlaySource` of
+/// the new voice (its bus, gain, pan; its source slot is `source`) at
+/// `cw_swap_play_buffer`, the notes the old synth holds in `cw_held_buffer`
+/// (`held_count` of them). The synth is built now, in the message handler (one
+/// build, a few milliseconds), and then warmed up `slice_blocks` blocks (0 for 4,
+/// at most 32) per render quantum, while the old voice goes on playing, until it
+/// is `warm_blocks` blocks (of 128 frames) further into its notes than the old
+/// synth was when this was called plus the time since: when the held notes are
+/// `warm_blocks` old, it sounds as if they had been held that long. Then it takes
+/// over with a crossfade of `fade_frames`. Returns 1 if the swap is pending; on
+/// failure 0, with the reason at `cw_error`. A swap already pending is dropped.
+/// `cw_warm_step` does the rest.
+#[no_mangle]
+pub extern "C" fn cw_swap_begin(
+    source: u32,
+    one_shot: u32,
+    old_voice: f64,
+    fade_frames: u32,
+    warm_blocks: u32,
+    slice_blocks: u32,
+    held_count: u32,
+) -> u32 {
+    let s = state();
+    s.released.clear();
+    s.error.clear();
+    let fail = |s: &mut State, why: &str| {
+        s.error
+            .extend(why.bytes().map(|c| if c.is_ascii() { c } else { b'?' }));
+        0
+    };
+    let old = VoiceId(old_voice as u64);
+    if !s.mixer.is_playing(old) {
+        return fail(s, "the voice to replace is not playing");
+    }
+    let decoded = wire::decode(&s.swap_play).next();
+    let play = match decoded {
+        Some(Ok(Command::PlaySource(play))) => play,
+        _ => return fail(s, "the swap needs a PlaySource command"),
+    };
+    let held: Vec<HeldNote> = s
+        .held
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .take(held_count as usize)
+        .map(|pair| HeldNote {
+            note: pair[0].clamp(0.0, 127.0) as u8,
+            velocity: pair[1].clamp(0.0, 1.0),
+        })
+        .collect();
+    let build = SynthBuild {
+        one_shot: one_shot != 0,
+        held,
+        warm_blocks: 1,
+    };
+    let built = std::str::from_utf8(&s.file)
+        .map_err(|e| format!("the patch is not UTF-8: {e}"))
+        .and_then(|json| SynthSource::from_patch_with(json, s.mixer.config().sample_rate, &build));
+    match built {
+        Ok(synth) => {
+            s.swaps.begin(
+                synth,
+                cubed_mixer::SourceId(source),
+                old,
+                play,
+                fade_frames,
+                warm_blocks as u64,
+                slice_blocks,
+            );
+            1
+        }
+        Err(why) => fail(s, &why),
+    }
+}
+
+/// Warms the pending swap's synth a slice, before the render quantum of `frames`
+/// frames is rendered (call it from `process`, ahead of `cw_process`). Returns
+/// 0 if no swap is pending, 1 while one is warming up, 2 the moment the new
+/// voice took over (`cw_swap_old` and `cw_swap_new` say which voices), 3 if the
+/// swap was given up because the old voice ended or was stopped. It allocates
+/// nothing.
+#[no_mangle]
+pub extern "C" fn cw_warm_step(frames: u32) -> u32 {
+    let State {
+        mixer,
+        swaps,
+        swapped,
+        ..
+    } = state();
+    match swaps.step(mixer, frames as usize) {
+        swap::Step::Idle => 0,
+        swap::Step::Warming => 1,
+        swap::Step::Done { old, new } => {
+            *swapped = (old.0 as f64, new.0 as f64);
+            2
+        }
+        swap::Step::Cancelled => 3,
+    }
+}
+
+/// 1 while a swap is warming up.
+#[no_mangle]
+pub extern "C" fn cw_swap_pending() -> u32 {
+    state().swaps.pending() as u32
+}
+
+/// The voice the last finished swap replaced.
+#[no_mangle]
+pub extern "C" fn cw_swap_old() -> f64 {
+    state().swapped.0
+}
+
+/// The voice that took over in the last finished swap.
+#[no_mangle]
+pub extern "C" fn cw_swap_new() -> f64 {
+    state().swapped.1
 }
 
 /// The reason the last `cw_prepare_song` failed (`cw_error_len` bytes).
@@ -666,7 +808,280 @@ mod tests {
         assert_eq!(cw_apply(bytes.len() as u32), 1);
     }
 
-    /// A song file through the exports, on a bus with a built effect.
+    /// A bass-like patch that decays to nothing: a sine with an envelope of no
+    /// sustain, so a note held for seconds is silent, and a fresh one is loud.
+    fn pluck(gain: f64) -> Vec<u8> {
+        use cubed_dsp::patch_edit::PatchDoc;
+        use serde_json::json;
+        let mut doc = PatchDoc::new("pluck");
+        let find = |doc: &PatchDoc, t: &str| {
+            doc.nodes()
+                .into_iter()
+                .find(|n| n.type_name == t)
+                .unwrap()
+                .id
+        };
+        let (osc, env) = (find(&doc, "oscillator"), find(&doc, "envelope"));
+        doc.set_param(&osc, "waveform", &json!(0)).unwrap();
+        doc.set_param(&osc, "gain", &json!(gain)).unwrap();
+        doc.set_param(&env, "attack", &json!(0.001)).unwrap();
+        doc.set_param(&env, "decay", &json!(0.3)).unwrap();
+        doc.set_param(&env, "sustain", &json!(0.0)).unwrap();
+        doc.set_param("10005", "active", &json!(false)).unwrap();
+        doc.to_json().into_bytes()
+    }
+
+    fn put(patch: &[u8]) {
+        let at = cw_file_buffer(patch.len() as u32);
+        // SAFETY: cw_file_buffer made room for the file.
+        unsafe { std::ptr::copy_nonoverlapping(patch.as_ptr(), at, patch.len()) };
+    }
+
+    fn put_play(play: &cubed_mixer::PlaySource) {
+        let mut bytes = Vec::new();
+        assert!(wire::encode(&Command::PlaySource(*play), &mut bytes));
+        let at = cw_swap_play_buffer(bytes.len() as u32);
+        // SAFETY: cw_swap_play_buffer made room for the bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len()) };
+    }
+
+    fn put_held(notes: &[(f32, f32)]) {
+        let room = cw_held_buffer(notes.len() as u32);
+        // SAFETY: cw_held_buffer made room for two floats a note.
+        let view = unsafe { std::slice::from_raw_parts_mut(room, notes.len() * 2) };
+        for (i, (note, velocity)) in notes.iter().enumerate() {
+            view[i * 2] = *note;
+            view[i * 2 + 1] = *velocity;
+        }
+    }
+
+    /// One render quantum, with a swap's warm-up step ahead of it as the
+    /// processor does; the left channel's RMS and the step's outcome.
+    fn quantum() -> (f32, u32) {
+        let step = cw_warm_step(128);
+        cw_process(128);
+        // SAFETY: the output buffers hold BLOCK floats.
+        let left = unsafe { std::slice::from_raw_parts(cw_left(), BLOCK) };
+        (
+            (left.iter().map(|s| s * s).sum::<f32>() / BLOCK as f32).sqrt(),
+            step,
+        )
+    }
+
+    fn start_pluck(note: u8) {
+        use cubed_mixer::{PlaySource, SourceEvent, SourceId, VoiceId};
+        send(Command::SetBus(BusId(1), BusSettings::default()));
+        put(&pluck(0.8));
+        assert_eq!(cw_prepare_synth(0, 0), 1);
+        send(Command::PlaySource(PlaySource::new(
+            VoiceId(1),
+            SourceId(0),
+            BusId(1),
+        )));
+        send(Command::SourceEvent {
+            voice: VoiceId(1),
+            event: SourceEvent::NoteOn {
+                note,
+                velocity: 1.0,
+                duration: 0,
+            },
+        });
+    }
+
+    /// Begins swapping a rebuilt pluck in for voice 1 as voice 2.
+    fn begin_swap(warm_blocks: u32, slice: u32, held: &[(f32, f32)]) -> u32 {
+        use cubed_mixer::{PlaySource, SourceId, VoiceId};
+        put(&pluck(0.7));
+        put_play(&PlaySource::new(VoiceId(2), SourceId(1), BusId(1)));
+        put_held(held);
+        cw_swap_begin(1, 0, 1.0, 600, warm_blocks, slice, held.len() as u32)
+    }
+
+    /// The point of the slices: a decayed note stays decayed through a swap, the
+    /// render callback never does more than a few blocks of warm-up, and the old
+    /// voice keeps playing meanwhile.
+    #[test]
+    fn a_warmed_swap_keeps_a_decayed_note_decayed() {
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 11, 12);
+        start_pluck(60);
+        let first: Vec<f32> = (0..10).map(|_| quantum().0).collect();
+        assert!(first[2] > 0.1, "the pluck sounds: {first:?}");
+        for _ in 0..750 {
+            quantum();
+        }
+        let decayed = quantum().0;
+        assert!(decayed < 0.01, "after 2 s it has decayed: {decayed}");
+
+        // The note has been held 760 blocks: swap in a rebuilt synth warmed that far.
+        assert_eq!(begin_swap(760, 8, &[(60.0, 1.0)]), 1);
+        assert_eq!(cw_swap_pending(), 1);
+        let mut quanta = 0;
+        let mut loudest = 0.0f32;
+        loop {
+            let (level, step) = quantum();
+            quanta += 1;
+            loudest = loudest.max(level);
+            if step == 2 {
+                break;
+            }
+            assert_eq!(step, 1, "warming until it is done");
+            assert!(quanta < 400, "it never finished");
+        }
+        // 760 blocks at 8 a quantum against a clock that moves 1: about 110.
+        assert!((90..=140).contains(&quanta), "{quanta} quanta");
+        assert_eq!((cw_swap_old(), cw_swap_new()), (1.0, 2.0));
+        assert_eq!(cw_swap_pending(), 0);
+        // Through the crossfade and after, still decayed: no attack.
+        for _ in 0..80 {
+            loudest = loudest.max(quantum().0);
+        }
+        assert!(loudest < 0.02, "no retrigger: {loudest}");
+        assert_eq!(cw_voices(), 1, "the old voice ended");
+
+        // A note played now (for the old id) sounds, in the new synth.
+        send(Command::SourceEvent {
+            voice: cubed_mixer::VoiceId(1),
+            event: cubed_mixer::SourceEvent::NoteOn {
+                note: 67,
+                velocity: 1.0,
+                duration: 0,
+            },
+        });
+        let heard = (0..10).map(|_| quantum().0).fold(0.0f32, f32::max);
+        assert!(heard > 0.1, "the alias reaches the new voice: {heard}");
+        // ... and a stop for the old id stops the new voice.
+        send(Command::Stop(cubed_mixer::VoiceId(1), 0));
+        for _ in 0..4 {
+            quantum();
+        }
+        assert_eq!(cw_voices(), 0);
+        assert_eq!(cw_bad_batches(), 0);
+    }
+
+    /// Without the warm-up the same swap attacks again: what the test above rules
+    /// out is real.
+    #[test]
+    fn a_cold_swap_retriggers_the_attack() {
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 13, 14);
+        start_pluck(60);
+        for _ in 0..760 {
+            quantum();
+        }
+        assert_eq!(begin_swap(0, 8, &[(60.0, 1.0)]), 1);
+        let mut loudest = 0.0f32;
+        for _ in 0..20 {
+            loudest = loudest.max(quantum().0);
+        }
+        assert!(loudest > 0.1, "a cold synth attacks: {loudest}");
+    }
+
+    /// A note played while the new synth warms up is in it when it takes over, at
+    /// the right point of its decay.
+    #[test]
+    fn notes_played_during_the_warm_up_carry_over() {
+        use cubed_mixer::{SourceEvent, VoiceId};
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 15, 16);
+        start_pluck(60);
+        for _ in 0..400 {
+            quantum();
+        }
+        assert_eq!(begin_swap(400, 6, &[(60.0, 1.0)]), 1);
+        let mut levels = Vec::new();
+        let mut swapped_at = None;
+        for q in 0..400 {
+            // A new note 30 quanta into the warm-up.
+            if q == 30 {
+                send(Command::SourceEvent {
+                    voice: VoiceId(1),
+                    event: SourceEvent::NoteOn {
+                        note: 64,
+                        velocity: 1.0,
+                        duration: 0,
+                    },
+                });
+            }
+            let (level, step) = quantum();
+            levels.push(level);
+            if step == 2 {
+                swapped_at = Some(q);
+                break;
+            }
+        }
+        let swapped_at = swapped_at.expect("swapped");
+        assert!(swapped_at > 60, "warming took a while: {swapped_at}");
+        // The note decays over 0.3 s (112 blocks): at the swap, the new voice is
+        // where the old one is, not at the attack.
+        let before = levels[swapped_at - 1];
+        let after: Vec<f32> = (0..12).map(|_| quantum().0).collect();
+        assert!(before > 0.005, "the note is still ringing: {before}");
+        for level in &after {
+            assert!(
+                *level < before * 1.4 && *level > before * 0.3,
+                "{level} vs {before}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_swap_gives_up_when_the_old_voice_stops_and_refuses_a_missing_one() {
+        use cubed_mixer::VoiceId;
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 17, 18);
+        start_pluck(60);
+        quantum();
+        // A voice that is not playing.
+        put(&pluck(0.7));
+        put_play(&cubed_mixer::PlaySource::new(
+            VoiceId(2),
+            cubed_mixer::SourceId(1),
+            BusId(1),
+        ));
+        assert_eq!(cw_swap_begin(1, 0, 9.0, 600, 10, 4, 0), 0);
+        assert!(cw_error_len() > 0);
+        // Not a PlaySource.
+        let at = cw_swap_play_buffer(3);
+        // SAFETY: room for 3 bytes.
+        unsafe { std::slice::from_raw_parts_mut(at, 3) }.copy_from_slice(&[1, 2, 3]);
+        assert_eq!(cw_swap_begin(1, 0, 1.0, 600, 10, 4, 0), 0);
+
+        assert_eq!(begin_swap(2_000, 4, &[(60.0, 1.0)]), 1);
+        for _ in 0..5 {
+            assert_eq!(quantum().1, 1);
+        }
+        send(Command::Stop(VoiceId(1), 0));
+        let steps: Vec<u32> = (0..3).map(|_| quantum().1).collect();
+        assert!(steps.contains(&3) || steps[0] == 0, "{steps:?}");
+        assert_eq!(cw_swap_pending(), 0);
+        for _ in 0..10 {
+            quantum();
+        }
+        assert_eq!(cw_voices(), 0, "nothing took over");
+    }
+
+    /// A newer swap replaces a pending one.
+    #[test]
+    fn a_newer_swap_replaces_a_pending_one() {
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 19, 20);
+        start_pluck(60);
+        for _ in 0..50 {
+            quantum();
+        }
+        assert_eq!(begin_swap(5_000, 2, &[(60.0, 1.0)]), 1);
+        for _ in 0..10 {
+            quantum();
+        }
+        assert_eq!(begin_swap(100, 16, &[(60.0, 1.0)]), 1);
+        let mut done = false;
+        for _ in 0..40 {
+            done |= quantum().1 == 2;
+        }
+        assert!(done, "the second one finished, the first was dropped");
+    }
+
     /// A bus's tap through the exports: switched on, cut after rendering, the
     /// frames in order, and the page's reader sees them.
     #[test]
@@ -814,6 +1229,7 @@ mod tests {
         assert_eq!(cw_rejected(), 0);
     }
 
+    /// A song file through the exports, on a bus with a built effect.
     #[cfg(feature = "songs")]
     #[test]
     fn the_exports_play_a_song_through_an_effect() {

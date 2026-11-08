@@ -235,6 +235,45 @@ async function taps() {
   return { ok, messages: messages.length, frames, written: last?.written?.[bus1], replies, sample: left[frames - 1] };
 }
 
+// A swap warmed in slices: the old voice plays on while the rebuilt synth warms
+// up a few blocks per quantum, then it takes over; the page is told twice.
+async function swap() {
+  const patchBytes = await (await fetch('../../dsp/tests/real_patch.json')).arrayBuffer();
+  const context = new OfflineAudioContext(2, RATE * 2, RATE);
+  const replies = [];
+  const telemetry = [];
+  const { node, ready } = await mixerNode(context, (m) => {
+    if (m.type === 'swap') replies.push(m);
+    else if (m.type === 'telemetry') telemetry.push(m);
+  });
+  const send = (...parts) => {
+    const bytes = new Uint8Array(parts.flatMap((p) => [...p]));
+    node.port.postMessage({ type: 'commands', bytes: bytes.buffer }, [bytes.buffer]);
+  };
+  node.port.postMessage({ type: 'synth', source: 0, bytes: patchBytes.slice(0), oneShot: false });
+  send(setBus(2, 0), playSource(1, 0, 2), sourceEvent(1, 0, 60, 1, 0));
+  // The notes have been held 300 blocks (0.8 s) when this comes; 4 blocks a quantum.
+  node.port.postMessage({
+    type: 'swap', source: 1, bytes: patchBytes.slice(0), play: playSource(2, 1, 2).buffer,
+    oldVoice: 1, fadeFrames: 1200, held: [[60, 1]], warmBlocks: 300, sliceBlocks: 4,
+  });
+  // A swap for a voice that is not there fails at once.
+  node.port.postMessage({
+    type: 'swap', source: 1, bytes: patchBytes.slice(0), play: playSource(3, 1, 2).buffer,
+    oldVoice: 77, fadeFrames: 1200, held: [], warmBlocks: 10,
+  });
+  await ready;
+  const left = (await context.startRendering()).getChannelData(0);
+  const rms = Math.sqrt(left.reduce((sum, s) => sum + s * s, 0) / left.length);
+  const done = replies.find((r) => r.phase === 'done');
+  const last = telemetry[telemetry.length - 1] ?? {};
+  // 300 blocks at 4 a quantum against a clock that moves 1: about 100 quanta, 0.27 s.
+  const ok = replies.map((r) => r.phase).join() === 'started,failed,done'
+    && done && done.old === 1 && done.new === 2 && done.frame > 8000 && done.frame < 24000
+    && rms > 0.01 && last.voices === 1;
+  return { ok, rms, replies, voices: last.voices };
+}
+
 async function run() {
   const clips = await clip();
   const songs = await song();
@@ -242,9 +281,10 @@ async function run() {
   const synths = await synth();
   const synthEdits = await synthEdit();
   const tapped = await taps();
+  const swapped = await swap();
   return {
-    ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok && tapped.ok,
-    clips, songs, modules, synths, synthEdits, tapped,
+    ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok && tapped.ok && swapped.ok,
+    clips, songs, modules, synths, synthEdits, tapped, swapped,
   };
 }
 
