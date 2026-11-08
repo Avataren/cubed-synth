@@ -290,7 +290,13 @@ handler: lda #$01
     code, lab = build(0x1000, """
 init:   lda #$0f
         sta $d418
-        sta $d438
+        sta $d438       ; volume on both
+        lda #$f0
+        sta $d406
+        sta $d426       ; sustain 15
+        lda #$21
+        sta $d404
+        sta $d424       ; sawtooth, gate on
         lda #0
         sta $f0
         rts

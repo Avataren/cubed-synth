@@ -251,6 +251,8 @@ impl PsidPlayer {
         &self.chips[i]
     }
 
+    /// Chip `i` to change its settings (the 6581 revision, say). Do not render
+    /// it or clock it yourself: the player keeps the chips in step with the tune.
     pub fn chip_mut(&mut self, i: usize) -> &mut Chip {
         &mut self.chips[i]
     }
@@ -313,11 +315,9 @@ impl PsidPlayer {
         }
         let hz = self.runner.clock_hz() as f64;
         let target = (seconds * hz) as u64;
-        if target < self.cycle {
-            if self.restart(None).is_err() {
-                // Init worked once; it only fails if the tune is not deterministic. Stay where we are.
-                return Ok(());
-            }
+        // Init worked once; it only fails now if the tune is not deterministic: stay where we are then.
+        if target < self.cycle && self.restart(None).is_err() {
+            return Ok(());
         }
         let rendered = (SEEK_RENDERED_SECONDS * hz) as u64;
         let skip_to = target.saturating_sub(rendered).max(self.cycle);
@@ -336,7 +336,7 @@ impl PsidPlayer {
             let samples = self.stretch_samples;
             // The last stretch may go past the target by less than a stretch.
             let cycles = self.chips[0].cycles_in_next(samples);
-            self.stretch(samples, cycles);
+            self.stretch(cycles);
             for chip in &mut self.chips {
                 chip.render(&mut scratch[..samples]);
             }
@@ -368,7 +368,7 @@ impl PsidPlayer {
     /// Run the tune up to the end of a stretch of `cycles` cycles and schedule
     /// what it wrote on the chips.
     #[inline]
-    fn stretch(&mut self, _samples: usize, cycles: u64) {
+    fn stretch(&mut self, cycles: u64) {
         let start = self.cycle;
         let end = start + cycles;
         self.runner.advance(end);
@@ -389,7 +389,7 @@ impl PsidPlayer {
         while done < len {
             let n = (len - done).min(self.stretch_samples);
             let cycles = self.chips[0].cycles_in_next(n);
-            self.stretch(n, cycles);
+            self.stretch(cycles);
             let o = &mut out[done..done + n];
             match taps.as_mut() {
                 Some([a, b, c]) => self.chips[0].render_taps(

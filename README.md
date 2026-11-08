@@ -7,7 +7,7 @@ in a browser AudioWorklet and in a native audio callback.
 
 | Crate | What it is |
 |---|---|
-| `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, GoatTracker 1 and 2 `.sng` import (`goattracker`, another_synth's importer ported byte for byte) and a GTS5 `.sng` writer, `edit::SidDoc` (the song as data: JSON operations, GoatTracker's limits, undo), player controls for an editor (seek by place, loops, mute and solo, instrument audition, position and peaks, live edits), and a register-stream chip player (`stream`) |
+| `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, GoatTracker 1 and 2 `.sng` import (`goattracker`, another_synth's importer ported byte for byte) and a GTS5 `.sng` writer, `edit::SidDoc` (the song as data: JSON operations, GoatTracker's limits, undo), player controls for an editor (seek by place, loops, mute and solo, instrument audition, position and peaks, live edits), a register-stream chip player (`stream`), and a PSID/RSID player (`psid`: a 6510 and a small C64 that run a C64 `.sid` tune's own code in step with the audio, ported from the DAW's runner) |
 | `cubed-ahx` | AHX / HivelyTracker (`.ahx`, `.hvl`) parser and replayer, bit-exact against `hvl_replay.c`, with a band-limited "hifi" path. The writer (`write`: `.ahx` and `.hvl`, byte-identical to the DAW's on all 127 fixtures) and `edit::AhxDoc`, which edits a song as data with JSON operations, format limits and undo; the player takes live control (seek, loops, mute and solo, an audition voice, levels, a `AhxProbe`) and live edits |
 | `cubed-opl` | Yamaha OPL2/OPL3 FM chip (a port of ymfm's OPL path), an Adlib Tracker II (`.a2m`) parser, writer and player (which takes live control: seek, loops, mute and solo, position, levels, live edits), `edit::A2mDoc` and `edit::OplInstrumentDoc` (a song and an instrument as data, with JSON operations and undo), and `audition::OplAudition`, an OPL instrument played by hand |
 | `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. The writers (`write_mod`, `write_s3m`, `write_xm`) and `edit::ModuleDoc`, which edits a module as data with JSON operations, format limits and undo. An `Observer` sees every row and command; a `Probe` shows the position, per-channel levels and scopes of a playing player, which also takes live control (stop and play, seek, loops, mute and solo, note preview) |
@@ -723,7 +723,121 @@ which costs nothing measurable (47.9 against 47.8 us a block). The mixer and the
 *Not covered*: dual SID (six orderlists per subsong); GoatTracker 1 (`GTS!`) is read but not written; the
 `.sng` of a song with a start tempo other than 6 (refused, `bake_tempo`); the DAW's flat "song-wide pattern"
 view of a GoatTracker song (`flat.ts`, a UI projection that the DAW compiles back to orderlists): this layer is
-GoatTracker's own orderlists, which a Lua editor can show per voice; PSID/C64 playback (a later agent's).
+GoatTracker's own orderlists, which a Lua editor can show per voice (PSID/C64 playback is `cubed_sid::psid`, below).
+
+## Playing PSID and RSID tunes (C64 `.sid` files)
+
+A C64 `.sid` is not a song but a program: 6502 code that, called once per video frame (PSID) or from
+its own interrupts (RSID), writes the SID's registers. `cubed_sid::psid` runs that code on an emulated
+C64 and plays the writes on the crate's SID chip. It is a port of another_synth's
+`src/audio/tracker/psid/` (`mos6510.ts`, `c64.ts`, `psid-file.ts`, `psid-runner.ts`), which was tuned
+against real tunes, so what it plays is what the DAW plays. Plain Rust, no allocation while it renders,
+native and `wasm32`.
+
+```rust
+use cubed_sid::psid::{PsidOptions, PsidPlayer};
+
+// Build off the audio thread: the tune's init routine runs here.
+let mut player = PsidPlayer::new(&bytes, 48_000.0, PsidOptions::default())?;   // the start song
+// On the audio thread, any block size:
+player.render(&mut out);                                // mono, the chips' mix
+player.render_taps(&mut out, [&mut v0, &mut v1, &mut v2]); // and the first chip's three voices
+player.render_stereo(&mut left, &mut right);            // the mono signal in both
+```
+
+| | |
+|---|---|
+| `PsidFile::parse(bytes)` | The header of PSID and RSID, versions 1-4: load, init and play addresses, songs, start song, per-song speed bits (`uses_cia(song)`), PAL/NTSC, the SID model(s), the second and third SID's address, name/author/released. A file this cannot run is refused with a reason (`PsidError`, the DAW's words): no magic, bad header, Compute!'s Sidplayer data (MUS), an RSID that is a BASIC program, an init that jams, hits a BRK or runs past 60 million cycles |
+| `PsidPlayer::new / from_file` | Options: `subsong` (0-based; the header's start song when `None`) and `model` (`Sid6581`/`Sid8580`; the file's tag, else a 6581, as HVSC's players do). The chip runs at the file's clock (985 248 Hz PAL, 1 022 727 NTSC), so pitch and speed are the machine's |
+| `render`, `render_taps`, `render_stereo` | Mono mix of the chips (taps: the first chip's voices); `render_taps` gives the mix `render` does, sample for sample |
+| `ended() -> Option<EndReason>`, `song_end_reached()` | A tune has no length (nearly all loop for ever); the only end is a play routine or an RSID that jams the CPU, hits a BRK, or does not return from a play call in 2 million cycles. The chips keep sounding what they hold |
+| `position_seconds()`, `frames()`, `subsong()`, `subsongs()`, `file()`, `sid_count()`, `chip(i)`, `chip_mut(i)` | Reading it; `chip_mut` is for a settings change (`set_revision`, `set_model`), not for clocking |
+| `set_gain`, `set_mute_solo(mute, solo)`, `set_model` | Cheap controls, fine between blocks (rule of `SidChipPlayer::set_mute_solo`: bit `i` is voice `i` of every chip) |
+| `restart(subsong)`, `seek(seconds)` | They run the tune again, so not for the audio thread. A seek runs the code to the target as fast as it goes, applies the writes of all but the last second to the chips at once and plays that second for real; a seek back restarts. Up to 1200 s |
+
+**Design: the CPU runs live, inside `render`.** The alternative is to capture the tune's writes offline into
+a register stream and play that (`stream`, which the worklet already uses for the DAW's TypeScript runner).
+Running live wins: a 6510 costs about a million cycles a second of audio (the whole player, chip included, runs
+35-60x real time on the 6510-heavy tunes of the corpus, `examples/psid_play`), a tune has no length so there is
+nothing to capture to the end of and no limit to choose, a subsong change or a seek only runs the code again,
+and an RSID that sets up its own interrupts works the same way. The price is that a tune's init routine (up to
+60 M cycles, a fraction of a second at worst) runs in `new`: build the player on a loading thread.
+
+**How a block is played.** The audio is cut into stretches of at most 600 chip cycles (a few dozen samples).
+For each, `PsidRunner` runs the tune up to the stretch's last cycle, the SID writes it made come out stamped
+with the cycle they were made on, `Chip::write_after` schedules them at those cycles, and the chip renders the
+stretch (`Chip::cycles_in_next` tells how many cycles it will clock). Every write lands on its own cycle, so the
+envelope's rate counter keeps running between two writes (the ADSR delay bug) as on a real C64, and the queues
+in between never hold more than a stretch's worth: a main loop that stores to the SID every 5 cycles renders
+without one allocation (`cubed-rt-check --test psid_alloc`). A host-driven play call that straddles the end of
+a stretch is stopped where the cycle falls and goes on in the next (the DAW's runner runs it to its end; the
+writes are the same).
+
+**How a tune is driven** (as HVSC's SID file environment says, and the DAW does): a PSID with a play address
+gets `init` called with the subsong in A and `play` once per tick, per video frame (19 656 cycles PAL) or per
+CIA 1 timer A period when the header's speed bit says so (the period is read again after every call: Rubicon
+reprograms the timer in its first play call), with `$01` set for the call address as libsidplayfp does and
+interrupts off. An RSID, or a PSID with play address 0, is left to its own interrupts after init: the stand-in
+KERNAL's IRQ entry (`$FF48`, `JMP ($0314)`), CIA 1 and 2 timers (timer B may count timer A), the VIC raster
+interrupt, an NMI from CIA 2. **The machine** (`psid::c64`) is 64 KB of RAM with the 6510's `$01` banking, the
+SID (voice 3's `$D41B`/`$D41C` modelled, since players use them as random numbers), CIA 1/2, the VIC's raster
+(PAL 312 x 63, NTSC 263 x 65) and a small KERNAL of our own (no ROM images): its vectors and exits return, every
+other routine is an `RTS`. **The CPU** (`psid::cpu`) is every NMOS opcode, decimal-mode ADC/SBC included, the
+undocumented ones tunes use (SLO RLA SRE RRA SAX LAX DCP ISC ANC ALR ARR SBX, the NOPs, LAS, SHA/SHX/SHY/TAS,
+ANE/LXA with `$EE`), the twelve JAMs, and the documented cycle counts with page-crossing and branch penalties.
+A write is stamped with the cycle its instruction started on.
+
+**More than one SID.** A v3/v4 file names a second and a third SID (`$D420`-`$D7F0`, `$DE00`-`$DFE0`); each gets
+a chip of its own, the model from the header (else the first's), and the player plays their sum divided by the
+number of chips (mono, so three chips never clip where one would not). Writes to a SID the file does not name are
+mirrors of the first.
+
+**What is checked.**
+
+- The CPU, `src/psid/tests_cpu.rs`: ADC and SBC for every input in binary and decimal (decimal against Bruce
+  Clark's sequences for the NMOS 6502), flags of every group, the documented cycle table of all 151 official
+  opcodes plus page-crossing and branch penalties, the undocumented read-modify-write opcodes against their two
+  official instructions, interrupts, JAM.
+- The machine and runner, `src/psid/tests_runner.rs` (the DAW's own tests, ported, and more): banking, CIA timers
+  (continuous, one-shot, B counting A), NMI, the raster counter and interrupt, the KERNAL IRQ and BRK paths, the
+  runner's modes, retiming, overruns, jams, and the header parser.
+- End to end, `tests/psid.rs`, on synthetic tunes written by `tests/fixtures/psid/make_fixtures.py` (a few lines of
+  6502 each; **no real tune is ever committed**): the register writes with the cycles their instructions take
+  (hand-counted), the CIA and raster interrupt tunes' periods, two chips, and the audio: the player in any block
+  size equals a bare chip fed the same writes sample for sample, the notes sound at their pitches.
+- Against the DAW: `tests/fixtures/psid/oracle.ts` runs the DAW's own `PsidRunner` over a list of tunes and records
+  the first N seconds of writes to the first SID (cycle, register, value) as a count and a hash. `CUBED_PSID_ORACLE`
+  makes `tests/psid.rs` compare. On HVSC 85 (61 157 `.sid` files, 10 seconds of the start song of each) **every
+  tune's write stream is identical to the DAW's**: the same files refused, the same failures, the same writes at the
+  same cycles.
+
+```sh
+cargo test -p cubed-sid --test psid                       # the synthetic tunes
+cargo test -p cubed-rt-check --test psid_alloc            # render, taps, controls: no allocation
+DAW=~/src/rust/another_synth; cd crates/sid/tests/fixtures/psid
+$DAW/node_modules/.bin/esbuild oracle.ts --bundle --platform=node --format=esm \
+    --alias:another_synth=$DAW --outfile=$SCRATCH/psid-oracle.mjs
+find ~/hvsc -iname '*.sid' | sort > list.txt
+node $SCRATCH/psid-oracle.mjs oracle.json 10 list.txt     # the DAW's writes, 10 s of each
+CUBED_PSID_ORACLE=oracle.json cargo test --release -p cubed-sid --test psid oracle
+CUBED_PSID=~/hvsc CUBED_PSID_STRIDE=3 cargo test --release -p cubed-sid --test psid corpus_smoke -- --nocapture
+cargo run --release -p cubed-sid --example psid_play -- tune.sid 1 30 out.wav   # speed and a WAV
+```
+
+`corpus_smoke` runs every tune of a folder (`CUBED_PSID_SECONDS`, `CUBED_PSID_STRIDE`, `CUBED_PSID_AUDIO` render
+every n-th for real) and prints the tunes that do not play, grouped; `CUBED_PSID_STRICT=1` makes it fail on any
+but a refused file. Both tests skip when their variable is unset.
+
+**Known gaps** (the DAW's too, on the same files). HVSC 85: of 61 157 tunes 589 (1.0%) are RSID BASIC programs and
+are refused (they need the C64's BASIC ROM, which is not ours to ship); 362 hit a BRK, 79 stop the CPU and 3 never
+return from a play call or write nothing in their first ten seconds (about 0.7%): tunes that call into the real
+KERNAL (this one's routines are `RTS`) or read ROM contents, or lean on timing the model does not have. The
+rest play. Not modelled: sample playback through NMI handlers in a PSID that has a play address (the host-driven
+call runs with interrupts off, as the DAW's does; a PSID with play address 0 and every RSID run their interrupts
+and do play samples written to `$D418`), PlaySID's own sample registers, the VIC's bad lines and sprite DMA (a
+write is where the instruction count puts it, not where the cycles stolen from the CPU would), CIA TOD, serial
+and ports, the keyboard and joysticks. The unstable opcodes use their common behaviour. A tune has no stored
+length (HVSC's Songlengths database is not read): it loops until stopped.
 
 ## Building, testing, benchmarks
 
@@ -734,6 +848,8 @@ cargo bench -p cubed-sid --bench sid_render
 cargo test -p cubed-sid --test edit_soak            # CUBED_GT_SONGS=<dir> soaks a corpus too
 cargo test -p cubed-sid --test sng_write            # CUBED_SNG_WRITE_ORACLE=<json>, CUBED_GT_SONGS=<dir>
 cargo test -p cubed-rt-check --test sid_controls    # the controls allocate nothing
+cargo test -p cubed-sid --test psid                 # PSID/RSID: CUBED_PSID=<dir>, CUBED_PSID_ORACLE=<json>
+cargo test -p cubed-rt-check --test psid_alloc      # the PSID player allocates nothing
 cargo bench -p cubed-opl --bench opl_render
 cargo bench -p cubed-ahx --bench ahx_render
 cargo bench -p cubed-dsp --bench patch_render
