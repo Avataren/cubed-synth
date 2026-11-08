@@ -793,6 +793,19 @@ fn subsongs_add_copy_remove_and_select() {
     assert_eq!(d.subsong(), 1);
     ok(&mut d, json!({"op": "remove_subsong", "subsong": 1}));
     assert_eq!(d.subsong(), 0);
+    // A batch that fails after removing one leaves the same subsong shown.
+    ok(&mut d, json!({"op": "add_subsong"}));
+    ok(&mut d, json!({"op": "select_subsong", "subsong": 1}));
+    let e = d
+        .apply(&json!({"op": "batch", "ops": [
+            {"op": "remove_subsong", "subsong": 0},
+            {"op": "set_cell", "pattern": 0, "row": 0, "note": 200},
+        ]}))
+        .unwrap_err();
+    assert!(e.contains("operation 1"), "{e}");
+    assert_eq!((d.subsong(), d.song().subsongs.len()), (1, 2));
+    ok(&mut d, json!({"op": "remove_subsong", "subsong": 1}));
+    assert_eq!(d.subsong(), 0);
     assert!(
         refused(&mut d, json!({"op": "remove_subsong", "subsong": 0}))
             .contains("at least one subsong")
@@ -1246,7 +1259,7 @@ fn table_rows_set_clear_and_append() {
     assert_eq!(d.song().tables.filter[0], Default::default());
     let t = ok(
         &mut d,
-        json!({"op": "table", "table": "wave", "row0": 1, "count": 5}),
+        json!({"op": "table", "kind": "wave", "row0": 1, "count": 5}),
     );
     assert_eq!(t["cells"], json!([[255, 0]]));
     assert_eq!(
@@ -1872,4 +1885,43 @@ fn reads_give_the_shapes_an_editor_draws_from() {
     let s = ok(&mut d, json!({"op": "export_sng"}));
     assert_eq!(s["bytes"][0], 71, "G of GTS5");
     assert!(s["notes"][0].as_str().unwrap().contains("6581"));
+}
+
+#[test]
+fn a_new_song_is_what_the_daw_makes() {
+    // `fixtures/goattracker/oracle_new.ts`: the .asid createNewSidDoc saves for each set of options.
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/goattracker/expected_new.json"),
+    )
+    .unwrap();
+    let cases: Vec<Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(cases.len(), 11);
+    for case in cases {
+        let o = &case["options"];
+        let options = NewSong {
+            title: o["songName"].as_str().unwrap_or("").into(),
+            author: o["author"].as_str().unwrap_or("").into(),
+            model: if o["chipModel"] == "8580" {
+                SidModel::Sid8580
+            } else {
+                SidModel::Sid6581
+            },
+            speed_multiplier: o["speedMultiplier"].as_u64().unwrap_or(1) as u8,
+            pattern_rows: o["patternRows"].as_u64().unwrap_or(64) as usize,
+            tempo: o["tempo"].as_u64().map(|t| t as u8),
+        };
+        let made = SidDoc::with_options(&options);
+        if case["ok"] == true {
+            let hex: String = made
+                .unwrap_or_else(|e| panic!("{o}: {e}"))
+                .to_asid_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(hex, case["asid"].as_str().unwrap(), "{o}");
+        } else {
+            assert!(made.is_err(), "{o}: the DAW refuses: {}", case["reason"]);
+        }
+    }
 }

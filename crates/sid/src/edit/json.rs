@@ -77,8 +77,12 @@ pub(crate) fn opt_u8(op: &Value, key: &str) -> Res<Option<u8>> {
     }
 }
 
+/// The table an operation names: `"table": "wave"` (or `"kind"`).
 pub(crate) fn req_table(op: &Value) -> Res<TableKind> {
-    let name = req_str(op, "table")?;
+    let name = match (opt_str(op, "table")?, opt_str(op, "kind")?) {
+        (Some(n), _) | (None, Some(n)) => n,
+        (None, None) => return Err("'table' must be a string (wave, pulse, filter, speed)".into()),
+    };
     TableKind::from_name(name)
         .ok_or_else(|| format!("'{name}' is not a table (wave, pulse, filter, speed)"))
 }

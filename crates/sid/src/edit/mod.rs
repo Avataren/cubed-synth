@@ -543,6 +543,7 @@ impl SidDoc {
     pub(crate) fn edit<T>(&mut self, f: impl FnOnce(&mut Self) -> Res<T>) -> Res<(T, Changes)> {
         self.history.depth += 1;
         let mark = self.history.open.len();
+        let shown = self.subsong;
         let result = f(self);
         let out = match result {
             Ok(v) => {
@@ -562,6 +563,7 @@ impl SidDoc {
                         c.apply(&mut self.song);
                     }
                 }
+                self.subsong = shown;
                 Err(e)
             }
         };
