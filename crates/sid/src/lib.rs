@@ -33,6 +33,8 @@
 #![allow(clippy::doc_overindented_list_items)]
 
 pub mod chip;
+#[cfg(feature = "edit")]
+pub mod edit;
 pub mod envelope;
 pub mod filter;
 pub mod goattracker;
