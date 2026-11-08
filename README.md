@@ -230,6 +230,7 @@ enum SongControl {
     Timing { tempo: u8, speed: u8 },                  // Adlib: tempo and speed now
     SetOrder { order, channel, pattern, transpose },  // AHX/HVL: a position's track and transpose for a channel
     SetRestart(u16),                                  // AHX/HVL: where the song starts over
+    SetTableRow { table, row, left, right },          // SID: a row of a step table (wire kind 17)
 }
 trait SongReader: Send + Sync {                       // natively: the song's probe; on the web: WebSong
     fn status(&self) -> SongStatus;                   // as Player::status, plus `version`
@@ -247,7 +248,7 @@ batch): tag 30, 24 bytes, little endian: `u8 tag, u64 voice, u8 kind, u16 a, u16
 u32 frames`. Kinds: 0 Play, 1 Stop, 2 Seek (a order, b row), 3 Loop none, 4 Loop pattern (a order), 5 Loop
 range (a order, b row0, c row1), 6 Mute (a channel, b on), 7 Solo (a, b), 8 MuteMask (frames), 9 SoloMask
 (frames), 10 PreviewOn (a instrument, b note, value velocity, frames duration), 11 PreviewOff, 12 Looped
-(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
+(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order), 17 SetTableRow (a table | row << 8, b left | right << 8). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
 number, u8 fm[11], u8 panning, i8 finetune, u8 voice_type`. Tag 31, 21 bytes: `u8 tag, u64 voice, u16 pattern, u16 row, u8 channel, u8 note
 (0 none, 255 key off, else MIDI; Adlib: the file's note byte), u16 period (Adlib: `effect2 << 8 | param2`), u8
 instrument, u8 volume, u8 effect, u8 param` (SetCell). An
@@ -298,7 +299,7 @@ holds the song as bytes needs nothing per format:
 | MOD, S3M, XM | `open_module(module, ..)`, `open_module_song(format, bytes, ..)` | everything above |
 | Adlib Tracker II (`.a2m`) | `open_a2m(song, ..)` (an `A2mSong` the host holds), `open_controlled_song(SongFormat::A2m, bytes, ..)` | everything above; see below |
 | AHX, HVL (`.ahx`, `.hvl`) | `open_ahx(song, ..)` (a `cubed_ahx::format::Song` the host holds), `open_controlled_song(SongFormat::Ahx, bytes, ..)` | everything above except scopes; see below |
-| SID | `open_song` (plays at once, ends with the song) | not yet: `open_controlled_song` says so |
+| SID (`.asid`) | `open_sid(song, ..)` (a `cubed_sid::song::SidSong` the host holds), `open_controlled_song(SongFormat::Sid, bytes, ..)` | everything above; see below |
 
 **Adlib.** The channels are the song's tracks. `Play`/`Stop`, `Seek` (the song replays silently to the row: a far row costs
 a few thousand ticks of register writes on the audio thread, no allocation), `Loop`, `Mute`/`Solo` and their masks map
@@ -329,7 +330,21 @@ song's shape (the track length, positions inserted, deleted or moved, the speed 
 (`open_ahx` of the edited `Song`, then the usual `Seek`, `Loop`, masks and `Play`). No scopes: the engine's per-voice capture
 allocates when it is switched on, which an audio thread may not do.
 
-**Adding a song format** (SID is the next of these):
+**SID.** Three voices (the channels), an orderlist each over one pool of patterns. `SidSongPlayer` has no pause, so **stopped is
+its preview mode** (the sequencer is off, the notes die away, the position stays, auditions play on any voice) and `Play` leaves
+it; a song opens stopped. `Seek { order, row }`, `Loop` and the status refer to **voice 0**: voice 0 reads row `row` of the
+pattern at its orderlist position `order`, a range loop repeats rows of voice 0's entry, and `status()` is voice 0's position (the
+other voices' places are not reported yet; `pattern` is the pattern number, `speed` the frames per row, `tempo` the timer's Hz, 50
+x the speed multiplier, `rows` the song row of the reference voice). The preview is the player's audition on voice 0 (held until
+`PreviewOff`, or for `duration` frames; over a playing song voice 0 is taken for it; a note is MIDI, 12 is C-0). `levels` are the
+voices' peaks (the taps), then 0; the scopes are the voices' own signals before the filter. Live edits on the wire: `SetCell` (a
+row: `pattern` is the pattern number, `note` 1-93 / 126 off / 127 on, `effect` the command), `SetInstrument` (the ten bytes in
+`fm`: attack/decay, sustain/release, first wave, gate timer, flags (bit 0 hard restart, bit 1 no gate off), vibrato delay, the
+wave, pulse, filter and speed pointers) and `SetTableRow`; a pattern's length, the orderlists, the instrument list, a table's
+length, the start tempo, the speed multiplier and the chip model are a new song. The chip's output carries a constant offset
+while its volume register is up, silence included.
+
+**Adding a song format** (the next one is one more of these):
 
 1. Make the format's player a `songs::SongPlayer` (a small struct in `crates/mixer/src/songs/<format>.rs`, so the format crate
    needs no mixer): `channels()`; `render(left, right)` (silence while stopped; at most `PLAYER_CHUNK` = 256 frames);
@@ -347,8 +362,8 @@ allocates when it is switched on, which an audio thread may not do.
    bigger or that changes the song's shape is a new song swapped in (`swap_commands`), which the editor does for every format.
 4. The worklet needs nothing for a format that is in `open_controlled_song`: its page already sends `{type: 'song', format,
    stopped: true}` and reads `'songpos'`/`'songscope'` (add the format number to the JS's list of controllable formats, `module`
-   in `cubed-worklet.js`). Tests: a rig like `tests/a2m_song.rs` or `tests/ahx_song.rs`, an allocation test in `rt-check` (`mixer_a2m_song_control`, `mixer_ahx_song_control`), and the
-   worklet page's (`crates/worklet/test/index.html`, `adlibControlled`, `ahxControlled`).
+   in `cubed-worklet.js`). Tests: a rig like `tests/a2m_song.rs`, `tests/ahx_song.rs` or `tests/sid_song.rs`, an allocation test in `rt-check` (`mixer_a2m_song_control`, `mixer_ahx_song_control`, `mixer_sid_song_control`), and the
+   worklet page's (`crates/worklet/test/index.html`, `adlibControlled`, `ahxControlled`, `sidControlled`).
 
 ## Editing and writing tracker modules (a pattern editor's data layer)
 
@@ -789,8 +804,7 @@ these):
 | `apply_live(&LiveEdit) -> bool` | One live edit (above) in place; `false` when the place does not exist or the change is not valid for the song |
 
 `render_taps` hands the voices' taps to the caller (the channel scopes): the player always renders with taps,
-which costs nothing measurable (47.9 against 47.8 us a block). The mixer and the worklet do not call these yet:
-`SidSongSource` in `cubed-mixer` owns a player and can pass them on (as `ModuleSong` does for modules).
+which costs nothing measurable (47.9 against 47.8 us a block). The mixer and the worklet call these through `songs::SidPlayer` ("Song formats under live control").
 
 *Not covered*: dual SID (six orderlists per subsong); GoatTracker 1 (`GTS!`) is read but not written; the
 `.sng` of a song with a start tempo other than 6 (refused, `bake_tempo`); the DAW's flat "song-wide pattern"

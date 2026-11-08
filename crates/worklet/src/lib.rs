@@ -365,7 +365,7 @@ fn forget_song(s: &mut State, source: u32) {
 }
 
 /// Builds the song written at `cw_file_buffer` as prepared source `source`, under live
-/// control, and follows it: `format` 0 is an AHX or HVL song, 1 an Adlib Tracker II module, 3 MOD,
+/// control, and follows it: `format` 0 is an AHX or HVL song, 1 an Adlib Tracker II module, 2 a SID song, 3 MOD,
 /// 4 S3M, 5 XM (the formats `cubed_mixer::songs::open_controlled_song` puts under control;
 /// the others are refused); `separation` as for `cw_prepare_song`, for modules. `flags` bit 0 opens it stopped and
 /// under transport control (no sound until a `SongControl::Play`; its voice never
@@ -414,12 +414,13 @@ fn prepare_module(
     let format = match format {
         0 => SongFormat::Ahx,
         1 => SongFormat::A2m,
+        2 => SongFormat::Sid,
         3 => SongFormat::Mod,
         4 => SongFormat::S3m,
         5 => SongFormat::Xm,
         other => {
             return Err(format!(
-                "format {other} is not under live control (0 AHX/HVL, 1 A2M, 3 MOD, 4 S3M, 5 XM)"
+                "format {other} is not under live control (0 AHX/HVL, 1 A2M, 2 SID, 3 MOD, 4 S3M, 5 XM)"
             ))
         }
     };

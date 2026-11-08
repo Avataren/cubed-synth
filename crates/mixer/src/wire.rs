@@ -422,6 +422,19 @@ fn song_fields(control: &SongControl) -> (u8, u16, u16, u16, f32, u32) {
             0,
         ),
         SongControl::SetRestart(order) => (16, order, 0, 0, 0.0, 0),
+        SongControl::SetTableRow {
+            table,
+            row,
+            left,
+            right,
+        } => (
+            17,
+            table as u16 | (row as u16) << 8,
+            left as u16 | (right as u16) << 8,
+            0,
+            0.0,
+            0,
+        ),
         // Encoded with a tag of its own.
         SongControl::SetCell(_) | SongControl::SetInstrument(_) => unreachable!(),
     }
@@ -476,6 +489,12 @@ fn song_control(
             transpose: c as u8 as i8,
         },
         16 => SongControl::SetRestart(a),
+        17 => SongControl::SetTableRow {
+            table: a as u8,
+            row: (a >> 8) as u8,
+            left: b as u8,
+            right: (b >> 8) as u8,
+        },
         // The tag is known; the kind is from a newer sender.
         _ => return Err(WireError::UnknownTag(tag::SONG_CONTROL)),
     })
@@ -1266,6 +1285,12 @@ mod tests {
                 transpose: -128,
             },
             SongControl::SetRestart(1000),
+            SongControl::SetTableRow {
+                table: 3,
+                row: 254,
+                left: 0xff,
+                right: 0x12,
+            },
         ];
         let instrument = SongInstrument {
             number: 255,

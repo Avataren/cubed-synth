@@ -16,11 +16,13 @@ mod a2m;
 mod ahx;
 mod audition;
 mod player;
+mod sid;
 
 pub use a2m::A2mPlayer;
 pub use ahx::AhxSongPlayer;
 pub use audition::OplAuditionSource;
 pub use player::{PlayerSong, SongPlayer, CHUNK as PLAYER_CHUNK};
+pub use sid::SidPlayer;
 
 /// The most frames a player is asked for at once; longer blocks are split,
 /// so the players' buffers never grow past what the warm-up sized them for.
@@ -143,8 +145,7 @@ pub fn open_module_song(
 /// `song_reader`; `stopped` opens it stopped and its voice never ends by itself.
 ///
 /// MOD, S3M and XM modules (see [`open_module_song`]), Adlib Tracker II songs ([`open_a2m`])
-/// and AHX/HVL songs ([`open_ahx`]); an error for the formats that are not under live control
-/// yet (SID: it joins with a [`SongPlayer`] and an arm here).
+/// AHX/HVL songs ([`open_ahx`]) and SID songs ([`open_sid`]; a `.asid`).
 pub fn open_controlled_song(
     format: SongFormat,
     bytes: &[u8],
@@ -166,7 +167,8 @@ pub fn open_controlled_song(
             open_ahx(song, sample_rate, options, stopped)
         }
         SongFormat::Sid => {
-            Err("this format is not under live control yet (MOD, S3M, XM, A2M and AHX are)".into())
+            let song = SidSong::parse(bytes).map_err(|e| e.to_string())?;
+            open_sid(song, sample_rate, options, stopped)
         }
     }
 }
@@ -205,6 +207,22 @@ pub fn open_ahx(
     stopped: bool,
 ) -> Result<Box<dyn Source>, String> {
     let mut player = AhxSongPlayer::new(song, sample_rate, options.subsong)?;
+    if !stopped {
+        player.control(SongControl::Play);
+    }
+    Ok(Box::new(PlayerSong::new(player, stopped, options.looped)))
+}
+
+/// A SID song the host already holds (an edited one) as a song under live control: see
+/// [`open_controlled_song`]. `options.subsong` is the subsong to start. A SID song starts stopped
+/// (its preview mode); `stopped` false plays it at once. Build it off the audio thread.
+pub fn open_sid(
+    song: SidSong,
+    sample_rate: f32,
+    options: SongOptions,
+    stopped: bool,
+) -> Result<Box<dyn Source>, String> {
+    let mut player = SidPlayer::new(song, sample_rate, options.subsong)?;
     if !stopped {
         player.control(SongControl::Play);
     }
@@ -436,7 +454,8 @@ impl ModuleSong {
             SongControl::SetInstrument(_)
             | SongControl::Timing { .. }
             | SongControl::SetOrder { .. }
-            | SongControl::SetRestart(_) => {}
+            | SongControl::SetRestart(_)
+            | SongControl::SetTableRow { .. } => {}
         }
     }
 }

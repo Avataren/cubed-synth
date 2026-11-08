@@ -159,7 +159,8 @@ impl SongPlayer for A2mPlayer {
             SongControl::Looped(_)
             | SongControl::Scopes(_)
             | SongControl::SetOrder { .. }
-            | SongControl::SetRestart(_) => {}
+            | SongControl::SetRestart(_)
+            | SongControl::SetTableRow { .. } => {}
         }
     }
 

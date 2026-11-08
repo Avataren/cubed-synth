@@ -43,6 +43,7 @@ fn followed_songs_render_and_report_without_allocating() {
         ("tracker/tests/fixtures/demo.xm", 5),
         ("opl/tests/fixtures/a2m/NAB622/corridors of time.a2m", 1),
         ("ahx/tests/fixtures/songs/a_new_beginning.ahx", 0),
+        ("sid/tests/fixtures/sid/s3-chain.asid", 2),
     ];
     for (slot, (name, format)) in names.iter().enumerate() {
         let module = std::fs::read(format!("{}/../{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
@@ -66,7 +67,7 @@ fn followed_songs_render_and_report_without_allocating() {
     };
     // What the page sends, one batch every 200 quanta; the encoding is the page's.
     let mut script: Vec<Vec<u8>> = Vec::new();
-    for voice in 10..15 {
+    for voice in 10..16 {
         script.push(
             [
                 song(voice, SongControl::Scopes(true)),

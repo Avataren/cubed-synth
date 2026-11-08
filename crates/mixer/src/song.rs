@@ -115,10 +115,22 @@ pub enum SongControl {
     },
     /// Sets where the song starts over when it ends (AHX and HVL). Wire kind 16.
     SetRestart(u16),
+    /// Puts a row in one of a SID song's step tables (`table` 0 wave, 1 pulse, 2 filter, 3 speed;
+    /// the table keeps its length): heard where the table next reads it. Wire kind 17. Other
+    /// formats ignore it.
+    SetTableRow {
+        table: u8,
+        row: u8,
+        left: u8,
+        right: u8,
+    },
 }
 
-/// An Adlib instrument as `SongControl::SetInstrument` carries it: what the song loads
-/// into a channel at a note (`cubed_opl::a2::live::LiveEdit::Instrument`).
+/// An instrument as `SongControl::SetInstrument` carries it: what the song loads into a channel
+/// at a note. Adlib: `fm` is the eleven FM bytes and the rest is the instrument's panning,
+/// fine-tune and voice type (`cubed_opl::a2::live::LiveEdit::Instrument`). SID: `fm[..10]` is
+/// attack/decay, sustain/release, first wave, gate timer, flags (bit 0 hard restart, bit 1 no gate
+/// off), vibrato delay and the wave, pulse, filter and speed pointers; the rest is not used.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SongInstrument {
     /// The instrument's number, from 1 (as a cell names it).

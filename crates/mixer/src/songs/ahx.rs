@@ -149,7 +149,8 @@ impl SongPlayer for AhxSongPlayer {
             SongControl::Looped(_)
             | SongControl::Scopes(_)
             | SongControl::SetInstrument(_)
-            | SongControl::Timing { .. } => {}
+            | SongControl::Timing { .. }
+            | SongControl::SetTableRow { .. } => {}
         }
     }
 
