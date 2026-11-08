@@ -496,3 +496,34 @@ fn attaching_a_probe_after_a_seek_shows_the_position_at_once() {
     let s = probe.status();
     assert_eq!((s.order, s.pattern, s.row, s.playing), (2, 2, 12, false));
 }
+
+#[test]
+fn a_live_cell_edit_is_played_the_next_time_it_is_reached() {
+    let mut p = player("demo.mod");
+    p.stop();
+    // Empty the first four rows of pattern 0: a silent start.
+    for row in 0..4 {
+        for ch in 0..4 {
+            assert!(p.set_cell(0, row, ch, Default::default()));
+        }
+    }
+    assert!(!p.set_cell(0, 64, 0, Default::default()), "no row 64");
+    assert!(!p.set_cell(0, 0, 4, Default::default()), "no channel 4");
+    assert!(!p.set_cell(9, 0, 0, Default::default()), "no pattern 9");
+    p.seek(0, 0);
+    p.play();
+    let (_, silent) = run(&mut p, 0.3, 128);
+    assert_eq!(peak(&silent), 0.0);
+    // A note on channel 1, row 1: C-2 (MIDI 36, period 428) on sample 1.
+    let cell = cubed_tracker::Cell {
+        note: cubed_tracker::Note::On(36),
+        period: 428,
+        instrument: 1,
+        ..Default::default()
+    };
+    assert!(p.set_cell(0, 1, 1, cell));
+    assert_eq!(p.module().patterns[0].cell(1, 1), &cell);
+    p.seek(0, 0);
+    let (_, sound) = run(&mut p, 0.3, 128);
+    assert!(energy(&sound) > 0.01, "the new note plays");
+}

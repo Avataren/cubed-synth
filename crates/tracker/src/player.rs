@@ -494,6 +494,27 @@ impl Player {
         };
     }
 
+    /// Puts `cell` in the module's pattern `pattern` (a pattern number, not an
+    /// order position), `row` and `channel`, for the song to play the next time it
+    /// reaches it: a live edit that allocates nothing. Returns false (and changes
+    /// nothing) if there is no such cell. Anything that changes the shape of the
+    /// module (rows of a pattern, the order list, samples) needs a new player.
+    pub fn set_cell(
+        &mut self,
+        pattern: usize,
+        row: usize,
+        channel: usize,
+        cell: crate::module::Cell,
+    ) -> bool {
+        match self.module.patterns.get_mut(pattern) {
+            Some(p) if row < p.rows() && channel < p.channels() => {
+                *p.cell_mut(row, channel) = cell;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Repeats a pattern or a range of rows instead of moving on (see [`Loop`]).
     /// Takes effect at the next row; it does not move the playhead.
     pub fn set_loop(&mut self, repeat: Loop) {
