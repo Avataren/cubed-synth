@@ -206,6 +206,16 @@ pub struct SamplerState {
     pub channels: u32,
     #[serde(rename = "fileName", default)]
     pub file_name: Option<String>,
+    /// The tuning as the DAW keeps it: octaves, semitones and cents, and their
+    /// sum in cents. The engine plays `frequency`, which follows from them.
+    #[serde(default)]
+    pub detune_oct: f32,
+    #[serde(default)]
+    pub detune_semi: f32,
+    #[serde(default)]
+    pub detune_cents: f32,
+    #[serde(default)]
+    pub detune: f32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

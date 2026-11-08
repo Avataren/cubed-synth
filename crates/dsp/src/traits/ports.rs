@@ -46,6 +46,51 @@ impl PortId {
     pub fn index(self) -> usize {
         self as usize
     }
+
+    /// The port's name, as the DAW's generated `PortId` enum spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            PortId::AudioInput0 => "AudioInput0",
+            PortId::AudioInput1 => "AudioInput1",
+            PortId::AudioInput2 => "AudioInput2",
+            PortId::AudioInput3 => "AudioInput3",
+            PortId::AudioOutput0 => "AudioOutput0",
+            PortId::AudioOutput1 => "AudioOutput1",
+            PortId::AudioOutput2 => "AudioOutput2",
+            PortId::AudioOutput3 => "AudioOutput3",
+            PortId::GlobalGate => "GlobalGate",
+            PortId::GlobalFrequency => "GlobalFrequency",
+            PortId::GlobalVelocity => "GlobalVelocity",
+            PortId::Frequency => "Frequency",
+            PortId::FrequencyMod => "FrequencyMod",
+            PortId::PhaseMod => "PhaseMod",
+            PortId::ModIndex => "ModIndex",
+            PortId::CutoffMod => "CutoffMod",
+            PortId::ResonanceMod => "ResonanceMod",
+            PortId::GainMod => "GainMod",
+            PortId::EnvelopeMod => "EnvelopeMod",
+            PortId::StereoPan => "StereoPan",
+            PortId::FeedbackMod => "FeedbackMod",
+            PortId::DetuneMod => "DetuneMod",
+            PortId::WavetableIndex => "WavetableIndex",
+            PortId::WetDryMix => "WetDryMix",
+            PortId::AttackMod => "AttackMod",
+            PortId::ArpGate => "ArpGate",
+            PortId::CombinedGate => "CombinedGate",
+            PortId::SampleOffset => "SampleOffset",
+        }
+    }
+
+    /// The port named `name` (see [`PortId::name`]).
+    pub fn from_name(name: &str) -> Option<PortId> {
+        PortId::ALL.iter().copied().find(|p| p.name() == name)
+    }
+
+    /// The port with this number, if there is one. (`from_u32` maps
+    /// unknown numbers to `AudioInput0`.)
+    pub fn try_from_u32(value: u32) -> Option<PortId> {
+        PortId::ALL.get(value as usize).copied()
+    }
 }
 
 /// A map from ports to values with the API of the hash maps it replaces,

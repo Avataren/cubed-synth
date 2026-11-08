@@ -1,0 +1,1927 @@
+{
+  "effects": [
+    {
+      "category": "effect",
+      "default_id": "10000",
+      "deletable": true,
+      "inputs": [],
+      "outputs": [],
+      "params": [
+        {
+          "default": false,
+          "key": "active",
+          "kind": "bool",
+          "label": "Enabled"
+        },
+        {
+          "curve": "linear",
+          "default": 15,
+          "key": "baseDelayMs",
+          "kind": "float",
+          "label": "Delay",
+          "max": 65,
+          "min": 0.1,
+          "unit": "ms"
+        },
+        {
+          "curve": "linear",
+          "default": 5,
+          "key": "depthMs",
+          "kind": "float",
+          "label": "Depth",
+          "max": 25,
+          "min": 0,
+          "unit": "ms"
+        },
+        {
+          "curve": "log",
+          "default": 0.5,
+          "key": "lfoRateHz",
+          "kind": "float",
+          "label": "Rate",
+          "max": 10,
+          "min": 0.01,
+          "unit": "Hz"
+        },
+        {
+          "curve": "linear",
+          "default": 0.3,
+          "key": "feedback",
+          "kind": "float",
+          "label": "Feedback",
+          "max": 0.98,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "feedback_filter",
+          "kind": "float",
+          "label": "Filter",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "mix",
+          "kind": "float",
+          "label": "Mix",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 90,
+          "key": "stereoPhaseOffsetDeg",
+          "kind": "float",
+          "label": "Stereo phase",
+          "max": 360,
+          "min": 0,
+          "unit": "deg"
+        }
+      ],
+      "singleton": false,
+      "slot": 0,
+      "state_map": "choruses",
+      "state_shape": "map",
+      "title": "Chorus",
+      "type": "chorus"
+    },
+    {
+      "category": "effect",
+      "default_id": "10001",
+      "deletable": true,
+      "inputs": [],
+      "outputs": [],
+      "params": [
+        {
+          "default": false,
+          "key": "active",
+          "kind": "bool",
+          "label": "Enabled"
+        },
+        {
+          "curve": "linear",
+          "default": 250,
+          "key": "delayMs",
+          "kind": "float",
+          "label": "Delay",
+          "max": 2000,
+          "min": 0,
+          "unit": "ms"
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "feedback",
+          "kind": "float",
+          "label": "Feedback",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 0.1,
+          "key": "wetMix",
+          "kind": "float",
+          "label": "Mix",
+          "max": 1,
+          "min": 0
+        }
+      ],
+      "singleton": false,
+      "slot": 1,
+      "state_map": "delays",
+      "state_shape": "map",
+      "title": "Delay",
+      "type": "delay"
+    },
+    {
+      "category": "effect",
+      "default_id": "10002",
+      "deletable": true,
+      "inputs": [],
+      "outputs": [],
+      "params": [
+        {
+          "default": false,
+          "key": "active",
+          "kind": "bool",
+          "label": "Enabled"
+        },
+        {
+          "curve": "linear",
+          "default": 0.95,
+          "key": "room_size",
+          "kind": "float",
+          "label": "Room size",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "damp",
+          "kind": "float",
+          "label": "Damping",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 0.3,
+          "key": "wet",
+          "kind": "float",
+          "label": "Wet",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 0.7,
+          "key": "dry",
+          "kind": "float",
+          "label": "Dry",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "width",
+          "kind": "float",
+          "label": "Width",
+          "max": 1,
+          "min": 0
+        }
+      ],
+      "singleton": false,
+      "slot": 2,
+      "state_map": "reverbs",
+      "state_shape": "map",
+      "title": "Reverb",
+      "type": "freeverb"
+    },
+    {
+      "category": "effect",
+      "default_id": "10003",
+      "deletable": true,
+      "inputs": [],
+      "outputs": [],
+      "params": [
+        {
+          "default": false,
+          "key": "active",
+          "kind": "bool",
+          "label": "Enabled"
+        },
+        {
+          "curve": "linear",
+          "default": 0.1,
+          "key": "wetMix",
+          "kind": "float",
+          "label": "Mix",
+          "max": 1,
+          "min": 0
+        }
+      ],
+      "singleton": false,
+      "slot": 3,
+      "state_map": "convolvers",
+      "state_shape": "map",
+      "title": "Convolution reverb",
+      "type": "convolver"
+    },
+    {
+      "category": "effect",
+      "default_id": "10004",
+      "deletable": true,
+      "inputs": [],
+      "outputs": [],
+      "params": [],
+      "singleton": false,
+      "slot": 4,
+      "state_map": null,
+      "state_shape": "none",
+      "title": "Limiter",
+      "type": "limiter"
+    },
+    {
+      "category": "effect",
+      "default_id": "10005",
+      "deletable": true,
+      "inputs": [],
+      "outputs": [],
+      "params": [
+        {
+          "default": true,
+          "key": "active",
+          "kind": "bool",
+          "label": "Enabled"
+        },
+        {
+          "curve": "linear",
+          "default": -12,
+          "key": "thresholdDb",
+          "kind": "float",
+          "label": "Threshold",
+          "max": 0,
+          "min": -60,
+          "unit": "dB"
+        },
+        {
+          "curve": "linear",
+          "default": 4,
+          "key": "ratio",
+          "kind": "float",
+          "label": "Ratio",
+          "max": 20,
+          "min": 1
+        },
+        {
+          "curve": "log",
+          "default": 10,
+          "key": "attackMs",
+          "kind": "float",
+          "label": "Attack",
+          "max": 200,
+          "min": 0.1,
+          "unit": "ms"
+        },
+        {
+          "curve": "log",
+          "default": 80,
+          "key": "releaseMs",
+          "kind": "float",
+          "label": "Release",
+          "max": 500,
+          "min": 5,
+          "unit": "ms"
+        },
+        {
+          "curve": "linear",
+          "default": 3,
+          "key": "makeupGainDb",
+          "kind": "float",
+          "label": "Makeup",
+          "max": 24,
+          "min": 0,
+          "unit": "dB"
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "mix",
+          "kind": "float",
+          "label": "Mix",
+          "max": 1,
+          "min": 0
+        }
+      ],
+      "singleton": false,
+      "slot": 5,
+      "state_map": "compressors",
+      "state_shape": "map",
+      "title": "Compressor",
+      "type": "compressor"
+    },
+    {
+      "category": "effect",
+      "default_id": "10006",
+      "deletable": true,
+      "inputs": [],
+      "outputs": [],
+      "params": [
+        {
+          "default": false,
+          "key": "active",
+          "kind": "bool",
+          "label": "Enabled"
+        },
+        {
+          "curve": "linear",
+          "default": 2,
+          "key": "drive",
+          "kind": "float",
+          "label": "Drive",
+          "max": 8,
+          "min": 0.5
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "mix",
+          "kind": "float",
+          "label": "Mix",
+          "max": 1,
+          "min": 0
+        }
+      ],
+      "singleton": false,
+      "slot": 6,
+      "state_map": "saturations",
+      "state_shape": "map",
+      "title": "Saturation",
+      "type": "saturation"
+    },
+    {
+      "category": "effect",
+      "default_id": "10007",
+      "deletable": true,
+      "inputs": [],
+      "outputs": [],
+      "params": [
+        {
+          "default": false,
+          "key": "active",
+          "kind": "bool",
+          "label": "Enabled"
+        },
+        {
+          "curve": "linear",
+          "default": 12,
+          "key": "bits",
+          "kind": "int",
+          "label": "Bits",
+          "max": 24,
+          "min": 2,
+          "step": 1
+        },
+        {
+          "curve": "linear",
+          "default": 4,
+          "key": "downsampleFactor",
+          "kind": "int",
+          "label": "Downsample",
+          "max": 32,
+          "min": 1,
+          "step": 1
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "mix",
+          "kind": "float",
+          "label": "Mix",
+          "max": 1,
+          "min": 0
+        }
+      ],
+      "singleton": false,
+      "slot": 7,
+      "state_map": "bitcrushers",
+      "state_shape": "map",
+      "title": "Bitcrusher",
+      "type": "bitcrusher"
+    }
+  ],
+  "modulation_types": [
+    "vca",
+    "bipolar",
+    "additive"
+  ],
+  "nodes": [
+    {
+      "category": "system",
+      "deletable": false,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 21,
+          "kind": "control",
+          "label": "Detune",
+          "modulatable": true,
+          "port": "DetuneMod",
+          "system": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": 9,
+          "kind": "control",
+          "label": "Pitch",
+          "port": "GlobalFrequency"
+        }
+      ],
+      "params": [],
+      "singleton": true,
+      "state_map": null,
+      "state_shape": "none",
+      "title": "Global frequency",
+      "type": "global_frequency"
+    },
+    {
+      "category": "system",
+      "deletable": false,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 0,
+          "kind": "control",
+          "label": "Pitch",
+          "modulatable": false,
+          "port": "AudioInput0",
+          "system": true
+        },
+        {
+          "default_modulation": "additive",
+          "id": 26,
+          "kind": "control",
+          "label": "Gate",
+          "modulatable": false,
+          "port": "CombinedGate",
+          "system": true
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "audio",
+          "label": "Out",
+          "port": "AudioOutput0"
+        }
+      ],
+      "params": [
+        {
+          "default": false,
+          "key": "active",
+          "kind": "bool",
+          "label": "Portamento"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "time",
+          "kind": "float",
+          "label": "Time",
+          "max": 1,
+          "min": 0,
+          "unit": "s"
+        }
+      ],
+      "singleton": true,
+      "state_map": "glides",
+      "state_shape": "map",
+      "title": "Glide",
+      "type": "glide"
+    },
+    {
+      "category": "system",
+      "deletable": false,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 8,
+          "kind": "control",
+          "label": "Gate",
+          "modulatable": false,
+          "port": "GlobalGate",
+          "system": true
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "control",
+          "label": "Out",
+          "port": "AudioOutput0"
+        }
+      ],
+      "params": [
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "sensitivity",
+          "kind": "float",
+          "label": "Sensitivity",
+          "max": 2,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "randomize",
+          "kind": "float",
+          "label": "Randomize",
+          "max": 1,
+          "min": 0
+        }
+      ],
+      "singleton": true,
+      "state_map": "velocity",
+      "state_shape": "single",
+      "title": "Velocity",
+      "type": "global_velocity"
+    },
+    {
+      "category": "system",
+      "deletable": false,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 8,
+          "kind": "control",
+          "label": "Gate",
+          "modulatable": false,
+          "port": "GlobalGate",
+          "system": true
+        },
+        {
+          "default_modulation": "additive",
+          "id": 25,
+          "kind": "control",
+          "label": "Arp gate",
+          "modulatable": false,
+          "port": "ArpGate",
+          "system": true
+        }
+      ],
+      "outputs": [
+        {
+          "id": 26,
+          "kind": "control",
+          "label": "Gate",
+          "port": "CombinedGate"
+        }
+      ],
+      "params": [],
+      "singleton": true,
+      "state_map": null,
+      "state_shape": "none",
+      "title": "Gate mixer",
+      "type": "gatemixer"
+    },
+    {
+      "category": "mixer",
+      "deletable": false,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 0,
+          "kind": "audio",
+          "label": "In",
+          "modulatable": false,
+          "port": "AudioInput0",
+          "system": false
+        },
+        {
+          "default_modulation": "vca",
+          "id": 17,
+          "kind": "control",
+          "label": "Gain",
+          "modulatable": true,
+          "port": "GainMod",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 19,
+          "kind": "control",
+          "label": "Pan",
+          "modulatable": true,
+          "port": "StereoPan",
+          "system": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "audio",
+          "label": "Left",
+          "port": "AudioOutput0"
+        },
+        {
+          "id": 5,
+          "kind": "audio",
+          "label": "Right",
+          "port": "AudioOutput1"
+        }
+      ],
+      "params": [],
+      "singleton": true,
+      "state_map": null,
+      "state_shape": "none",
+      "title": "Mixer",
+      "type": "mixer"
+    },
+    {
+      "category": "filter",
+      "deletable": true,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 0,
+          "kind": "audio",
+          "label": "In",
+          "modulatable": false,
+          "port": "AudioInput0",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 9,
+          "kind": "control",
+          "label": "Pitch",
+          "modulatable": false,
+          "port": "GlobalFrequency",
+          "system": true
+        },
+        {
+          "default_modulation": "additive",
+          "id": 11,
+          "kind": "control",
+          "label": "Base frequency",
+          "modulatable": false,
+          "port": "Frequency",
+          "system": true
+        },
+        {
+          "default_modulation": "additive",
+          "id": 15,
+          "kind": "control",
+          "label": "Cutoff",
+          "modulatable": true,
+          "port": "CutoffMod",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 16,
+          "kind": "control",
+          "label": "Resonance",
+          "modulatable": true,
+          "port": "ResonanceMod",
+          "system": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "audio",
+          "label": "Out",
+          "port": "AudioOutput0"
+        }
+      ],
+      "params": [
+        {
+          "default": true,
+          "key": "active",
+          "kind": "bool",
+          "label": "Active"
+        },
+        {
+          "default": 0,
+          "key": "filter_type",
+          "kind": "enum",
+          "label": "Type",
+          "options": [
+            "LowPass",
+            "LowShelf",
+            "Peaking",
+            "HighShelf",
+            "Notch",
+            "HighPass",
+            "Ladder",
+            "Comb",
+            "BandPass"
+          ]
+        },
+        {
+          "default": 0,
+          "key": "filter_slope",
+          "kind": "enum",
+          "label": "Slope",
+          "options": [
+            "Db12",
+            "Db24"
+          ]
+        },
+        {
+          "curve": "log",
+          "default": 20000,
+          "key": "cutoff",
+          "kind": "float",
+          "label": "Cutoff",
+          "max": 20000,
+          "min": 20,
+          "modulated_by": "CutoffMod",
+          "unit": "Hz"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "resonance",
+          "kind": "float",
+          "label": "Resonance",
+          "max": 1,
+          "min": 0,
+          "modulated_by": "ResonanceMod"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "keytracking",
+          "kind": "float",
+          "label": "Key tracking",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "gain",
+          "kind": "float",
+          "label": "Gain",
+          "max": 2,
+          "min": 0
+        },
+        {
+          "curve": "log",
+          "default": 220,
+          "key": "comb_frequency",
+          "kind": "float",
+          "label": "Comb frequency",
+          "max": 880,
+          "min": 55,
+          "unit": "Hz"
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "comb_dampening",
+          "kind": "float",
+          "label": "Comb damping",
+          "max": 1,
+          "min": 0
+        }
+      ],
+      "singleton": false,
+      "state_map": "filters",
+      "state_shape": "map",
+      "title": "Filter",
+      "type": "filter"
+    },
+    {
+      "category": "generator",
+      "deletable": true,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 9,
+          "kind": "control",
+          "label": "Pitch",
+          "modulatable": false,
+          "port": "GlobalFrequency",
+          "system": true
+        },
+        {
+          "default_modulation": "additive",
+          "id": 8,
+          "kind": "control",
+          "label": "Gate",
+          "modulatable": false,
+          "port": "GlobalGate",
+          "system": true
+        },
+        {
+          "default_modulation": "bipolar",
+          "id": 12,
+          "kind": "control",
+          "label": "Frequency mod",
+          "modulatable": true,
+          "port": "FrequencyMod",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 13,
+          "kind": "control",
+          "label": "Phase mod",
+          "modulatable": true,
+          "port": "PhaseMod",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 14,
+          "kind": "control",
+          "label": "Mod index",
+          "modulatable": true,
+          "port": "ModIndex",
+          "system": false
+        },
+        {
+          "default_modulation": "vca",
+          "id": 17,
+          "kind": "control",
+          "label": "Gain",
+          "modulatable": true,
+          "port": "GainMod",
+          "system": false
+        },
+        {
+          "default_modulation": "vca",
+          "id": 20,
+          "kind": "control",
+          "label": "Feedback",
+          "modulatable": true,
+          "port": "FeedbackMod",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 21,
+          "kind": "control",
+          "label": "Detune",
+          "modulatable": true,
+          "port": "DetuneMod",
+          "system": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "audio",
+          "label": "Left",
+          "port": "AudioOutput0"
+        },
+        {
+          "id": 5,
+          "kind": "audio",
+          "label": "Right",
+          "port": "AudioOutput1"
+        }
+      ],
+      "params": [
+        {
+          "default": true,
+          "key": "active",
+          "kind": "bool",
+          "label": "Active"
+        },
+        {
+          "default": 0,
+          "key": "waveform",
+          "kind": "enum",
+          "label": "Waveform",
+          "options": [
+            "Sine",
+            "Triangle",
+            "Saw",
+            "Square"
+          ]
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "gain",
+          "kind": "float",
+          "label": "Gain",
+          "max": 1,
+          "min": 0,
+          "modulated_by": "GainMod"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "phase_mod_amount",
+          "kind": "float",
+          "label": "Mod index",
+          "max": 30,
+          "min": 0,
+          "modulated_by": "ModIndex"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "feedback_amount",
+          "kind": "float",
+          "label": "Feedback",
+          "max": 1,
+          "min": 0,
+          "modulated_by": "FeedbackMod"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "detune_oct",
+          "kind": "int",
+          "label": "Octave",
+          "max": 5,
+          "min": -5,
+          "step": 1
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "detune_semi",
+          "kind": "int",
+          "label": "Semitones",
+          "max": 12,
+          "min": -12,
+          "step": 1,
+          "unit": "st"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "detune_cents",
+          "kind": "float",
+          "label": "Cents",
+          "max": 100,
+          "min": -100,
+          "step": 1,
+          "unit": "cents"
+        },
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "unison_voices",
+          "kind": "int",
+          "label": "Unison",
+          "max": 10,
+          "min": 1,
+          "step": 1
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "spread",
+          "kind": "float",
+          "label": "Spread",
+          "max": 100,
+          "min": 0,
+          "step": 1,
+          "unit": "cents"
+        },
+        {
+          "default": false,
+          "key": "hard_sync",
+          "kind": "bool",
+          "label": "Hard sync"
+        }
+      ],
+      "singleton": false,
+      "state_map": "oscillators",
+      "state_shape": "map",
+      "title": "Oscillator",
+      "type": "oscillator"
+    },
+    {
+      "category": "generator",
+      "deletable": true,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 9,
+          "kind": "control",
+          "label": "Pitch",
+          "modulatable": false,
+          "port": "GlobalFrequency",
+          "system": true
+        },
+        {
+          "default_modulation": "additive",
+          "id": 8,
+          "kind": "control",
+          "label": "Gate",
+          "modulatable": false,
+          "port": "GlobalGate",
+          "system": true
+        },
+        {
+          "default_modulation": "bipolar",
+          "id": 12,
+          "kind": "control",
+          "label": "Frequency mod",
+          "modulatable": true,
+          "port": "FrequencyMod",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 13,
+          "kind": "control",
+          "label": "Phase mod",
+          "modulatable": true,
+          "port": "PhaseMod",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 14,
+          "kind": "control",
+          "label": "Mod index",
+          "modulatable": true,
+          "port": "ModIndex",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 22,
+          "kind": "control",
+          "label": "Wavetable index",
+          "modulatable": true,
+          "port": "WavetableIndex",
+          "system": false
+        },
+        {
+          "default_modulation": "vca",
+          "id": 17,
+          "kind": "control",
+          "label": "Gain",
+          "modulatable": true,
+          "port": "GainMod",
+          "system": false
+        },
+        {
+          "default_modulation": "vca",
+          "id": 20,
+          "kind": "control",
+          "label": "Feedback",
+          "modulatable": true,
+          "port": "FeedbackMod",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 21,
+          "kind": "control",
+          "label": "Detune",
+          "modulatable": true,
+          "port": "DetuneMod",
+          "system": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "audio",
+          "label": "Left",
+          "port": "AudioOutput0"
+        },
+        {
+          "id": 5,
+          "kind": "audio",
+          "label": "Right",
+          "port": "AudioOutput1"
+        }
+      ],
+      "params": [
+        {
+          "default": true,
+          "key": "active",
+          "kind": "bool",
+          "label": "Active"
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "gain",
+          "kind": "float",
+          "label": "Gain",
+          "max": 1,
+          "min": 0,
+          "modulated_by": "GainMod"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "wave_index",
+          "kind": "float",
+          "label": "Wave index",
+          "max": 1,
+          "min": 0,
+          "modulated_by": "WavetableIndex"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "phase_mod_amount",
+          "kind": "float",
+          "label": "Mod index",
+          "max": 30,
+          "min": 0,
+          "modulated_by": "ModIndex"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "feedback_amount",
+          "kind": "float",
+          "label": "Feedback",
+          "max": 1,
+          "min": 0,
+          "modulated_by": "FeedbackMod"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "detune_oct",
+          "kind": "int",
+          "label": "Octave",
+          "max": 5,
+          "min": -5,
+          "step": 1
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "detune_semi",
+          "kind": "int",
+          "label": "Semitones",
+          "max": 12,
+          "min": -12,
+          "step": 1,
+          "unit": "st"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "detune_cents",
+          "kind": "float",
+          "label": "Cents",
+          "max": 100,
+          "min": -100,
+          "step": 1,
+          "unit": "cents"
+        },
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "unison_voices",
+          "kind": "int",
+          "label": "Unison",
+          "max": 10,
+          "min": 1,
+          "step": 1
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "spread",
+          "kind": "float",
+          "label": "Spread",
+          "max": 100,
+          "min": 0,
+          "step": 1,
+          "unit": "cents"
+        },
+        {
+          "default": false,
+          "key": "hard_sync",
+          "kind": "bool",
+          "label": "Hard sync"
+        }
+      ],
+      "singleton": false,
+      "state_map": "wavetableOscillators",
+      "state_shape": "map",
+      "title": "Wavetable oscillator",
+      "type": "wavetable_oscillator"
+    },
+    {
+      "category": "generator",
+      "deletable": true,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 9,
+          "kind": "control",
+          "label": "Pitch",
+          "modulatable": false,
+          "port": "GlobalFrequency",
+          "system": true
+        },
+        {
+          "default_modulation": "additive",
+          "id": 8,
+          "kind": "control",
+          "label": "Gate",
+          "modulatable": false,
+          "port": "GlobalGate",
+          "system": true
+        },
+        {
+          "default_modulation": "bipolar",
+          "id": 12,
+          "kind": "control",
+          "label": "Frequency mod",
+          "modulatable": true,
+          "port": "FrequencyMod",
+          "system": false
+        },
+        {
+          "default_modulation": "vca",
+          "id": 17,
+          "kind": "control",
+          "label": "Gain",
+          "modulatable": true,
+          "port": "GainMod",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 19,
+          "kind": "control",
+          "label": "Pan",
+          "modulatable": true,
+          "port": "StereoPan",
+          "system": false
+        },
+        {
+          "default_modulation": "additive",
+          "id": 27,
+          "kind": "control",
+          "label": "Sample offset",
+          "modulatable": true,
+          "port": "SampleOffset",
+          "system": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "audio",
+          "label": "Left",
+          "port": "AudioOutput0"
+        },
+        {
+          "id": 5,
+          "kind": "audio",
+          "label": "Right",
+          "port": "AudioOutput1"
+        }
+      ],
+      "params": [
+        {
+          "default": true,
+          "key": "active",
+          "kind": "bool",
+          "label": "Active"
+        },
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "gain",
+          "kind": "float",
+          "label": "Gain",
+          "max": 1.5,
+          "min": 0,
+          "modulated_by": "GainMod"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "detune_oct",
+          "kind": "int",
+          "label": "Octave",
+          "max": 5,
+          "min": -5,
+          "step": 1
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "detune_semi",
+          "kind": "int",
+          "label": "Semitones",
+          "max": 12,
+          "min": -12,
+          "step": 1,
+          "unit": "st"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "detune_cents",
+          "kind": "float",
+          "label": "Cents",
+          "max": 100,
+          "min": -100,
+          "step": 1,
+          "unit": "cents"
+        },
+        {
+          "curve": "linear",
+          "default": 60,
+          "key": "rootNote",
+          "kind": "int",
+          "label": "Root note",
+          "max": 127,
+          "min": 0,
+          "step": 1
+        },
+        {
+          "default": 0,
+          "key": "loopMode",
+          "kind": "enum",
+          "label": "Loop mode",
+          "options": [
+            "Off",
+            "Loop",
+            "PingPong"
+          ]
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "loopStart",
+          "kind": "float",
+          "label": "Loop start",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "loopEnd",
+          "kind": "float",
+          "label": "Loop end",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "default": 1,
+          "key": "triggerMode",
+          "kind": "enum",
+          "label": "Trigger",
+          "options": [
+            "FreeRunning",
+            "Gate",
+            "OneShot"
+          ]
+        }
+      ],
+      "singleton": false,
+      "state_map": "samplers",
+      "state_shape": "map",
+      "title": "Sampler",
+      "type": "sampler"
+    },
+    {
+      "category": "modulator",
+      "deletable": true,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 26,
+          "kind": "control",
+          "label": "Gate",
+          "modulatable": false,
+          "port": "CombinedGate",
+          "system": true
+        },
+        {
+          "default_modulation": "additive",
+          "id": 24,
+          "kind": "control",
+          "label": "Attack",
+          "modulatable": true,
+          "port": "AttackMod",
+          "system": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "control",
+          "label": "Out",
+          "port": "AudioOutput0"
+        }
+      ],
+      "params": [
+        {
+          "default": true,
+          "key": "active",
+          "kind": "bool",
+          "label": "Active"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "attack",
+          "kind": "float",
+          "label": "Attack",
+          "max": 3,
+          "min": 0,
+          "modulated_by": "AttackMod",
+          "unit": "s"
+        },
+        {
+          "curve": "linear",
+          "default": 0.1,
+          "key": "decay",
+          "kind": "float",
+          "label": "Decay",
+          "max": 10,
+          "min": 0,
+          "unit": "s"
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "sustain",
+          "kind": "float",
+          "label": "Sustain",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 0.1,
+          "key": "release",
+          "kind": "float",
+          "label": "Release",
+          "max": 3,
+          "min": 0,
+          "unit": "s"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "attackCurve",
+          "kind": "float",
+          "label": "Attack curve",
+          "max": 10,
+          "min": -10
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "decayCurve",
+          "kind": "float",
+          "label": "Decay curve",
+          "max": 10,
+          "min": -10
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "releaseCurve",
+          "kind": "float",
+          "label": "Release curve",
+          "max": 10,
+          "min": -10
+        }
+      ],
+      "singleton": false,
+      "state_map": "envelopes",
+      "state_shape": "map",
+      "title": "Envelope",
+      "type": "envelope"
+    },
+    {
+      "category": "modulator",
+      "deletable": true,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 26,
+          "kind": "control",
+          "label": "Gate",
+          "modulatable": false,
+          "port": "CombinedGate",
+          "system": true
+        },
+        {
+          "default_modulation": "bipolar",
+          "id": 12,
+          "kind": "control",
+          "label": "Frequency mod",
+          "modulatable": true,
+          "port": "FrequencyMod",
+          "system": false
+        },
+        {
+          "default_modulation": "vca",
+          "id": 17,
+          "kind": "control",
+          "label": "Gain",
+          "modulatable": true,
+          "port": "GainMod",
+          "system": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "control",
+          "label": "Out",
+          "port": "AudioOutput0"
+        }
+      ],
+      "params": [
+        {
+          "default": true,
+          "key": "active",
+          "kind": "bool",
+          "label": "Active"
+        },
+        {
+          "default": 0,
+          "key": "waveform",
+          "kind": "enum",
+          "label": "Waveform",
+          "options": [
+            "Sine",
+            "Triangle",
+            "Square",
+            "Saw",
+            "InverseSaw"
+          ]
+        },
+        {
+          "curve": "log",
+          "default": 1,
+          "key": "frequency",
+          "kind": "float",
+          "label": "Frequency",
+          "max": 20,
+          "min": 0.01,
+          "modulated_by": "FrequencyMod",
+          "unit": "Hz"
+        },
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "gain",
+          "kind": "float",
+          "label": "Gain",
+          "max": 5,
+          "min": -5,
+          "modulated_by": "GainMod"
+        },
+        {
+          "curve": "linear",
+          "default": 0,
+          "key": "phaseOffset",
+          "kind": "float",
+          "label": "Phase",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "default": false,
+          "key": "useAbsolute",
+          "kind": "bool",
+          "label": "Absolute"
+        },
+        {
+          "default": false,
+          "key": "useNormalized",
+          "kind": "bool",
+          "label": "Normalized"
+        },
+        {
+          "default": 0,
+          "key": "triggerMode",
+          "kind": "enum",
+          "label": "Trigger",
+          "options": [
+            "FreeRunning",
+            "StartOnGate",
+            "Retrigger",
+            "OneShot"
+          ]
+        },
+        {
+          "default": 0,
+          "key": "loopMode",
+          "kind": "enum",
+          "label": "Loop mode",
+          "options": [
+            "Off",
+            "Loop",
+            "PingPong"
+          ]
+        },
+        {
+          "curve": "linear",
+          "default": 0.5,
+          "key": "loopStart",
+          "kind": "float",
+          "label": "Loop start",
+          "max": 1,
+          "min": 0
+        },
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "loopEnd",
+          "kind": "float",
+          "label": "Loop end",
+          "max": 1,
+          "min": 0
+        }
+      ],
+      "singleton": false,
+      "state_map": "lfos",
+      "state_shape": "map",
+      "title": "LFO",
+      "type": "lfo"
+    },
+    {
+      "category": "generator",
+      "deletable": true,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 15,
+          "kind": "control",
+          "label": "Cutoff",
+          "modulatable": true,
+          "port": "CutoffMod",
+          "system": false
+        },
+        {
+          "default_modulation": "vca",
+          "id": 17,
+          "kind": "control",
+          "label": "Gain",
+          "modulatable": true,
+          "port": "GainMod",
+          "system": false
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "audio",
+          "label": "Left",
+          "port": "AudioOutput0"
+        },
+        {
+          "id": 5,
+          "kind": "audio",
+          "label": "Right",
+          "port": "AudioOutput1"
+        }
+      ],
+      "params": [
+        {
+          "default": false,
+          "key": "is_enabled",
+          "kind": "bool",
+          "label": "Enabled"
+        },
+        {
+          "default": 0,
+          "key": "noiseType",
+          "kind": "enum",
+          "label": "Noise type",
+          "options": [
+            "White",
+            "Pink",
+            "Brownian"
+          ]
+        },
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "cutoff",
+          "kind": "float",
+          "label": "Cutoff",
+          "max": 1,
+          "min": 0,
+          "modulated_by": "CutoffMod"
+        },
+        {
+          "curve": "linear",
+          "default": 1,
+          "key": "gain",
+          "kind": "float",
+          "label": "Gain",
+          "max": 1,
+          "min": 0,
+          "modulated_by": "GainMod"
+        }
+      ],
+      "singleton": true,
+      "state_map": "noise",
+      "state_shape": "single",
+      "title": "Noise",
+      "type": "noise"
+    },
+    {
+      "category": "modulator",
+      "deletable": true,
+      "inputs": [
+        {
+          "default_modulation": "additive",
+          "id": 8,
+          "kind": "control",
+          "label": "Gate",
+          "modulatable": false,
+          "port": "GlobalGate",
+          "system": true
+        }
+      ],
+      "outputs": [
+        {
+          "id": 4,
+          "kind": "control",
+          "label": "Out",
+          "port": "AudioOutput0"
+        },
+        {
+          "id": 25,
+          "kind": "control",
+          "label": "Arp gate",
+          "port": "ArpGate"
+        }
+      ],
+      "params": [],
+      "singleton": true,
+      "state_map": null,
+      "state_shape": "none",
+      "title": "Arpeggiator",
+      "type": "arpeggiator_generator"
+    }
+  ],
+  "patch": {
+    "macro_count": 4,
+    "macro_value": {
+      "curve": "linear",
+      "default": 0,
+      "key": "macro",
+      "kind": "float",
+      "label": "Macro",
+      "max": 1,
+      "min": 0
+    },
+    "params": [
+      {
+        "curve": "linear",
+        "default": 1,
+        "key": "instrumentGain",
+        "kind": "float",
+        "label": "Volume",
+        "max": 2,
+        "min": 0
+      }
+    ]
+  },
+  "ports": [
+    {
+      "id": 0,
+      "name": "AudioInput0"
+    },
+    {
+      "id": 1,
+      "name": "AudioInput1"
+    },
+    {
+      "id": 2,
+      "name": "AudioInput2"
+    },
+    {
+      "id": 3,
+      "name": "AudioInput3"
+    },
+    {
+      "id": 4,
+      "name": "AudioOutput0"
+    },
+    {
+      "id": 5,
+      "name": "AudioOutput1"
+    },
+    {
+      "id": 6,
+      "name": "AudioOutput2"
+    },
+    {
+      "id": 7,
+      "name": "AudioOutput3"
+    },
+    {
+      "id": 8,
+      "name": "GlobalGate"
+    },
+    {
+      "id": 9,
+      "name": "GlobalFrequency"
+    },
+    {
+      "id": 10,
+      "name": "GlobalVelocity"
+    },
+    {
+      "id": 11,
+      "name": "Frequency"
+    },
+    {
+      "id": 12,
+      "name": "FrequencyMod"
+    },
+    {
+      "id": 13,
+      "name": "PhaseMod"
+    },
+    {
+      "id": 14,
+      "name": "ModIndex"
+    },
+    {
+      "id": 15,
+      "name": "CutoffMod"
+    },
+    {
+      "id": 16,
+      "name": "ResonanceMod"
+    },
+    {
+      "id": 17,
+      "name": "GainMod"
+    },
+    {
+      "id": 18,
+      "name": "EnvelopeMod"
+    },
+    {
+      "id": 19,
+      "name": "StereoPan"
+    },
+    {
+      "id": 20,
+      "name": "FeedbackMod"
+    },
+    {
+      "id": 21,
+      "name": "DetuneMod"
+    },
+    {
+      "id": 22,
+      "name": "WavetableIndex"
+    },
+    {
+      "id": 23,
+      "name": "WetDryMix"
+    },
+    {
+      "id": 24,
+      "name": "AttackMod"
+    },
+    {
+      "id": 25,
+      "name": "ArpGate"
+    },
+    {
+      "id": 26,
+      "name": "CombinedGate"
+    },
+    {
+      "id": 27,
+      "name": "SampleOffset"
+    }
+  ],
+  "transforms": [
+    "none",
+    "invert",
+    "square",
+    "cube"
+  ],
+  "version": 1
+}

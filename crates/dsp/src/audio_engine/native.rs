@@ -617,6 +617,23 @@ impl AudioEngine {
         }
     }
 
+    /// The effects in the stack by type name (`chorus`, `delay`, ...), in the
+    /// order they process.
+    pub fn effect_kinds(&self) -> Vec<String> {
+        self.effect_stack
+            .effects
+            .iter()
+            .map(|effect| effect.node.node_type().to_string())
+            .collect()
+    }
+
+    /// A node of this type, as the loader makes it (for tests).
+    #[cfg(test)]
+    pub(crate) fn build_node_for_test(&mut self, node_type: &str) -> Box<dyn AudioNode> {
+        self.create_node_from_type(node_type, &NodeId::new())
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
     /// The effect-stack node with this patch id (`EFFECT_NODE_ID_OFFSET` +
     /// its index), if it is a `T`; otherwise a warning.
     fn effect_mut<T: 'static>(&mut self, node_id: usize) -> Option<&mut T> {

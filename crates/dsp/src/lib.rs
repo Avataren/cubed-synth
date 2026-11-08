@@ -7,6 +7,7 @@ pub mod audio;
 pub mod audio_engine;
 pub mod automation;
 pub mod biquad;
+pub mod catalog;
 pub mod effect_stack;
 pub mod graph;
 pub mod impulse_generator;

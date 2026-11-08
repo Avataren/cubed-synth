@@ -1,5 +1,5 @@
-mod patch;
-mod patch_loader;
+pub(crate) mod patch;
+pub(crate) mod patch_loader;
 #[cfg(any(
     all(feature = "wasm", target_arch = "wasm32"),
     feature = "native-host",
