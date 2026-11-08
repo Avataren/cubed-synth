@@ -1646,7 +1646,7 @@ fn follow(name: &str, ops: &[Value]) {
         );
     }
     // Undo and redo are live edits too.
-    while let Some(_) = d.undo() {
+    while d.undo().is_some() {
         match d.live_edits() {
             Some(edits) => {
                 for e in edits {

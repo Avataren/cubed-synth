@@ -381,6 +381,12 @@ XMs none is byte-identical and all 113 load to the same module: the DAW keeps th
 sample's bit depth (this writes the narrowest exact width) and the points of a *disabled* envelope, which
 `Module` does not hold (an envelope is `None` when off, so loading an XM drops them: a known limit).
 
+*Not covered*: converting between formats (a MOD to an XM; `to_bytes` writes the module's own format);
+S3M drum channels (channel settings 25-29 load as plain channels); the points of a disabled XM envelope; a MOD's
+`vblank_timing` and `amiga_limits` are not in the file (loading derives them from the song, so an edit can make a
+reload differ in those flags; `info().flags` and `set_flag` show and set them); an S3M pan that is not on the
+pan table's 16 steps (or ST3's default left/right) is written as the nearest step.
+
 ## Building, testing, benchmarks
 
 ```sh
