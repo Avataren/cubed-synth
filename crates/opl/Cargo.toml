@@ -9,6 +9,11 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
+default = ["edit"]
+# The edit layer (`cubed_opl::edit`: A2M songs and OPL instruments as documents,
+# JSON operations, undo and redo). Nothing in a player calls it, so a worklet
+# drops it at link time.
+edit = []
 # wasm-bindgen classes for the browser (another_synth's OPL worklet).
 wasm = ["dep:wasm-bindgen"]
 

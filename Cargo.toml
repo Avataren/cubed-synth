@@ -57,3 +57,8 @@ opt-level = 1
 
 [profile.dev.package.cubed-simd]
 opt-level = 1
+
+# The A2M writer packs megabytes of songdata with the aPLib and LZH encoders:
+# the edit layer's tests save a song after every operation.
+[profile.dev.package.cubed-opl]
+opt-level = 1

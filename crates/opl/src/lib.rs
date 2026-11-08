@@ -46,6 +46,8 @@
 pub mod a2;
 pub mod audition;
 pub mod chip;
+#[cfg(feature = "edit")]
+pub mod edit;
 pub mod fm;
 pub mod operator;
 pub mod resample;
