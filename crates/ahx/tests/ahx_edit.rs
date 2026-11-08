@@ -1698,3 +1698,128 @@ fn undo_returns_what_to_redraw() {
     assert_eq!(doc.song().instrument_nr, 1);
     let _ = InsertKind::Blank;
 }
+
+// ----- what the controls draw ----------------------------------------------------
+
+#[test]
+fn the_instrument_visuals_come_from_the_replayer() {
+    let mut doc = AhxDoc::new(SongFormat::Ahx);
+    op(&mut doc, json!({"op": "add_instrument"}));
+    // The default envelope: attack 1 frame to 64, decay 10 to 48, no sustain, release 10 to 0.
+    let c = op(&mut doc, json!({"op": "envelope_curve", "n": 1}));
+    let v: Vec<f64> = c["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap())
+        .collect();
+    assert_eq!(v.len(), 21);
+    assert_eq!(v[0], 64.0);
+    assert_eq!(v[10], 48.0);
+    assert_eq!(*v.last().unwrap(), 0.0);
+    assert_eq!(
+        (
+            c["attack"].clone(),
+            c["decay"].clone(),
+            c["sustain"].clone(),
+            c["release"].clone()
+        ),
+        (json!(1), json!(11), json!(11), json!(21))
+    );
+    assert!(doc.apply(&json!({"op": "envelope_curve", "n": 2})).is_err());
+
+    // Waveforms: a cycle of 4 << wave_length samples.
+    for wl in 0..=5usize {
+        for w in 1..=4usize {
+            let s = op(
+                &mut doc,
+                json!({"op": "waveform_shape", "waveform": w, "wave_length": wl, "square_pos": 20}),
+            );
+            assert_eq!(
+                s["samples"].as_array().unwrap().len(),
+                4 << wl,
+                "waveform {w} length {wl}"
+            );
+        }
+    }
+    let saw = op(
+        &mut doc,
+        json!({"op": "waveform_shape", "waveform": 2, "wave_length": 3}),
+    );
+    let saw: Vec<i64> = saw["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap())
+        .collect();
+    assert_eq!(saw[0], -128);
+    assert!(saw.windows(2).all(|w| w[1] > w[0]));
+    let square = op(
+        &mut doc,
+        json!({"op": "waveform_shape", "waveform": 3, "wave_length": 3, "square_pos": 8}),
+    );
+    let square: Vec<i64> = square["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        square.iter().filter(|&&x| x > 0).count(),
+        square.iter().filter(|&&x| x < 0).count(),
+        "a 50% duty"
+    );
+    assert!(doc
+        .apply(&json!({"op": "waveform_shape", "waveform": 5, "wave_length": 0}))
+        .is_err());
+    assert!(doc
+        .apply(&json!({"op": "waveform_shape", "waveform": 1, "wave_length": 6}))
+        .is_err());
+
+    // A filter sweep heads for its upper limit, bounces and stays inside its limits.
+    op(
+        &mut doc,
+        json!({"op": "set_instrument", "n": 1, "filter_lower_limit": 10, "filter_upper_limit": 40, "filter_speed": 4,
+        "square_lower_limit": 8, "square_upper_limit": 40, "square_speed": 1, "wave_length": 5}),
+    );
+    let t = op(
+        &mut doc,
+        json!({"op": "sweep_trace", "n": 1, "kind": "filter", "frames": 400}),
+    );
+    let p: Vec<i64> = t["positions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap())
+        .collect();
+    assert_eq!(p[0], 32);
+    assert_eq!(
+        (t["lower"].clone(), t["upper"].clone()),
+        (json!(10), json!(40))
+    );
+    assert!(p.iter().all(|&x| (10..=40).contains(&x)), "{p:?}");
+    assert!(p.contains(&10) && p.contains(&40));
+    let t = op(
+        &mut doc,
+        json!({"op": "sweep_trace", "n": 1, "kind": "square", "frames": 400, "start": 10}),
+    );
+    let p: Vec<i64> = t["positions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap())
+        .collect();
+    assert!(p.iter().all(|&x| (8..=40).contains(&x)));
+    assert!(p.len() == 401 && p.iter().max() != p.iter().min());
+
+    // Vibrato: still through its delay, then the table times the depth.
+    op(
+        &mut doc,
+        json!({"op": "set_instrument", "n": 1, "vibrato_delay": 3, "vibrato_depth": 8, "vibrato_speed": 8}),
+    );
+    let v = op(
+        &mut doc,
+        json!({"op": "vibrato_curve", "n": 1, "frames": 8}),
+    );
+    assert_eq!(v["offsets"], json!([0, 0, 0, 0, 11, 15, 11, 0]));
+}

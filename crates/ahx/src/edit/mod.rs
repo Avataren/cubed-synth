@@ -70,6 +70,7 @@ mod limits;
 mod live;
 mod positions;
 mod steps;
+mod visuals;
 
 use serde_json::{json, Value};
 
@@ -89,7 +90,7 @@ pub use positions::{InsertKind, PositionMap};
 pub use steps::{At, ClearMask, PasteMode, Pasted, StepClip};
 
 use self::history::{Change, History};
-use self::json::{opt_bool, opt_str, opt_u8, opt_usize, req_i64, req_str, req_usize};
+use self::json::{opt_bool, opt_i64, opt_str, opt_u8, opt_usize, req_i64, req_str, req_usize};
 use self::limits::{format_name, Res};
 use crate::format::{self, Instrument, Position, Song, SongFormat, Step};
 use crate::write::{self, Origin};
@@ -806,6 +807,10 @@ impl AhxDoc {
     ///   "flat"}`
     /// - `{"op": "live_edits"}` -> `{"live": {...} | null}`, see
     ///   [`live_edits`](Self::live_edits)
+    /// - what the instrument controls draw, from the replayer's own code:
+    ///   `{"op": "envelope_curve", "n"}`, `{"op": "waveform_shape", "waveform",
+    ///   "wave_length", "square_pos"}`, `{"op": "sweep_trace", "n", "kind",
+    ///   "frames", "sign", "start"}`, `{"op": "vibrato_curve", "n", "frames"}`
     /// - `{"op": "bytes"}` -> `{"bytes": base64}` (the file), `{"op":
     ///   "instrument_bytes", "n"}` -> `{"bytes": base64}` (the wire form)
     /// - `{"op": "copy_range", <track>, "row0", "row1"}` -> a clip, `{"op":
@@ -892,6 +897,29 @@ impl AhxDoc {
                 opt_usize(op, "count")?.unwrap_or(usize::MAX),
                 opt_bool(op, "flat")?.unwrap_or(false),
             ),
+            "envelope_curve" => self.envelope_curve(req_usize(op, "n")?),
+            "waveform_shape" => self.waveform_shape(
+                req_usize(op, "waveform")?,
+                req_usize(op, "wave_length")?,
+                opt_usize(op, "square_pos")?.unwrap_or(32),
+            ),
+            "sweep_trace" => {
+                let kind = match req_str(op, "kind")? {
+                    "filter" => SweepKind::Filter,
+                    "square" => SweepKind::Square,
+                    other => return Err(format!("'{other}' is not a sweep (filter, square)")),
+                };
+                self.sweep_trace(
+                    req_usize(op, "n")?,
+                    kind,
+                    opt_usize(op, "frames")?.unwrap_or(200),
+                    opt_i64(op, "sign")?.unwrap_or(1) as i32,
+                    opt_i64(op, "start")?.unwrap_or(0) as i32,
+                )
+            }
+            "vibrato_curve" => {
+                self.vibrato_curve(req_usize(op, "n")?, opt_usize(op, "frames")?.unwrap_or(200))
+            }
             "bytes" => Ok(json!({"bytes": base64_encode(&self.to_bytes()?)})),
             "instrument_bytes" => {
                 Ok(json!({"bytes": base64_encode(&self.instrument_bytes(req_usize(op, "n")?)?)}))

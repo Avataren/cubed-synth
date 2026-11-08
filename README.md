@@ -419,7 +419,11 @@ Reads: `info()` (format, version, name, channels, counts, speed multiplier, `lim
 `rows(track, row0, count, flat)`, `position_rows(position, row0, count, flat)` (`cells[row][channel]` plus the tracks and
 transposes: what the pattern grid draws), `positions(first, count)`, `tracks()` (usage and blank flags),
 `instruments()` (with how many steps play each), `instrument(n)`, `plist(n, row0, count, flat)`, `validate()`,
-`instrument_bytes(n)` (the wire form `AhxPlayer::replace_instrument` takes). Every JSON edit returns `{"changed":
+`instrument_bytes(n)` (the wire form `AhxPlayer::replace_instrument` takes). What an instrument's controls draw is
+simulated with the replayer's own code, so a drawing cannot drift from what plays: `envelope_curve(n)` (the level
+per tick and where each stage ends), `waveform_shape(waveform, wave_length, square_pos)` (one cycle before any filter),
+`sweep_trace(n, kind, frames, sign, start)` (the filter's or the square's position per tick) and `vibrato_curve(n,
+frames)`. Every JSON edit returns `{"changed":
 {"tracks": [{track, row0, row1}], "positions": {first, last}, "position_list", "layout", "header", "restart",
 "instruments": [n], "plists": [{instrument, row0, row1}], "instrument_list"}}` and its own fields.
 
