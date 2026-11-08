@@ -365,6 +365,29 @@ impl Chip {
         self.pending.push((self.cycles + delay, reg, val));
     }
 
+    /// Room for `n` scheduled writes at once, so that [`Chip::write_after`] does
+    /// not allocate while a host feeds the chip a stretch of a register stream
+    /// (the queue starts with room for a player frame's worth).
+    pub fn reserve_writes(&mut self, n: usize) {
+        self.pending.reserve(n.saturating_sub(self.pending.len()));
+    }
+
+    /// The chip cycles the next `samples` samples of [`Chip::render`] will clock,
+    /// to the cycle (the count is the render's own: a fraction of a cycle carries
+    /// from one sample to the next). A host that runs the code making the writes
+    /// in step with the audio asks it how far to run before a block.
+    pub fn cycles_in_next(&self, samples: usize) -> u64 {
+        let mut frac = self.cycle_frac;
+        let mut total = 0u64;
+        for _ in 0..samples {
+            frac += self.cycles_per_sample;
+            let n = frac as u32;
+            frac -= n as f64;
+            total += n as u64;
+        }
+        total
+    }
+
     /// Runs the digital core at `hz` chip cycles per second instead of the PAL
     /// clock: a C64 tune made for an NTSC machine (1 022 727 Hz) plays at the
     /// pitch and speed its player was written for. Only the cycles each output

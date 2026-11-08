@@ -41,6 +41,7 @@ pub mod goattracker;
 pub mod noise;
 pub mod player;
 pub mod probe;
+pub mod psid;
 pub mod revision;
 pub mod song;
 pub mod stream;
