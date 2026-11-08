@@ -14,6 +14,7 @@ pub mod format;
 pub mod hifi;
 pub mod player;
 pub mod plist;
+pub mod probe;
 pub mod voice;
 pub mod waveform;
 pub mod write;

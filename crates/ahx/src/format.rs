@@ -16,6 +16,9 @@ use std::fmt;
 /// contradiction with `verdict.md`'s "AHX is always 4 channels" framing.
 pub const MAX_CHANNELS: usize = 16;
 
+/// AHX note `n` (C-1 is 1, B-5 is 60) is MIDI note `n + 23`.
+pub const MIDI_OFFSET: i32 = 23;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SongFormat {
     /// `"THX"` magic, version byte < 3.
