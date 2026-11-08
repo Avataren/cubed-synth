@@ -364,9 +364,10 @@ fn forget_song(s: &mut State, source: u32) {
     }
 }
 
-/// Builds the MOD, S3M or XM module written at `cw_file_buffer` as prepared
-/// source `source`, under live control, and follows it: `format` 3 is MOD, 4 S3M,
-/// 5 XM; `separation` as for `cw_prepare_song`. `flags` bit 0 opens it stopped and
+/// Builds the song written at `cw_file_buffer` as prepared source `source`, under live
+/// control, and follows it: `format` 1 is an Adlib Tracker II module, 3 MOD, 4 S3M,
+/// 5 XM (the formats `cubed_mixer::songs::open_controlled_song` puts under control;
+/// the others are refused); `separation` as for `cw_prepare_song`, for modules. `flags` bit 0 opens it stopped and
 /// under transport control (no sound until a `SongControl::Play`; its voice never
 /// ends by itself). Play it with a `PlaySource` command, steer it with
 /// `SourceEvent::Song` commands (wire tag 30), and read it with `cw_songs_prepare`.
@@ -409,12 +410,17 @@ fn prepare_module(
     options: SongOptions,
     stopped: bool,
 ) -> Result<(), String> {
-    use cubed_mixer::songs::{open_module_song, SongFormat};
+    use cubed_mixer::songs::{open_controlled_song, SongFormat};
     let format = match format {
+        1 => SongFormat::A2m,
         3 => SongFormat::Mod,
         4 => SongFormat::S3m,
         5 => SongFormat::Xm,
-        other => return Err(format!("format {other} is not a tracker module (3, 4, 5)")),
+        other => {
+            return Err(format!(
+                "format {other} is not under live control (1 A2M, 3 MOD, 4 S3M, 5 XM)"
+            ))
+        }
     };
     if source as usize >= s.songs.len() {
         return Err(format!("no source slot {source}"));
@@ -425,8 +431,8 @@ fn prepare_module(
         looped: options.looped,
         stereo_separation: options.stereo_separation,
     };
-    let song = open_module_song(format, &s.file, rate, options, stopped)?;
-    let reader = song.song_reader().ok_or("the module has no reader")?;
+    let song = open_controlled_song(format, &s.file, rate, options, stopped)?;
+    let reader = song.song_reader().ok_or("the song has no reader")?;
     s.songs[source as usize] = Some(SongSlot {
         reader,
         last_version: u32::MAX,
