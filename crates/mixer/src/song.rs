@@ -289,6 +289,97 @@ impl WebSong {
     }
 }
 
+/// The songs the page follows, by source slot: what a `'songpos'` and a
+/// `'songscope'` message carry, parsed into one [`WebSong`] each (the web
+/// counterpart of the native readers, as `WebAnalysis` is of `NativeHost`). Feed
+/// it each message with [`update_positions`](Self::update_positions) and
+/// [`update_scopes`](Self::update_scopes); read a song with [`get`](Self::get).
+#[derive(Debug, Default)]
+pub struct WebSongs {
+    songs: Vec<Option<WebSong>>,
+}
+
+impl WebSongs {
+    pub fn new() -> WebSongs {
+        WebSongs::default()
+    }
+
+    /// Takes a `'songpos'` message: the source slots it reports, their status
+    /// words ([`SONG_STATUS_WORDS`] each) and their levels
+    /// ([`SONG_LEVEL_SLOTS`] each). A song that is not in the message keeps what it
+    /// had (it has not moved); one reported gone reads `alive() == false` until
+    /// [`forget`](Self::forget). Returns how many entries were taken.
+    pub fn update_positions(&mut self, sources: &[u32], status: &[u32], levels: &[f32]) -> usize {
+        let mut taken = 0;
+        for (i, &source) in sources.iter().enumerate() {
+            let (Some(words), Some(slots)) = (
+                status.get(i * SONG_STATUS_WORDS..(i + 1) * SONG_STATUS_WORDS),
+                levels.get(i * SONG_LEVEL_SLOTS..(i + 1) * SONG_LEVEL_SLOTS),
+            ) else {
+                break;
+            };
+            let source = source as usize;
+            if source >= 4096 {
+                continue;
+            }
+            if self.songs.len() <= source {
+                self.songs.resize_with(source + 1, || None);
+            }
+            let song = self.songs[source].get_or_insert_with(WebSong::new);
+            taken += song.update_status(words, slots) as usize;
+        }
+        taken
+    }
+
+    /// Takes a `'songscope'` message: `frames` per channel, and for each song in
+    /// `sources` its channel count (`channels`), then `written` (frames seen, per
+    /// channel of each song in order) and `data` (each channel's frames, in the
+    /// same order). A message that does not add up is ignored.
+    pub fn update_scopes(
+        &mut self,
+        frames: usize,
+        sources: &[u32],
+        channels: &[u32],
+        written: &[f64],
+        data: &[f32],
+    ) {
+        let total: usize = channels.iter().map(|&c| c as usize).sum();
+        if frames == 0
+            || sources.len() != channels.len()
+            || written.len() < total
+            || data.len() < total * frames
+        {
+            return;
+        }
+        let (mut channel_at, mut data_at) = (0, 0);
+        for (&source, &count) in sources.iter().zip(channels) {
+            let count = count as usize;
+            if let Some(Some(song)) = self.songs.get_mut(source as usize) {
+                song.update_scopes(
+                    frames,
+                    &written[channel_at..channel_at + count],
+                    &data[data_at..data_at + count * frames],
+                );
+            }
+            channel_at += count;
+            data_at += count * frames;
+        }
+    }
+
+    /// The song in source slot `source`, if the worklet has reported one.
+    pub fn get(&self, source: u32) -> Option<&WebSong> {
+        self.songs.get(source as usize)?.as_ref()
+    }
+
+    /// Drops what it holds for `source` (the song was reported gone, or the page
+    /// no longer cares).
+    pub fn forget(&mut self, source: u32) {
+        if let Some(slot) = self.songs.get_mut(source as usize) {
+            *slot = None;
+        }
+    }
+}
+
 impl SongReader for WebSong {
     fn status(&self) -> SongStatus {
         self.status
@@ -356,6 +447,55 @@ mod tests {
         let (_, channels, alive, scopes) = SongStatus::from_words(&words).unwrap();
         assert_eq!((channels, alive, scopes), (32, false, true));
         assert_eq!(SongStatus::from_words(&words[..5]), None);
+    }
+
+    #[test]
+    fn web_songs_split_the_messages_by_source_slot() {
+        let mut web = WebSongs::new();
+        assert!(web.get(3).is_none());
+        let a = SongStatus {
+            playing: true,
+            row: 5,
+            ..Default::default()
+        };
+        let b = SongStatus {
+            order: 2,
+            ..Default::default()
+        };
+        let status = [a.to_words(2, true, true), b.to_words(4, true, false)].concat();
+        let mut levels = vec![0.0f32; 2 * SONG_LEVEL_SLOTS];
+        levels[0] = 0.5;
+        levels[SONG_LEVEL_SLOTS] = 0.25;
+        assert_eq!(web.update_positions(&[3, 1], &status, &levels), 2);
+        assert_eq!(web.get(3).unwrap().status(), a);
+        assert_eq!(web.get(1).unwrap().status(), b);
+        let mut out = [0.0; 5];
+        web.get(1).unwrap().levels(&mut out);
+        assert_eq!(out[0], 0.25);
+        // A short message takes what adds up.
+        assert_eq!(
+            web.update_positions(&[3, 1], &status[..SONG_STATUS_WORDS], &levels),
+            1
+        );
+        // Scopes: song 3 has 2 channels of 3 frames, song 1 none yet.
+        let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        web.update_scopes(3, &[3], &[2], &[10.0, 20.0], &data);
+        let mut ring = [0.0; 3];
+        assert_eq!(web.get(3).unwrap().scope(1, &mut ring), 3);
+        assert_eq!(ring, [4.0, 5.0, 6.0]);
+        assert_eq!(web.get(3).unwrap().scope_position(1), 20);
+        assert_eq!(web.get(1).unwrap().scope(0, &mut ring), 0);
+        // One that does not add up is ignored.
+        web.update_scopes(3, &[3], &[2], &[1.0, 2.0], &data[..4]);
+        assert_eq!(web.get(3).unwrap().scope_position(1), 20);
+        // Gone, then forgotten.
+        let gone = SongStatus::default().to_words(2, false, false);
+        web.update_positions(&[3], &gone, &levels);
+        assert!(!web.get(3).unwrap().alive());
+        web.forget(3);
+        assert!(web.get(3).is_none());
+        // A slot beyond any mixer's is refused.
+        assert_eq!(web.update_positions(&[9999], &gone, &levels), 0);
     }
 
     #[test]

@@ -394,3 +394,62 @@ fn live_cell_edits_arrive_by_wire_and_are_played() {
     }));
     assert!(rig.mixer.is_playing(VOICE));
 }
+
+#[test]
+fn a_rebuilt_module_takes_over_at_the_place_of_the_old_one() {
+    use cubed_mixer::swap_commands;
+    let mut rig = rig("demo.mod", SongFormat::Mod, SongOptions::default(), true);
+    rig.control(SongControl::Seek { order: 1, row: 4 });
+    rig.control(SongControl::Loop(SongLoop::Pattern { order: 1 }));
+    rig.control(SongControl::Play);
+    rig.run(0.7);
+    let at = rig.reader.status();
+    assert!(at.playing);
+    // The edited module (here the same file, as a host would hand over a rebuilt
+    // one) is opened stopped in another slot; one batch crossfades it in and puts
+    // it where the old one is.
+    let new = open_module_song(
+        SongFormat::Mod,
+        &module("demo.mod"),
+        RATE,
+        SongOptions::default(),
+        true,
+    )
+    .unwrap();
+    let new_reader = new.song_reader().unwrap();
+    rig.mixer.apply(Command::PrepareSource(SourceId(1), new));
+    let new_voice = VoiceId(8);
+    let mut batch = Vec::from(swap_commands(
+        VOICE,
+        PlaySource::new(new_voice, SourceId(1), MUSIC),
+        2_400,
+    ));
+    for control in [
+        SongControl::Seek {
+            order: at.order,
+            row: at.row,
+        },
+        SongControl::Loop(SongLoop::Pattern { order: at.order }),
+        SongControl::Play,
+    ] {
+        batch.push(Command::SourceEvent {
+            voice: new_voice,
+            event: SourceEvent::Song(control),
+        });
+    }
+    for command in batch {
+        rig.mixer.apply(command);
+    }
+    let crossfade = rig.run(0.6);
+    // The old song fades out under the new one, which starts the row it was at
+    // (from a clean state: notes sustained from earlier rows are not carried over,
+    // as a seek never does) and plays on.
+    assert!(energy(&crossfade[..2_400]) > 0.0, "the old voice fades out");
+    assert!(energy(&crossfade[2_400..]) > 0.0, "the new one plays");
+    let s = new_reader.status();
+    assert!(s.playing);
+    assert_eq!(s.order, at.order, "the same pattern, looped");
+    assert!(!rig.mixer.is_playing(VOICE), "the old voice has ended");
+    assert!(rig.mixer.is_playing(new_voice));
+    assert!(rig.events().contains(&Event::Ended(VOICE)));
+}
