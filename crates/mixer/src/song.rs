@@ -227,9 +227,9 @@ impl WebSong {
 
     /// Takes one song's entry of a `'songpos'` message: its `status` words
     /// ([`SONG_STATUS_WORDS`] of them, see [`SongStatus::to_words`]) and its
-    /// `levels` ([`SONG_LEVEL_SLOTS`] floats: the channels, then the preview;
-    /// shorter is padded with 0). A malformed entry is ignored; returns whether
-    /// it was taken.
+    /// `levels` ([`SONG_LEVEL_SLOTS`] floats: what `SongReader::levels` gave,
+    /// the channels' then the preview's; shorter is padded with 0). A malformed
+    /// entry is ignored; returns whether it was taken.
     pub fn update_status(&mut self, status: &[u32], levels: &[f32]) -> bool {
         let Some((status, channels, alive, scopes_on)) = SongStatus::from_words(status) else {
             return false;
@@ -274,13 +274,8 @@ impl SongReader for WebSong {
     fn levels(&self, out: &mut [f32]) -> usize {
         // The preview's level follows the last channel's.
         let n = out.len().min(self.channels + 1);
-        for (i, o) in out[..n].iter_mut().enumerate() {
-            let slot = if i < self.channels {
-                i
-            } else {
-                SONG_LEVEL_SLOTS - 1
-            };
-            *o = self.levels.get(slot).copied().unwrap_or(0.0);
+        for (o, &level) in out[..n].iter_mut().zip(&self.levels) {
+            *o = level;
         }
         n
     }
@@ -354,7 +349,7 @@ mod tests {
         let mut levels = vec![0.0f32; SONG_LEVEL_SLOTS];
         levels[0] = 0.5;
         levels[1] = 0.25;
-        levels[SONG_LEVEL_SLOTS - 1] = 0.75;
+        levels[2] = 0.75;
         assert!(web.update_status(&status.to_words(2, true, true), &levels));
         assert_eq!(web.status(), status);
         assert_eq!(web.channels(), 2);
