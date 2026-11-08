@@ -6,18 +6,26 @@
 //! seconds, row by row), so the two can be compared command for command.
 //! Events land on the output frame their time falls on.
 
+use std::sync::Arc;
+
 #[cfg(feature = "adlib")]
 use crate::adlib::AdlibDriver;
 use crate::effects::{js_round, Command, Commands, EffectState, VolumeCommand};
 use crate::filter::AmigaFilter;
 use crate::module::{Format, ModFlavor, Module, Note};
-use crate::pitch::PAULA_TO_SYNTH_SCALE;
+use crate::pitch::{MOD_EXTENDED_PERIODS, PAULA_TO_SYNTH_SCALE, PT_PERIODS, S3M_PERIODS};
+use crate::probe::{Probe, Status, LEVEL_SLOTS};
 use crate::profile::{Decoded, Effect, EffectType, ExtSub, Profile};
-use crate::protracker::period_to_frequency;
+use crate::protracker::{period_to_frequency, MAX_CHANNELS};
 use crate::voice::{prepare_tables, PreparedSample, Voice, XmVoice, CUT_SECONDS, RELEASE_SECONDS};
 
 /// The rate MOD samples are declared at; their root note makes up for it.
 const MOD_SAMPLE_RATE: f64 = 44100.0;
+/// Frames a channel's voices render into scratch at once.
+const SCRATCH: usize = 1024;
+/// How fast a channel's reported peak falls once its sound has gone, in dB per
+/// second.
+const LEVEL_FALL_DB: f32 = 24.0;
 
 /// Sees what the player does, as it does it: rows as they start, and every
 /// command a channel's voice receives. Times are song seconds.
@@ -143,6 +151,44 @@ pub struct Position {
     pub row: usize,
 }
 
+/// What the transport repeats instead of moving on.
+///
+/// A loop does not move the playhead: seek there first. The player plays on
+/// until it reaches the loop's pattern, and from then on wraps there (a row
+/// sought to inside or outside it plays once first). While a loop is set a
+/// position jump (`Bxx`) is ignored and a pattern break (`Dxx`) goes to its row
+/// in the looped pattern, or back to the loop's first row if that row is
+/// outside it; E6x pattern loops and pattern delays work as usual inside.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Loop {
+    /// Play the song through (and round, if it is looped).
+    #[default]
+    None,
+    /// Repeat the pattern at this position of the order list.
+    Pattern(usize),
+    /// Repeat rows `row0` to `row1`, both played, of the pattern at `order`.
+    Range {
+        order: usize,
+        row0: usize,
+        row1: usize,
+    },
+}
+
+/// A note the host plays on the player's spare channel: it sounds over the song
+/// (or alone, when the song is stopped), whatever is muted.
+struct Preview {
+    voice: Voice,
+    /// What the previous preview note was doing when this one cut it.
+    tail: Voice,
+    /// The note is on the AdLib chip, on the track after the song's last.
+    adlib: bool,
+    instrument: u8,
+    /// Frames until it lets go by itself.
+    release_in: Option<u32>,
+    /// Frames until the next tick of an XM note's envelopes.
+    tick_in: u32,
+}
+
 /// Plays a [`Module`] into stereo blocks.
 pub struct Player {
     module: Module,
@@ -169,7 +215,26 @@ pub struct Player {
     song_stop_pending: bool,
     end_time: Option<f64>,
     finished: bool,
-    loop_pattern: bool,
+    /// The song is running; stopped, only a preview (and the last notes dying
+    /// away) sounds, and the position stays where it was.
+    playing: bool,
+    repeat: Loop,
+    /// A seek has put the playhead on a row that has not played yet.
+    fresh_seek: bool,
+    /// Channels the host mutes, and channels it solos: with any solo, only those
+    /// are heard.
+    mute_mask: u32,
+    solo_mask: u32,
+    rows_started: u32,
+    probe: Option<Arc<Probe>>,
+    /// Each channel's peak, falling, then the preview's (see `Probe::levels`),
+    /// and the loudest frame of the block being rendered.
+    levels: [f32; LEVEL_SLOTS],
+    block_peaks: [f32; LEVEL_SLOTS],
+    scratch_left: Vec<f32>,
+    scratch_right: Vec<f32>,
+    scratch_mono: Vec<f32>,
+    preview: Preview,
 
     // The row playing.
     row: usize,
@@ -243,17 +308,26 @@ impl Player {
             .collect();
         let filter =
             (module.format == Format::Mod && options.filter).then(|| AmigaFilter::new(rate));
-        // Channels the file switches off are not heard (the DAW plays them).
+        // Channels the file switches off are not heard (the DAW plays them);
+        // the host can switch them on.
         let mut channels: Vec<Channel> = channels;
-        for (c, &off) in channels.iter_mut().zip(&module.muted) {
-            c.muted = off && !quirks;
+        let mut mute_mask = 0u32;
+        for (i, &off) in module.muted.iter().enumerate().take(MAX_CHANNELS) {
+            if off && !quirks {
+                mute_mask |= 1 << i;
+            }
         }
+        for (i, c) in channels.iter_mut().enumerate() {
+            c.muted = mute_mask >> i & 1 == 1;
+        }
+
         let separation = options
             .stereo_separation
             .unwrap_or(module.stereo_separation)
             .clamp(0.0, 1.0);
         #[cfg(feature = "adlib")]
         let adlib = AdlibDriver::new(&module, rate);
+
         let mut player = Player {
             #[cfg(feature = "adlib")]
             adlib,
@@ -282,7 +356,26 @@ impl Player {
             song_stop_pending: false,
             end_time: None,
             finished: false,
-            loop_pattern: false,
+            playing: true,
+            repeat: Loop::None,
+            fresh_seek: false,
+            mute_mask,
+            solo_mask: 0,
+            rows_started: 0,
+            probe: None,
+            levels: [0.0; LEVEL_SLOTS],
+            block_peaks: [0.0; LEVEL_SLOTS],
+            scratch_left: vec![0.0; SCRATCH],
+            scratch_right: vec![0.0; SCRATCH],
+            scratch_mono: vec![0.0; SCRATCH],
+            preview: Preview {
+                voice: Voice::default(),
+                tail: Voice::default(),
+                adlib: false,
+                instrument: 0,
+                release_in: None,
+                tick_in: 0,
+            },
             row: 0,
             row_time: 0.0,
             sec_per_tick: 0.0,
@@ -308,9 +401,73 @@ impl Player {
         &self.module
     }
 
-    /// Where the song is: the row playing.
+    /// Where the song is: the row playing (or, stopped, the row it will start
+    /// at).
     pub fn position(&self) -> Position {
         self.position
+    }
+
+    /// The transport as a plain value: position, tick, speed, tempo, whether it
+    /// plays. `version` is the probe's and stays 0 here.
+    pub fn status(&self) -> Status {
+        let preview = self.preview.voice.active || self.preview.tail.active || self.preview.adlib;
+        Status {
+            playing: self.playing && !self.finished,
+            preview,
+            order: self.position.order.min(u16::MAX as usize) as u16,
+            pattern: self.position.pattern.min(u16::MAX as usize) as u16,
+            row: self.position.row.min(u16::MAX as usize) as u16,
+            tick: if self.playing && !self.fresh_seek {
+                self.next_tick.saturating_sub(1).min(255) as u8
+            } else {
+                0
+            },
+            speed: self.speed.min(255) as u8,
+            tempo: self.bpm.round().clamp(0.0, 511.0) as u16,
+            rows: self.rows_started,
+            frames: self.frame,
+            version: 0,
+        }
+    }
+
+    /// Lets `probe` see this player from now on (see [`Probe`]): the position
+    /// each tick, the levels each block, the channel scopes when they are
+    /// switched on. The probe must have been made for this song's channel
+    /// count. Make and attach it off the audio thread.
+    pub fn attach_probe(&mut self, probe: Arc<Probe>) {
+        probe.set_alive(true);
+        self.probe = Some(probe);
+        self.publish_position();
+    }
+
+    /// Whether the song is running (`false` after [`stop`](Self::stop)).
+    pub fn playing(&self) -> bool {
+        self.playing
+    }
+
+    /// Starts the song from where it is: the position a seek or a stop left. A
+    /// song that has played to its end starts again from the top. Does nothing
+    /// while it plays.
+    pub fn play(&mut self) {
+        if self.playing && !self.finished {
+            return;
+        }
+        if self.finished {
+            self.seek(0, 0);
+        }
+        self.playing = true;
+        self.next_row_time = self.frame as f64 / self.rate;
+        self.next_tick = self.ticks_per_row;
+        self.publish_position();
+    }
+
+    /// Stops the song where it is: its notes die away in a few milliseconds, the
+    /// position stays, and [`play`](Self::play) starts again from that row. A
+    /// previewed note goes on.
+    pub fn stop(&mut self) {
+        let at = self.position;
+        self.playing = false;
+        self.seek(at.order, at.row);
     }
 
     /// Whether the song has played to its end (never, when looped).
@@ -327,9 +484,87 @@ impl Player {
         self.options.looped = looped;
     }
 
-    /// Repeat the current pattern instead of moving through the order list.
+    /// Repeat the pattern the song is in now instead of moving through the
+    /// order list (`set_loop` with [`Loop::Pattern`] for the current order).
     pub fn set_pattern_loop(&mut self, looped: bool) {
-        self.loop_pattern = looped;
+        self.repeat = if looped {
+            Loop::Pattern(self.order)
+        } else {
+            Loop::None
+        };
+    }
+
+    /// Repeats a pattern or a range of rows instead of moving on (see [`Loop`]).
+    /// Takes effect at the next row; it does not move the playhead.
+    pub fn set_loop(&mut self, repeat: Loop) {
+        self.repeat = repeat;
+    }
+
+    pub fn loop_region(&self) -> Loop {
+        self.repeat
+    }
+
+    /// Mutes or unmutes `channel` (see [`set_mute_mask`](Self::set_mute_mask)).
+    pub fn set_mute(&mut self, channel: usize, muted: bool) {
+        if channel < MAX_CHANNELS {
+            self.mute_mask = self.mute_mask & !(1 << channel) | (muted as u32) << channel;
+            self.refresh_audibility();
+        }
+    }
+
+    /// Solos or unsolos `channel`.
+    pub fn set_solo(&mut self, channel: usize, solo: bool) {
+        if channel < MAX_CHANNELS {
+            self.solo_mask = self.solo_mask & !(1 << channel) | (solo as u32) << channel;
+            self.refresh_audibility();
+        }
+    }
+
+    /// The channels muted, one bit each (bit 0 is channel 0), all at once. A
+    /// muted channel keeps playing underneath, unheard (an AdLib channel's note
+    /// stops). Channels the file switches off start muted, so a host that shows
+    /// mute buttons reads them from [`mute_mask`](Self::mute_mask).
+    pub fn set_mute_mask(&mut self, mask: u32) {
+        self.mute_mask = mask;
+        self.refresh_audibility();
+    }
+
+    /// The channels soloed, one bit each. While any is, only soloed channels
+    /// are heard, mute or not (as the DAW does it).
+    pub fn set_solo_mask(&mut self, mask: u32) {
+        self.solo_mask = mask;
+        self.refresh_audibility();
+    }
+
+    pub fn mute_mask(&self) -> u32 {
+        self.mute_mask
+    }
+
+    pub fn solo_mask(&self) -> u32 {
+        self.solo_mask
+    }
+
+    /// Whether `channel` is heard, with the mutes and solos as they are.
+    pub fn channel_audible(&self, channel: usize) -> bool {
+        self.channels.get(channel).is_some_and(|c| !c.muted)
+    }
+
+    fn refresh_audibility(&mut self) {
+        for (i, c) in self.channels.iter_mut().enumerate() {
+            let heard = if self.solo_mask != 0 {
+                self.solo_mask >> i & 1 == 1
+            } else {
+                self.mute_mask >> i & 1 == 0
+            };
+            let was_muted = c.muted;
+            c.muted = !heard;
+            #[cfg(feature = "adlib")]
+            if let (Some(adlib), true, false) = (&mut self.adlib, c.muted, was_muted) {
+                adlib.note_off(i);
+                adlib.flush();
+            }
+            let _ = was_muted;
+        }
     }
 
     /// Stereo width from now on: 0 (mono) to 1 (the pans as written).
@@ -342,26 +577,21 @@ impl Player {
     }
 
     /// Silences a channel; it keeps playing underneath (an AdLib channel's
-    /// note stops).
+    /// note stops). The same as [`set_mute`](Self::set_mute).
     pub fn set_channel_muted(&mut self, channel: usize, muted: bool) {
-        if let Some(c) = self.channels.get_mut(channel) {
-            c.muted = muted;
-        }
-        #[cfg(feature = "adlib")]
-        if let (Some(adlib), true) = (&mut self.adlib, muted) {
-            adlib.note_off(channel);
-            adlib.flush();
-        }
+        self.set_mute(channel, muted);
     }
 
-    /// Starts again from `order` and `row`, from a clean state. Speed and
-    /// tempo are those the song would have reached by playing there in order.
+    /// Starts again from `order` and `row`, from a clean state: notes that were
+    /// sounding die away in a few milliseconds. Speed and tempo are those the
+    /// song would have reached by playing there in order. Works while the song
+    /// is stopped (the position moves, and [`play`](Self::play) starts there).
     pub fn seek(&mut self, order: usize, row: usize) {
         let order = order.min(self.module.orders.len().saturating_sub(1));
         self.reset_effect_states();
+        let rate = self.rate;
         for c in &mut self.channels {
-            c.voice.active = false;
-            c.tail.active = false;
+            Self::cut(c, rate);
         }
         #[cfg(feature = "adlib")]
         if let Some(adlib) = &mut self.adlib {
@@ -383,6 +613,13 @@ impl Player {
         for (c, &pan) in self.channels.iter_mut().zip(&self.module.channel_pan) {
             c.pan = pan.unwrap_or(0.5) as f64;
         }
+        self.fresh_seek = true;
+        self.position = Position {
+            order,
+            pattern: self.module.orders.get(order).copied().unwrap_or(0),
+            row,
+        };
+        self.publish_position();
     }
 
     fn load_pattern(&mut self) {
@@ -507,7 +744,13 @@ impl Player {
         let n = left.len().min(right.len());
         left[..n].fill(0.0);
         right[..n].fill(0.0);
+        self.block_peaks.fill(0.0);
         let mut at = 0;
+        if !self.playing {
+            // Stopped: only what is still dying away and a preview sound.
+            self.mix(&mut left[..n], &mut right[..n]);
+            at = n;
+        }
         while at < n {
             if self.fade_out == Some(0) {
                 break;
@@ -540,6 +783,7 @@ impl Player {
             self.fade_out = Some(frames - k as u32);
             at += k;
         }
+        self.render_preview(&mut left[..n], &mut right[..n]);
         self.frame += n as u64;
         if self.separation < 1.0 {
             // Mid/side: the side signal scaled, the mid kept.
@@ -553,7 +797,31 @@ impl Player {
         if let Some(filter) = &mut self.filter {
             filter.process(&mut left[..n], &mut right[..n]);
         }
+        self.publish_block(n);
         self.fade_out != Some(0)
+    }
+
+    /// Publishes the position to the probe, if there is one.
+    fn publish_position(&self) {
+        if let Some(probe) = &self.probe {
+            probe.publish_position(&self.status());
+        }
+    }
+
+    /// Lets the levels fall, and publishes them and the frame clock.
+    fn publish_block(&mut self, n: usize) {
+        let fall = 10f32.powf(-LEVEL_FALL_DB * n as f32 / self.rate as f32 / 20.0);
+        for (level, &peak) in self.levels.iter_mut().zip(&self.block_peaks) {
+            *level = peak.max(*level * fall);
+            // Below -60 dB it reads as silence.
+            if *level < 1e-3 {
+                *level = 0.0;
+            }
+        }
+        if let Some(probe) = &self.probe {
+            probe.publish_block(self.frame, &self.levels);
+            probe.publish_position(&self.status());
+        }
     }
 
     fn frame_at(&self, time: f64) -> u64 {
@@ -595,6 +863,7 @@ impl Player {
         if self.module.format == Format::Xm {
             self.tick_voices();
         }
+        self.publish_position();
     }
 
     /// XM: every voice's envelopes and vibrato, a tick on.
@@ -641,6 +910,19 @@ impl Player {
             if let Some(command) = self.pending_position.filter(|_| !self.delay_repeating) {
                 self.pending_position = None;
                 let count = self.module.orders.len();
+                if let Some((first, last)) = self.loop_rows() {
+                    // A looped pattern ignores a jump, and a break goes to its
+                    // row in the loop.
+                    if let PositionCommand::Break(target) = command {
+                        let row = if (first..=last).contains(&target) {
+                            target
+                        } else {
+                            first
+                        };
+                        self.last_row = row as isize - 1;
+                    }
+                    continue;
+                }
                 match command {
                     PositionCommand::Jump(target) => {
                         // S3M counts positions in the file's order list.
@@ -675,7 +957,17 @@ impl Player {
                 continue;
             }
 
-            if actual == 0 && current > 0 && !self.loop_pattern {
+            if let Some((first, last)) = self.loop_rows() {
+                // The row after the loop's last goes back to its first. A row
+                // sought to beyond the loop plays once first.
+                if !self.fresh_seek && current > last as isize {
+                    self.last_row = first as isize - 1;
+                    self.loop_start = 0;
+                    self.loop_count = 0;
+                    self.loop_pending = false;
+                    continue;
+                }
+            } else if actual == 0 && current > 0 {
                 self.order += 1;
                 if self.order >= self.module.orders.len() && !self.wrap_or_finish(observer) {
                     return;
@@ -712,6 +1004,20 @@ impl Player {
                 self.end_time = Some(self.next_row_time);
             }
             return;
+        }
+    }
+
+    /// The rows (first and last, both played) that repeat while the song is at
+    /// this order, if a loop covers it.
+    fn loop_rows(&self) -> Option<(usize, usize)> {
+        let last_row = self.length.saturating_sub(1);
+        match self.repeat {
+            Loop::Pattern(order) if order == self.order => Some((0, last_row)),
+            Loop::Range { order, row0, row1 } if order == self.order => {
+                let last = row1.min(last_row);
+                Some((row0.min(last), last))
+            }
+            _ => None,
         }
     }
 
@@ -1089,6 +1395,8 @@ impl Player {
             pattern,
             row,
         };
+        self.fresh_seek = false;
+        self.rows_started = self.rows_started.wrapping_add(1);
         observer.row(time, self.order, row);
 
         let channel_count = self.channels.len();
@@ -1604,6 +1912,228 @@ impl Player {
         false
     }
 
+    /// The musical frequency of MIDI note `midi` as the module's format plays
+    /// it (the period its table has for it, clamped to the table's range).
+    fn note_frequency(&self, midi: u8) -> Option<f64> {
+        match self.module.format {
+            Format::Mod => {
+                // ProTracker's table starts at C-1 (MIDI 24), the PC extension
+                // at MIDI 0.
+                let period = if self.module.flags.amiga_limits {
+                    PT_PERIODS[(midi as usize).saturating_sub(24).min(PT_PERIODS.len() - 1)]
+                } else {
+                    MOD_EXTENDED_PERIODS[(midi as usize).min(MOD_EXTENDED_PERIODS.len() - 1)]
+                };
+                period_to_frequency(period)
+            }
+            Format::S3m => {
+                let index = (midi as usize)
+                    .saturating_sub(24)
+                    .min(S3M_PERIODS.len() - 1);
+                Some(
+                    self.profile
+                        .pitch
+                        .frequency_from_period(S3M_PERIODS[index] as f64),
+                )
+            }
+            Format::Xm => {
+                // XM's 96 notes are MIDI 12 to 107.
+                let n = (midi.clamp(12, 107) as f64 - 11.0) - 1.0;
+                let period = if self.module.flags.linear_frequency {
+                    7680.0 - n * 64.0
+                } else {
+                    1712.0 * 2f64.powf((48.0 - n) / 12.0)
+                };
+                Some(self.profile.pitch.frequency_from_period(period))
+            }
+        }
+    }
+
+    /// Plays `instrument` (1-based, as in a cell: a MOD or S3M sample number, an
+    /// XM instrument, which picks its sample by `midi` through its keymap) at MIDI
+    /// note `midi` on the player's spare channel, over the song or alone while
+    /// it is stopped, and whatever is muted or soloed. `velocity` (0 to 1)
+    /// scales the sample's own default volume (1 is how it plays in a song).
+    /// `duration` frames after it starts the note lets go by itself; 0 holds it
+    /// until [`preview_off`](Self::preview_off). A new preview cuts the last.
+    /// Returns false (and plays nothing) when the instrument has no sample for
+    /// the note. An AdLib instrument plays on a free chip channel: none is free
+    /// when a song uses all nine.
+    pub fn preview_on(&mut self, instrument: u8, midi: u8, velocity: f32, duration: u32) -> bool {
+        let rate = self.rate;
+        if instrument == 0 {
+            return false;
+        }
+        let Some(frequency) = self.note_frequency(midi) else {
+            return false;
+        };
+        let velocity = velocity.clamp(0.0, 1.0);
+        #[cfg(feature = "adlib")]
+        {
+            let track = self.channels.len();
+            if let Some(adlib) = &mut self.adlib {
+                if adlib.handles(instrument) {
+                    Self::cut_preview(&mut self.preview, rate);
+                    adlib.note_on(
+                        instrument,
+                        (velocity * 127.0).round() as u8,
+                        track,
+                        frequency,
+                    );
+                    adlib.flush();
+                    if adlib.level(track) == 0.0 && !self.preview.adlib {
+                        // No free chip channel.
+                        adlib.release_track(track);
+                        return false;
+                    }
+                    self.preview.adlib = true;
+                    self.preview.instrument = instrument;
+                    self.preview.release_in = (duration > 0).then_some(duration);
+                    return true;
+                }
+                if self.preview.adlib {
+                    adlib.note_off(track);
+                    adlib.flush();
+                    adlib.release_track(track);
+                    self.preview.adlib = false;
+                }
+            }
+        }
+        let Some(sample) = self.sample_for(instrument, midi as f64) else {
+            return false;
+        };
+        let Some(Some(prepared)) = self.samples.get(sample) else {
+            return false;
+        };
+        let xm = self.xm_voice(instrument, frequency);
+        let source = &self.module.samples[sample];
+        let volume = velocity as f64 * source.volume.min(64) as f64 / 64.0;
+        let pan = match (xm, source.pan) {
+            (Some(_), Some(p)) if p != 128 => p as f64 / 255.0,
+            _ => 0.5,
+        };
+        let tick_frames = ((2.5 / self.bpm) * rate).round().max(1.0) as u32;
+        let preview = &mut self.preview;
+        Self::cut_preview(preview, rate);
+        preview
+            .voice
+            .start(sample, prepared, None, frequency, volume, pan, rate);
+        if let Some(xm) = xm {
+            preview.voice.start_xm(xm);
+        }
+        preview.instrument = instrument;
+        preview.release_in = (duration > 0).then_some(duration);
+        preview.tick_in = tick_frames;
+        true
+    }
+
+    /// Lets go of the previewed note: an XM note with a volume envelope goes
+    /// through its release, any other fades out in 10 ms.
+    pub fn preview_off(&mut self) {
+        let rate = self.rate;
+        #[cfg(feature = "adlib")]
+        if self.preview.adlib {
+            let track = self.channels.len();
+            if let Some(adlib) = &mut self.adlib {
+                adlib.note_off(track);
+                adlib.flush();
+                adlib.release_track(track);
+            }
+            self.preview.adlib = false;
+        }
+        let preview = &mut self.preview;
+        preview.release_in = None;
+        if !preview.voice.active {
+            return;
+        }
+        let enveloped = preview.voice.xm.is_some_and(|x| {
+            self.module
+                .instruments
+                .get(x.instrument)
+                .is_some_and(|i| i.volume_envelope.is_some())
+        });
+        match &mut preview.voice.xm {
+            Some(xm) if enveloped => xm.release(),
+            _ => preview.voice.fade_out(RELEASE_SECONDS, rate),
+        }
+    }
+
+    /// Moves the preview's voice to its tail, fading out.
+    fn cut_preview(preview: &mut Preview, rate: f64) {
+        if preview.voice.active {
+            preview.tail = preview.voice;
+            preview.tail.fade_out(CUT_SECONDS, rate);
+            preview.voice.active = false;
+        }
+    }
+
+    /// Adds the previewed note into the block, after the song (the master volume
+    /// leaves it alone, as it does the AdLib chip), and ticks an XM note's
+    /// envelopes.
+    fn render_preview(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let n = left.len();
+        if let Some(frames) = self.preview.release_in {
+            if frames as usize <= n {
+                self.preview_off();
+            } else {
+                self.preview.release_in = Some(frames - n as u32);
+            }
+        }
+        if !(self.preview.voice.active || self.preview.tail.active) {
+            return;
+        }
+        let gain = self.output_gain;
+        let mut peak = 0.0f32;
+        let mut done = 0;
+        while done < n {
+            let k = (n - done).min(SCRATCH);
+            for which in 0..2 {
+                let voice = if which == 0 {
+                    &mut self.preview.voice
+                } else {
+                    &mut self.preview.tail
+                };
+                if !voice.active {
+                    continue;
+                }
+                let Some(Some(prepared)) = self.samples.get(voice.sample) else {
+                    voice.active = false;
+                    continue;
+                };
+                let (sl, sr) = (&mut self.scratch_left[..k], &mut self.scratch_right[..k]);
+                sl.fill(0.0);
+                sr.fill(0.0);
+                voice.render(prepared, sl, sr);
+                for i in 0..k {
+                    let (a, b) = (sl[i] * gain, sr[i] * gain);
+                    left[done + i] += a;
+                    right[done + i] += b;
+                    peak = peak.max(a.abs()).max(b.abs());
+                }
+            }
+            done += k;
+        }
+        self.block_peaks[MAX_CHANNELS] = self.block_peaks[MAX_CHANNELS].max(peak);
+        // An XM note's envelopes move a tick at a time, at the song's tempo.
+        let tick_frames = ((2.5 / self.bpm) * self.rate).round().max(1.0) as u32;
+        let mut left_over = n as u32;
+        while left_over >= self.preview.tick_in.max(1) {
+            left_over -= self.preview.tick_in.max(1);
+            for voice in [&mut self.preview.voice, &mut self.preview.tail] {
+                if let (true, Some(instrument)) = (
+                    voice.active,
+                    voice
+                        .xm
+                        .and_then(|x| self.module.instruments.get(x.instrument)),
+                ) {
+                    voice.tick_xm(instrument, tick_frames);
+                }
+            }
+            self.preview.tick_in = tick_frames;
+        }
+        self.preview.tick_in = self.preview.tick_in.saturating_sub(left_over);
+    }
+
     /// Moves the channel's voice to its tail, fading out.
     fn cut(channel: &mut Channel, rate: f64) {
         if channel.voice.active {
@@ -1613,34 +2143,61 @@ impl Player {
         }
     }
 
+    /// Renders the voices of every channel for the frames of `left` and `right`
+    /// and adds them in (a muted channel's keep their clocks running,
+    /// unheard), noting each channel's peak and, when a probe asks for them,
+    /// its scope frames.
     fn mix(&mut self, left: &mut [f32], right: &mut [f32]) {
         let n = left.len();
         if n == 0 {
             return;
         }
-        for channel in &mut self.channels {
-            for voice in [&mut channel.voice, &mut channel.tail] {
-                if !voice.active {
-                    continue;
+        let scopes = self.probe.as_deref().filter(|p| p.scopes_enabled());
+        let mut peaks = [0.0f32; MAX_CHANNELS];
+        let mut done = 0;
+        while done < n {
+            let k = (n - done).min(SCRATCH);
+            let (l, r) = (&mut left[done..done + k], &mut right[done..done + k]);
+            for (ci, channel) in self.channels.iter_mut().enumerate() {
+                let mono = &mut self.scratch_mono[..k];
+                if scopes.is_some() {
+                    mono.fill(0.0);
                 }
-                let Some(Some(prepared)) = self.samples.get(voice.sample) else {
-                    voice.active = false;
-                    continue;
-                };
-                if channel.muted {
-                    // Keep its clock running, silently.
-                    let mut scratch_l = [0.0f32; 64];
-                    let mut scratch_r = [0.0f32; 64];
-                    let mut at = 0;
-                    while at < n {
-                        let k = (n - at).min(64);
-                        voice.render(prepared, &mut scratch_l[..k], &mut scratch_r[..k]);
-                        at += k;
+                for voice in [&mut channel.voice, &mut channel.tail] {
+                    if !voice.active {
+                        continue;
                     }
-                } else {
-                    voice.render(prepared, left, right);
+                    let Some(Some(prepared)) = self.samples.get(voice.sample) else {
+                        voice.active = false;
+                        continue;
+                    };
+                    // One voice at a time, then added: the sums come out as if
+                    // the voice had played into the mix itself.
+                    let (sl, sr) = (&mut self.scratch_left[..k], &mut self.scratch_right[..k]);
+                    sl.fill(0.0);
+                    sr.fill(0.0);
+                    voice.render(prepared, sl, sr);
+                    if channel.muted {
+                        continue;
+                    }
+                    let mut peak = peaks[ci];
+                    for i in 0..k {
+                        l[i] += sl[i];
+                        r[i] += sr[i];
+                        peak = peak.max(sl[i].abs()).max(sr[i].abs());
+                    }
+                    peaks[ci] = peak;
+                    if scopes.is_some() {
+                        for i in 0..k {
+                            mono[i] += 0.5 * (sl[i] + sr[i]);
+                        }
+                    }
+                }
+                if let Some(probe) = scopes {
+                    probe.write_scope(ci, mono);
                 }
             }
+            done += k;
         }
         // Global volume, gliding like a voice's gain, and the output trim.
         let glide = 1.0 / (0.0013 * self.rate as f32).max(1.0);
@@ -1657,10 +2214,25 @@ impl Player {
             *l *= g;
             *r *= g;
         }
+        // The levels are what is heard: the master volume and trim applied.
+        let g = self.master * self.output_gain;
+        for (block, &peak) in self.block_peaks.iter_mut().zip(&peaks) {
+            *block = block.max(peak * g);
+        }
         // The AdLib chip, which (as in the DAW) the global volume leaves alone.
         #[cfg(feature = "adlib")]
         if let Some(adlib) = &mut self.adlib {
             adlib.render(left, right, self.output_gain);
+            for (ci, channel) in self.channels.iter().enumerate() {
+                if !channel.muted {
+                    self.block_peaks[ci] = self.block_peaks[ci].max(adlib.level(ci));
+                }
+            }
+            if self.preview.adlib {
+                let slot = MAX_CHANNELS;
+                self.block_peaks[slot] =
+                    self.block_peaks[slot].max(adlib.level(self.channels.len()));
+            }
         }
     }
 }
@@ -1701,3 +2273,11 @@ const XM_TO_SYNTH_SCALE: f64 = 32.0;
 const S3M_C2FREQ: f64 = 8363.0;
 /// ST3's rates over musical Hz.
 const S3M_TO_SYNTH_SCALE: f64 = 16.0;
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.probe {
+            probe.set_alive(false);
+        }
+    }
+}

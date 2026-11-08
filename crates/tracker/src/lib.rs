@@ -22,6 +22,7 @@ mod filter;
 mod module;
 mod pitch;
 mod player;
+mod probe;
 mod profile;
 mod protracker;
 mod s3m;
@@ -33,7 +34,9 @@ pub use module::{
     Adlib, AutoVibrato, Cell, Envelope, Flags, Format, Instrument, LoopKind, ModFlavor, Module,
     Note, Pattern, Sample,
 };
-pub use player::{Observer, Player, PlayerOptions, Position};
+pub use player::{Loop, Observer, Player, PlayerOptions, Position};
+pub use probe::{Probe, Status, LEVEL_SLOTS, SCOPE_FRAMES};
+pub use protracker::MAX_CHANNELS;
 
 /// Whether `bytes` look like a module this crate reads, and which kind.
 pub fn sniff(bytes: &[u8]) -> Option<Format> {
