@@ -8,6 +8,7 @@ use crate::insert::Insert;
 use crate::sfx::Sfx;
 use crate::source::{Source, SourceEvent};
 use crate::spatial::{Listener, Spatial};
+use crate::tap::Tap;
 
 /// A bus slot. The host names its buses and maps the names to slots; slot 0
 /// is the master bus, which feeds the output.
@@ -344,6 +345,11 @@ pub enum Command {
     StopAll(u32),
     /// Starts recording the master output into the buffer.
     Capture(Box<Capture>),
+    /// Gives the bus a tap, which keeps its latest frames (after its fader) for a
+    /// scope or a spectrum, or (`None`) takes it away; a bus without one costs
+    /// nothing. The host makes the tap (`Tap::new`, or `TapSet::enable`) and keeps
+    /// its own handle to read it. A tap already on the bus is handed back.
+    SetTap(BusId, Option<Arc<Tap>>),
     /// Moves the listener (once per game frame, with its velocity).
     SetListener(Listener),
     /// Makes the voice spatial, changes its spatial settings, or (`None`)
@@ -422,6 +428,7 @@ impl std::fmt::Debug for Command {
             Command::StopBus(bus, fade) => write!(f, "StopBus({bus:?}, {fade})"),
             Command::StopAll(fade) => write!(f, "StopAll({fade})"),
             Command::Capture(c) => write!(f, "Capture({} frames)", c.left.len()),
+            Command::SetTap(bus, tap) => write!(f, "SetTap({bus:?}, {tap:?})"),
             Command::SetListener(l) => write!(f, "SetListener({l:?})"),
             Command::SetVoiceSpatial(v, s) => write!(f, "SetVoiceSpatial({v:?}, {s:?})"),
             Command::SetVoicePosition {
@@ -458,4 +465,6 @@ pub enum Returned {
     Source(Box<dyn Source>),
     /// A finished (or cancelled) recording.
     Capture(Box<Capture>),
+    /// A tap taken off a bus (replaced, switched off, or its bus removed).
+    Tap(Arc<Tap>),
 }

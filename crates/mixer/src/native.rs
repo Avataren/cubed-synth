@@ -12,7 +12,10 @@ use std::time::Instant;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 
-use crate::{BusId, BusMeter, Capture, Command, Event, Mixer, MixerConfig, Returned};
+use crate::{
+    Analysis, BusId, BusMeter, Capture, Command, Event, Mixer, MixerConfig, Returned, TapSet,
+    TAP_FRAMES,
+};
 
 /// The callback renders at most this many frames between ring checks.
 const CHUNK: usize = 1024;
@@ -219,6 +222,8 @@ pub struct NativeHost {
     shared: Arc<Shared>,
     sample_rate: u32,
     device_name: String,
+    /// The taps the host has switched on (see `enable_tap`).
+    taps: TapSet,
 }
 
 impl NativeHost {
@@ -319,6 +324,7 @@ impl NativeHost {
             shared,
             sample_rate,
             device_name,
+            taps: TapSet::new(max_buses),
         })
     }
 
@@ -373,6 +379,33 @@ impl NativeHost {
         })
     }
 
+    /// Switches the bus's tap on (`true`) or off: the bus keeps its latest 4,096
+    /// frames after its fader for [`Analysis::scope`], at the cost of a copy
+    /// per block, and costs nothing while it is off. The bus must exist (create
+    /// it first). Switching on a bus that has one starts it afresh. Fails if the
+    /// command queue is full or the bus slot is beyond the mixer's.
+    pub fn enable_tap(&mut self, bus: BusId, enable: bool) -> Result<(), String> {
+        if !enable {
+            self.taps.disable(bus);
+            return self
+                .send(Command::SetTap(bus, None))
+                .map_err(|_| "the command queue is full".to_string());
+        }
+        let tap = self
+            .taps
+            .enable(bus, TAP_FRAMES)
+            .ok_or_else(|| format!("bus {} is beyond the mixer's buses", bus.0))?;
+        self.send(Command::SetTap(bus, Some(tap))).map_err(|_| {
+            self.taps.disable(bus);
+            "the command queue is full".to_string()
+        })
+    }
+
+    /// Whether the bus's tap is switched on.
+    pub fn tap_enabled(&self, bus: BusId) -> bool {
+        self.taps.get(bus).is_some()
+    }
+
     /// Timing and counters; resets the slowest-callback figure.
     pub fn status(&self) -> HostStatus {
         let s = &self.shared;
@@ -401,5 +434,23 @@ impl NativeHost {
 
     pub fn failed(&self) -> bool {
         self.shared.failed.load(Ordering::Relaxed)
+    }
+}
+
+impl Analysis for NativeHost {
+    fn sample_rate(&self) -> f32 {
+        self.sample_rate as f32
+    }
+
+    fn scope(&self, bus: BusId, left: &mut [f32], right: &mut [f32]) -> usize {
+        self.taps.scope(bus, left, right)
+    }
+
+    fn scope_position(&self, bus: BusId) -> u64 {
+        self.taps.position(bus)
+    }
+
+    fn levels(&self, bus: BusId) -> Option<BusMeter> {
+        self.meter(bus)
     }
 }

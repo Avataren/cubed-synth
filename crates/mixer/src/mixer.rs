@@ -13,6 +13,7 @@ use crate::sfx::SfxVoice;
 use crate::smooth::{balance, block_coeff, db_to_gain, GainRamp, Smoothed};
 use crate::source::{Generator, Source, SourceVoice, Voice};
 use crate::spatial::{add_scaled, Hearing, Listener, SpatialVoice};
+use crate::tap::Tap;
 
 /// Insert slots per bus.
 pub const MAX_INSERTS: usize = 8;
@@ -110,6 +111,8 @@ struct Bus {
     meter: BusMeter,
     /// Mean squares behind `meter.rms`.
     mean_square: [f32; 2],
+    /// Keeps the bus's latest frames for the host, when it asked.
+    tap: Option<Arc<Tap>>,
     /// The last block's peak after the fader, for buses this one ducks.
     level: f32,
     /// How far ducking has the bus down at the end of this block and at its
@@ -134,6 +137,7 @@ impl Bus {
             silent_frames: 0,
             meter: BusMeter::default(),
             mean_square: [0.0; 2],
+            tap: None,
             level: 0.0,
             duck_gain: 1.0,
             duck_start: 1.0,
@@ -319,6 +323,19 @@ impl Mixer {
                 _ => self.stats.rejected_commands += 1,
             },
             Command::SetSend { bus, slot, send } => self.set_send(bus, slot, send),
+            Command::SetTap(bus, tap) => match self.used_bus(bus) {
+                Some(index) => {
+                    if let Some(old) = std::mem::replace(&mut self.buses[index].tap, tap) {
+                        self.give_back(Returned::Tap(old));
+                    }
+                }
+                None => {
+                    self.stats.rejected_commands += 1;
+                    if let Some(tap) = tap {
+                        self.give_back(Returned::Tap(tap));
+                    }
+                }
+            },
             Command::AddClip(id, clip) => self.add_clip(id, clip),
             Command::RemoveClip(id) => {
                 let Some(old) = self.clips.get_mut(id.0 as usize).and_then(Option::take) else {
@@ -529,6 +546,9 @@ impl Mixer {
             if let Some(insert) = self.buses[index].inserts[slot].take() {
                 self.give_back(Returned::Insert(insert.insert));
             }
+        }
+        if let Some(tap) = self.buses[index].tap.take() {
+            self.give_back(Returned::Tap(tap));
         }
         let removed = &mut self.buses[index];
         removed.used = false;
@@ -1104,6 +1124,11 @@ impl Mixer {
 
             let bus = &mut buses[b];
             meter(bus, n, peak_fall, rms_keep, idle);
+            // What the meter read, for a scope: a bus that is idle has silent
+            // buffers, so it writes silence.
+            if let Some(tap) = &bus.tap {
+                tap.write(&bus.left[..n], &bus.right[..n]);
+            }
 
             if b == 0 {
                 out_left.copy_from_slice(&bus.left[..n]);

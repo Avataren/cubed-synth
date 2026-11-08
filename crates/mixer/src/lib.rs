@@ -22,6 +22,7 @@
 //! [`wire`] encodes commands and events as bytes for hosts that cross a
 //! message port (the `cubed-worklet` AudioWorklet).
 
+pub mod analysis;
 mod clip;
 mod command;
 pub mod effects;
@@ -33,6 +34,7 @@ mod smooth;
 mod source;
 mod spatial;
 mod synth;
+pub mod tap;
 pub mod wire;
 
 #[cfg(feature = "native")]
@@ -42,6 +44,7 @@ pub mod songs;
 #[cfg(feature = "native")]
 pub mod stream;
 
+pub use analysis::{smooth_bins, Analysis, Spectrum, WebAnalysis, METER_FIELDS};
 pub use clip::Clip;
 pub use command::{
     BusId, BusSettings, Capture, ClipId, Command, Duck, Event, Play, PlayEngine, PlaySfx,
@@ -56,3 +59,4 @@ pub use smooth::MIN_DB;
 pub use source::{Source, SourceEvent};
 pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};
 pub use synth::{swap_commands, HeldNote, SynthBuild, SynthSource};
+pub use tap::{Tap, TapSet, TAP_FRAMES};

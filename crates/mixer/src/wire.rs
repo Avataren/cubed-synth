@@ -58,8 +58,8 @@ mod tag {
 pub const EVENT_SIZE: usize = 9;
 
 /// Appends `command` to `out`. Returns false (and writes nothing) for the
-/// commands that carry objects: `SetInsert`, `AddClip`, `PrepareSource` and
-/// `Capture`.
+/// commands that carry objects: `SetInsert`, `AddClip`, `PrepareSource`,
+/// `Capture` and `SetTap`.
 pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
     let mut w = Writer(out);
     match command {
@@ -327,7 +327,8 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
         Command::SetInsert { .. }
         | Command::AddClip(..)
         | Command::PrepareSource(..)
-        | Command::Capture(_) => return false,
+        | Command::Capture(_)
+        | Command::SetTap(..) => return false,
     }
     true
 }
