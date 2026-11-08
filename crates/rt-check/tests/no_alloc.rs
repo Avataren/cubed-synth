@@ -254,7 +254,7 @@ fn tracker_live_control() {
 #[test]
 fn mixer_song_control() {
     use cubed_mixer::songs::open_module_song;
-    use cubed_mixer::{wire, SongControl, SongLoop, SONG_LEVEL_SLOTS, SONG_SCOPE_FRAMES};
+    use cubed_mixer::{wire, SongCell, SongControl, SongLoop, SONG_LEVEL_SLOTS, SONG_SCOPE_FRAMES};
     let rate = RATE as f32;
     let mut mixer = Mixer::new(MixerConfig {
         sample_rate: rate,
@@ -283,6 +283,15 @@ fn mixer_song_control() {
         SongControl::Scopes(true),
         SongControl::Seek { order: 1, row: 8 },
         SongControl::Play,
+        SongControl::SetCell(SongCell {
+            pattern: 1,
+            row: 9,
+            channel: 2,
+            note: 64,
+            instrument: 2,
+            volume: 0x30,
+            ..Default::default()
+        }),
         SongControl::Loop(SongLoop::Range {
             order: 1,
             row0: 8,
