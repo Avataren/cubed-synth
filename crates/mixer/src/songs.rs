@@ -13,10 +13,12 @@ use crate::song::{SongControl, SongInstrument, SongLoop, SongReader, SongStatus}
 use crate::source::{Source, SourceEvent};
 
 mod a2m;
+mod ahx;
 mod audition;
 mod player;
 
 pub use a2m::A2mPlayer;
+pub use ahx::AhxSongPlayer;
 pub use audition::OplAuditionSource;
 pub use player::{PlayerSong, SongPlayer, CHUNK as PLAYER_CHUNK};
 
@@ -140,9 +142,9 @@ pub fn open_module_song(
 /// like [`open_module_song`]'s: it takes `SourceEvent::Song(SongControl)` and gives a
 /// `song_reader`; `stopped` opens it stopped and its voice never ends by itself.
 ///
-/// MOD, S3M and XM modules (see [`open_module_song`]) and Adlib Tracker II songs
-/// ([`open_a2m`]); an error for the formats that are not under live control yet (AHX and SID:
-/// each joins with a [`SongPlayer`] and an arm here).
+/// MOD, S3M and XM modules (see [`open_module_song`]), Adlib Tracker II songs ([`open_a2m`])
+/// and AHX/HVL songs ([`open_ahx`]); an error for the formats that are not under live control
+/// yet (SID: it joins with a [`SongPlayer`] and an arm here).
 pub fn open_controlled_song(
     format: SongFormat,
     bytes: &[u8],
@@ -159,8 +161,12 @@ pub fn open_controlled_song(
                 .map_err(|e| format!("Cannot read this A2M module: {e}"))?;
             open_a2m(song, sample_rate, options, stopped)
         }
-        SongFormat::Ahx | SongFormat::Sid => {
-            Err("this format is not under live control yet (MOD, S3M, XM and A2M are)".into())
+        SongFormat::Ahx => {
+            let song = cubed_ahx::format::parse(bytes).map_err(|e| e.to_string())?;
+            open_ahx(song, sample_rate, options, stopped)
+        }
+        SongFormat::Sid => {
+            Err("this format is not under live control yet (MOD, S3M, XM, A2M and AHX are)".into())
         }
     }
 }
@@ -182,6 +188,23 @@ pub fn open_a2m(
             row: 0,
         });
     }
+    if !stopped {
+        player.control(SongControl::Play);
+    }
+    Ok(Box::new(PlayerSong::new(player, stopped, options.looped)))
+}
+
+/// An AHX or HVL song the host already holds (an edited one) as a song under live control: see
+/// [`open_controlled_song`]. `options.subsong` is the subsong to start. Builds the player and
+/// plays its first moments to warm it up: do it off the audio thread. An error says why the
+/// engine cannot play the song.
+pub fn open_ahx(
+    song: cubed_ahx::format::Song,
+    sample_rate: f32,
+    options: SongOptions,
+    stopped: bool,
+) -> Result<Box<dyn Source>, String> {
+    let mut player = AhxSongPlayer::new(song, sample_rate, options.subsong)?;
     if !stopped {
         player.control(SongControl::Play);
     }
@@ -409,8 +432,11 @@ impl ModuleSong {
                     },
                 );
             }
-            // Adlib's: a module's instruments and timing are a new song.
-            SongControl::SetInstrument(_) | SongControl::Timing { .. } => {}
+            // Other formats': a module's instruments, timing and order list are a new song.
+            SongControl::SetInstrument(_)
+            | SongControl::Timing { .. }
+            | SongControl::SetOrder { .. }
+            | SongControl::SetRestart(_) => {}
         }
     }
 }

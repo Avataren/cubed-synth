@@ -104,6 +104,17 @@ pub enum SongControl {
         tempo: u8,
         speed: u8,
     },
+    /// Sets one entry of the order list now: channel `channel` of position `order` plays
+    /// track `pattern` at `transpose` semitones (AHX and HVL; a module's order list entry
+    /// is a new song). Wire kind 15. Other formats ignore it.
+    SetOrder {
+        order: u16,
+        channel: u8,
+        pattern: u8,
+        transpose: i8,
+    },
+    /// Sets where the song starts over when it ends (AHX and HVL). Wire kind 16.
+    SetRestart(u16),
 }
 
 /// An Adlib instrument as `SongControl::SetInstrument` carries it: what the song loads
@@ -133,7 +144,9 @@ pub struct SongCell {
     pub note: u8,
     /// MOD: the Amiga period of the note. Adlib: the second effect and its parameter,
     /// `effect2 << 8 | param2` (a cell has two effect columns; `note` is the file's note
-    /// byte and `volume` is not used). 0 elsewhere.
+    /// byte and `volume` is not used). AHX and HVL: the second effect column the same way
+    /// (`fxb << 8 | fxb_param`; `pattern` is the *track* the step is in, `channel` is not
+    /// used, `note` is the file's 0-63, `volume` is not used). 0 elsewhere.
     pub period: u16,
     /// The instrument (MOD, S3M: sample) number, 1-based; 0 for none.
     pub instrument: u8,

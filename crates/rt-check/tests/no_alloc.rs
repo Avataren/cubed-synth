@@ -643,6 +643,125 @@ fn mixer_a2m_song_control() {
     assert!(reader.alive() && mixer.is_playing(voice));
 }
 
+/// An AHX song steered through the mixer the same way, from its very first block: every control
+/// as decoded wire bytes (a step, a position entry, the restart too), a preview, and the readers
+/// read each block.
+#[test]
+fn mixer_ahx_song_control() {
+    use cubed_mixer::songs::open_ahx;
+    use cubed_mixer::{wire, SongCell, SongControl, SongLoop, SONG_LEVEL_SLOTS};
+    let rate = RATE as f32;
+    let song =
+        cubed_ahx::format::parse(&fixture("ahx/tests/fixtures/songs/a_new_beginning.ahx")).unwrap();
+    let track = song.positions[1].track[2] as u16;
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        max_block: BLOCK,
+        ..MixerConfig::default()
+    });
+    let music = BusId(1);
+    mixer.apply(Command::SetBus(music, BusSettings::default()));
+    let source = open_ahx(song, rate, SongOptions::default(), true).unwrap();
+    let reader = source.song_reader().unwrap();
+    let voice = VoiceId(5);
+    mixer.apply(Command::PrepareSource(SourceId(0), source));
+    mixer.apply(Command::PlaySource(PlaySource::new(
+        voice,
+        SourceId(0),
+        music,
+    )));
+    let controls = [
+        SongControl::Seek { order: 1, row: 8 },
+        SongControl::Play,
+        SongControl::SetCell(SongCell {
+            pattern: track,
+            row: 9,
+            note: 40,
+            instrument: 2,
+            effect: 0x0c,
+            param: 0x20,
+            ..Default::default()
+        }),
+        SongControl::SetOrder {
+            order: 1,
+            channel: 2,
+            pattern: track as u8,
+            transpose: -5,
+        },
+        SongControl::SetRestart(1),
+        SongControl::PreviewOn {
+            instrument: 2,
+            note: 60,
+            velocity: 1.0,
+            duration: 0,
+        },
+        SongControl::Loop(SongLoop::Range {
+            order: 1,
+            row0: 8,
+            row1: 15,
+        }),
+        SongControl::Mute {
+            channel: 2,
+            on: true,
+        },
+        SongControl::SoloMask(0b11),
+        SongControl::PreviewOff,
+        SongControl::Stop,
+        SongControl::Seek { order: 0, row: 0 },
+        SongControl::Looped(false),
+        SongControl::Loop(SongLoop::Pattern { order: 2 }),
+        SongControl::Play,
+        SongControl::SoloMask(0),
+        SongControl::MuteMask(0),
+        SongControl::PreviewOn {
+            instrument: 1,
+            note: 48,
+            velocity: 0.5,
+            duration: 2_000,
+        },
+        SongControl::Loop(SongLoop::None),
+        SongControl::Looped(true),
+        SongControl::Scopes(true),
+        SongControl::Seek { order: 3, row: 20 },
+    ];
+    let encoded: Vec<Vec<u8>> = controls
+        .iter()
+        .map(|&control| {
+            let mut bytes = Vec::new();
+            wire::encode(
+                &Command::SourceEvent {
+                    voice,
+                    event: SourceEvent::Song(control),
+                },
+                &mut bytes,
+            );
+            bytes
+        })
+        .collect();
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let mut levels = [0f32; SONG_LEVEL_SLOTS];
+    let per_control = BLOCKS_PER_SECOND / 3;
+    let mut sounded = 0.0f32;
+    let events = allocations_during(|| {
+        for bytes in &encoded {
+            for command in wire::decode(bytes) {
+                mixer.apply(command.unwrap());
+            }
+            for _ in 0..per_control {
+                mixer.process(&mut left, &mut right);
+                mixer.drain_events(|_| {});
+                let _ = reader.status();
+                reader.levels(&mut levels);
+                sounded = sounded.max(levels.iter().cloned().fold(0.0, f32::max));
+            }
+        }
+    });
+    assert_eq!(events, 0, "{events} allocations or frees");
+    assert!(sounded > 0.0, "the song sounded");
+    assert!(reader.alive() && mixer.is_playing(voice));
+}
+
 /// The DAW's synth engine: 8 voices of an FM-into-subtractive patch (two
 /// oscillators, 4-voice unison, a 24 dB low-pass, two envelopes; the
 /// `patch_render` bench's) through chorus, delay and reverb, with notes

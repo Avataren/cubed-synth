@@ -12,7 +12,7 @@
 //   {type: 'song', source, format (0 AHX/HVL, 1 A2M, 2 SID, 3 MOD, 4 S3M, 5 XM), bytes: ArrayBuffer,
 //    subsong, looped, separation?, stopped?, follow?}  prepares source slot `source` for a
 //    PlaySource command; separation (0-1) is a module's stereo width. For a module
-//    (3, 4, 5) or an Adlib song (1), `stopped` opens it under live control and stopped (silent until a
+//    (3, 4, 5), an Adlib song (1) or an AHX/HVL song (0), `stopped` opens it under live control and stopped (silent until a
 //    SongControl 'Play' command, its voice never ends by itself) and `follow` (also
 //    implied by `stopped`) makes the worklet post its position, levels and channel
 //    scopes ('songpos', 'songscope'). The controls are ordinary 'commands': wire tag 30
@@ -151,8 +151,8 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         const at = x.cw_file_buffer(bytes.length);
         new Uint8Array(x.memory.buffer, at, bytes.length).set(bytes);
         const separation = typeof message.separation === 'number' ? message.separation : -1;
-        // The formats that can be put under live control: MOD, S3M, XM and A2M.
-        const module = (message.format >= 3 && message.format <= 5) || message.format === 1;
+        // The formats that can be put under live control: MOD, S3M, XM, A2M and AHX/HVL.
+        const module = (message.format >= 3 && message.format <= 5) || message.format === 1 || message.format === 0;
         let ok;
         if (module && (message.stopped || message.follow)) {
           ok = x.cw_prepare_module(

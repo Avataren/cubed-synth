@@ -155,8 +155,11 @@ impl SongPlayer for A2mPlayer {
             SongControl::Timing { tempo, speed } => {
                 p.apply_edit(&LiveEdit::Timing { tempo, speed });
             }
-            // The adapter's.
-            SongControl::Looped(_) | SongControl::Scopes(_) => {}
+            // The adapter's, and other formats' (an Adlib order list edit is a new song).
+            SongControl::Looped(_)
+            | SongControl::Scopes(_)
+            | SongControl::SetOrder { .. }
+            | SongControl::SetRestart(_) => {}
         }
     }
 
