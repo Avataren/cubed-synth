@@ -90,6 +90,39 @@ pub fn filter_type_from_i32(value: i32) -> PatchLoaderResult<FilterType> {
     }
 }
 
+/// The output port a patch connection leaves its source node by: the one the
+/// connection names (`fromPort`), which the node must have, else, for patches
+/// that name none, the first output in the node's port-map order (the
+/// loader's choice before `fromPort` existed, which the oscillator, mixer,
+/// sampler and noise nodes make ambiguous). `ports` is `None` when the node is
+/// not in the graph.
+pub fn source_port(
+    requested: Option<u32>,
+    ports: Option<&rustc_hash::FxHashMap<PortId, bool>>,
+) -> PatchLoaderResult<PortId> {
+    match requested {
+        None => Ok(ports
+            .and_then(|ports| {
+                ports
+                    .iter()
+                    .find(|(_, &is_output)| is_output)
+                    .map(|(port, _)| *port)
+            })
+            .unwrap_or(PortId::AudioOutput0)),
+        Some(value) => {
+            let port = PortId::try_from_u32(value)
+                .ok_or_else(|| format!("Unknown source port id {value}"))?;
+            match ports {
+                Some(ports) if ports.get(&port) != Some(&true) => Err(format!(
+                    "The source node has no output port {}",
+                    port.name()
+                )),
+                _ => Ok(port),
+            }
+        }
+    }
+}
+
 /// Find the first node ID of a specific type in the voice layout
 pub fn find_node_id(voice_layout: &PatchVoiceLayout, node_type: &str) -> Option<String> {
     voice_layout

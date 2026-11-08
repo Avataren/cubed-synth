@@ -2,7 +2,7 @@ use super::patch::{AudioAsset, PatchFile, VoiceLayout as PatchVoiceLayout};
 use super::patch_loader::{
     filter_type_from_i32, find_node_id, for_each_node_in_creation_order,
     modulation_transform_from_i32, modulation_type_from_i32, parse_audio_asset_id, parse_node_id,
-    port_id_from_u32,
+    port_id_from_u32, source_port,
 };
 use crate::automation::AutomationFrame;
 use crate::biquad::FilterType;
@@ -2601,24 +2601,15 @@ impl AudioEngine {
                 modulation_transform_from_i32(connection.modulation_transform)
                     .map_err(|e| JsValue::from_str(&e))?;
 
-            // Determine the appropriate output port on the source node.
-            let from_port = self
-                .voices
-                .first()
-                .and_then(|voice| {
-                    NodeId::from_string(&connection.from_id)
-                        .ok()
-                        .and_then(|node_id| voice.graph.get_node(node_id))
-                        .map(|node| {
-                            let ports = node.get_ports();
-                            ports
-                                .iter()
-                                .find(|(_, &is_output)| is_output)
-                                .map(|(p, _)| *p)
-                                .unwrap_or(PortId::AudioOutput0)
-                        })
-                })
-                .unwrap_or(PortId::AudioOutput0);
+            // The output port the connection names, else the node's first.
+            let source_ports = self.voices.first().and_then(|voice| {
+                NodeId::from_string(&connection.from_id)
+                    .ok()
+                    .and_then(|node_id| voice.graph.get_node(node_id))
+                    .map(|node| node.get_ports())
+            });
+            let from_port = source_port(connection.from_port, source_ports.as_ref())
+                .map_err(|e| JsValue::from_str(&e))?;
 
             let mut from_id = connection.from_id.clone();
             let mut effective_from_port = from_port;

@@ -128,6 +128,10 @@ pub struct PatchConnection {
     pub from_id: String,
     #[serde(rename = "toId")]
     pub to_id: String,
+    /// The output port of the source node, a `PortId` number. Patches from
+    /// before it existed have none, and take the node's first output.
+    #[serde(rename = "fromPort", default, skip_serializing_if = "Option::is_none")]
+    pub from_port: Option<u32>,
     pub target: u32,
     pub amount: f32,
     #[serde(rename = "modulationType")]
@@ -376,4 +380,30 @@ pub enum AudioAssetType {
     Sample,
     ImpulseResponse,
     Wavetable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_keeps_its_from_port_and_skips_a_missing_one() {
+        let named: PatchConnection = serde_json::from_str(
+            r#"{"fromId":"a","toId":"b","fromPort":5,"target":0,"amount":1,
+                "modulationType":2,"modulationTransformation":0}"#,
+        )
+        .unwrap();
+        assert_eq!(named.from_port, Some(5));
+        assert!(serde_json::to_string(&named)
+            .unwrap()
+            .contains("\"fromPort\":5"));
+
+        let old: PatchConnection = serde_json::from_str(
+            r#"{"fromId":"a","toId":"b","target":0,"amount":1,
+                "modulationType":2,"modulationTransformation":0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.from_port, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("fromPort"));
+    }
 }

@@ -3,7 +3,7 @@ use crate::audio_engine::patch::{
 };
 use crate::audio_engine::patch_loader::for_each_node_in_creation_order;
 use crate::audio_engine::patch_loader::{
-    filter_type_from_i32, find_node_id, parse_audio_asset_id, parse_node_id,
+    filter_type_from_i32, find_node_id, parse_audio_asset_id, parse_node_id, source_port,
 };
 use crate::audio_engine::wav_decode::{decode_wav, impulse_from_wav};
 use crate::automation::AutomationFrame;
@@ -793,17 +793,15 @@ impl AudioEngine {
             let to_node = parse_node_id(&conn_data.to_id)?;
 
             for voice in &mut self.voices {
-                let from_port = voice
-                    .graph
-                    .nodes
-                    .get(&from_node)
-                    .and_then(|n| {
-                        n.get_ports()
-                            .iter()
-                            .find(|(_, &is_output)| is_output)
-                            .map(|(p, _)| *p)
-                    })
-                    .unwrap_or(PortId::AudioOutput0);
+                let from_port = source_port(
+                    conn_data.from_port,
+                    voice
+                        .graph
+                        .nodes
+                        .get(&from_node)
+                        .map(|n| n.get_ports())
+                        .as_ref(),
+                )?;
 
                 let mut effective_from_node = from_node;
                 let mut effective_from_port = from_port;

@@ -46,6 +46,7 @@ mod tests {
             let patch_conn = PatchConnection {
                 from_id: conn.from_node.to_string(),
                 to_id: conn.to_node.to_string(),
+                from_port: None,
                 target: conn.to_port as u32,
                 amount: conn.amount,
                 modulation_type: conn.modulation_type as i32,
