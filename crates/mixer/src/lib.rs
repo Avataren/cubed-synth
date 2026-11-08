@@ -29,6 +29,7 @@ pub mod effects;
 pub mod engine;
 mod insert;
 mod mixer;
+pub mod probe;
 pub mod sfx;
 mod smooth;
 mod song;
@@ -55,11 +56,12 @@ pub use effects::{Effect, EffectKind};
 pub use engine::{EngineControls, EngineSound, MAX_CYLINDERS};
 pub use insert::{DspInsert, Insert};
 pub use mixer::{BusMeter, Mixer, MixerConfig, Stats, MAX_INSERTS, MAX_SENDS};
+pub use probe::SongProbe;
 pub use sfx::{Sfx, SfxPreset, SfxWave};
 pub use smooth::MIN_DB;
 pub use song::{
-    SongCell, SongControl, SongLoop, SongReader, SongStatus, WebSong, WebSongs, SONG_LEVEL_SLOTS,
-    SONG_MAX_CHANNELS, SONG_SCOPE_FRAMES, SONG_STATUS_WORDS,
+    SongCell, SongControl, SongInstrument, SongLoop, SongReader, SongStatus, WebSong, WebSongs,
+    SONG_LEVEL_SLOTS, SONG_MAX_CHANNELS, SONG_SCOPE_FRAMES, SONG_STATUS_WORDS,
 };
 pub use source::{Source, SourceEvent};
 pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};

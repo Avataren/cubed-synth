@@ -94,6 +94,31 @@ pub enum SongControl {
     /// rows, the order list, a sample) is a new song: open the edited module,
     /// seek it to where the old one is and swap them (`swap_commands`).
     SetCell(SongCell),
+    /// Puts an Adlib instrument's data in the song, for the notes that load it from now on
+    /// (and the preview, if it plays this instrument): a live edit that allocates nothing.
+    /// Wire tag 32, 24 bytes. Other formats ignore it.
+    SetInstrument(SongInstrument),
+    /// Sets an Adlib song's tempo and speed now (a module changes them with its first row
+    /// effect, so its tempo is a new song). Other formats ignore it.
+    Timing {
+        tempo: u8,
+        speed: u8,
+    },
+}
+
+/// An Adlib instrument as `SongControl::SetInstrument` carries it: what the song loads
+/// into a channel at a note (`cubed_opl::a2::live::LiveEdit::Instrument`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SongInstrument {
+    /// The instrument's number, from 1 (as a cell names it).
+    pub number: u8,
+    /// The eleven FM bytes, as an A2M file holds them.
+    pub fm: [u8; 11],
+    /// 0 centre, 1 left, 2 right.
+    pub panning: u8,
+    pub finetune: i8,
+    /// 0 melodic, 1-5 bass drum, snare, tom, cymbal, hi-hat.
+    pub voice_type: u8,
 }
 
 /// A pattern cell as `SongControl::SetCell` carries it: the same numbers a
@@ -106,7 +131,9 @@ pub struct SongCell {
     pub channel: u8,
     /// 0 none, 255 key off, otherwise a MIDI note number (60 is middle C).
     pub note: u8,
-    /// MOD: the Amiga period of the note; 0 elsewhere.
+    /// MOD: the Amiga period of the note. Adlib: the second effect and its parameter,
+    /// `effect2 << 8 | param2` (a cell has two effect columns; `note` is the file's note
+    /// byte and `volume` is not used). 0 elsewhere.
     pub period: u16,
     /// The instrument (MOD, S3M: sample) number, 1-based; 0 for none.
     pub instrument: u8,

@@ -15,7 +15,7 @@ use crate::command::{
 };
 use crate::engine::{EngineControls, EngineSound, MAX_CYLINDERS};
 use crate::sfx::{Sfx, SfxWave};
-use crate::song::{SongCell, SongControl, SongLoop};
+use crate::song::{SongCell, SongControl, SongInstrument, SongLoop};
 use crate::source::SourceEvent;
 use crate::spatial::{Listener, Rolloff, Spatial, SpatialMode};
 
@@ -51,6 +51,7 @@ mod tag {
     pub const SOURCE_PARAM: u8 = 29;
     pub const SONG_CONTROL: u8 = 30;
     pub const SONG_CELL: u8 = 31;
+    pub const SONG_INSTRUMENT: u8 = 32;
 
     pub const ENDED: u8 = 1;
     pub const STOLEN: u8 = 2;
@@ -259,6 +260,21 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
         }
         Command::SourceEvent {
             voice,
+            event: SourceEvent::Song(SongControl::SetInstrument(i)),
+        } => {
+            // 24 bytes, a layout of its own.
+            w.u8(tag::SONG_INSTRUMENT);
+            w.u64(voice.0);
+            w.u8(i.number);
+            for &b in &i.fm {
+                w.u8(b);
+            }
+            w.u8(i.panning);
+            w.u8(i.finetune as u8);
+            w.u8(i.voice_type);
+        }
+        Command::SourceEvent {
+            voice,
             event: SourceEvent::Song(control),
         } => {
             // 24 bytes: tag, voice, kind, three u16s, an f32, a u32.
@@ -391,8 +407,9 @@ fn song_fields(control: &SongControl) -> (u8, u16, u16, u16, f32, u32) {
         SongControl::PreviewOff => (11, 0, 0, 0, 0.0, 0),
         SongControl::Looped(on) => (12, 0, on as u16, 0, 0.0, 0),
         SongControl::Scopes(on) => (13, 0, on as u16, 0, 0.0, 0),
+        SongControl::Timing { tempo, speed } => (14, tempo as u16, speed as u16, 0, 0.0, 0),
         // Encoded with a tag of its own.
-        SongControl::SetCell(_) => unreachable!(),
+        SongControl::SetCell(_) | SongControl::SetInstrument(_) => unreachable!(),
     }
 }
 
@@ -434,6 +451,10 @@ fn song_control(
         11 => SongControl::PreviewOff,
         12 => SongControl::Looped(b != 0),
         13 => SongControl::Scopes(b != 0),
+        14 => SongControl::Timing {
+            tempo: a.min(255) as u8,
+            speed: b.min(255) as u8,
+        },
         // The tag is known; the kind is from a newer sender.
         _ => return Err(WireError::UnknownTag(tag::SONG_CONTROL)),
     })
@@ -890,6 +911,24 @@ impl Reader<'_> {
                     param: self.u8()?,
                 })),
             },
+            tag::SONG_INSTRUMENT => {
+                let voice = self.voice()?;
+                let number = self.u8()?;
+                let mut fm = [0u8; 11];
+                for b in fm.iter_mut() {
+                    *b = self.u8()?;
+                }
+                Command::SourceEvent {
+                    voice,
+                    event: SourceEvent::Song(SongControl::SetInstrument(SongInstrument {
+                        number,
+                        fm,
+                        panning: self.u8()?,
+                        finetune: self.u8()? as i8,
+                        voice_type: self.u8()?,
+                    })),
+                }
+            }
             tag::FADE_VOICE => Command::FadeVoice {
                 voice: self.voice()?,
                 gain: self.f32()?,
@@ -1195,7 +1234,28 @@ mod tests {
             SongControl::Looped(true),
             SongControl::Scopes(true),
             SongControl::Scopes(false),
+            SongControl::Timing {
+                tempo: 255,
+                speed: 6,
+            },
         ];
+        let instrument = SongInstrument {
+            number: 255,
+            fm: [
+                0x21, 0x31, 0x4f, 0x0b, 0xf2, 0xf1, 0x72, 0x7a, 0x03, 0x01, 0x0e,
+            ],
+            panning: 2,
+            finetune: -128,
+            voice_type: 5,
+        };
+        let command = Command::SourceEvent {
+            voice,
+            event: SourceEvent::Song(SongControl::SetInstrument(instrument)),
+        };
+        let mut bytes = Vec::new();
+        assert!(encode(&command, &mut bytes));
+        assert_eq!((bytes.len(), bytes[0]), (24, 32));
+        round_trip(command);
         let cell = SongCell {
             pattern: 300,
             row: 63,

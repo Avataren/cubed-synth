@@ -9,8 +9,16 @@ use cubed_opl::a2::player::A2Player;
 use cubed_sid::{SidSong, SidSongPlayer};
 use cubed_tracker::{Loop, Player, PlayerOptions, Probe};
 
-use crate::song::{SongControl, SongLoop, SongReader, SongStatus};
+use crate::song::{SongControl, SongInstrument, SongLoop, SongReader, SongStatus};
 use crate::source::{Source, SourceEvent};
+
+mod a2m;
+mod audition;
+mod player;
+
+pub use a2m::A2mPlayer;
+pub use audition::OplAuditionSource;
+pub use player::{PlayerSong, SongPlayer, CHUNK as PLAYER_CHUNK};
 
 /// The most frames a player is asked for at once; longer blocks are split,
 /// so the players' buffers never grow past what the warm-up sized them for.
@@ -125,6 +133,72 @@ pub fn open_module_song(
     };
     let module = cubed_tracker::load_format(format, bytes)?;
     Ok(open_module(module, sample_rate, options, stopped))
+}
+
+/// A song file of any format that can be put under live control, ready to play at
+/// `sample_rate`: what a host that only has the file's bytes (the worklet) opens. A source
+/// like [`open_module_song`]'s: it takes `SourceEvent::Song(SongControl)` and gives a
+/// `song_reader`; `stopped` opens it stopped and its voice never ends by itself.
+///
+/// MOD, S3M and XM modules (see [`open_module_song`]) and Adlib Tracker II songs
+/// ([`open_a2m`]); an error for the formats that are not under live control yet (AHX and SID:
+/// each joins with a [`SongPlayer`] and an arm here).
+pub fn open_controlled_song(
+    format: SongFormat,
+    bytes: &[u8],
+    sample_rate: f32,
+    options: SongOptions,
+    stopped: bool,
+) -> Result<Box<dyn Source>, String> {
+    match format {
+        SongFormat::Mod | SongFormat::S3m | SongFormat::Xm => {
+            open_module_song(format, bytes, sample_rate, options, stopped)
+        }
+        SongFormat::A2m => {
+            let song = cubed_opl::a2::parse(bytes)
+                .map_err(|e| format!("Cannot read this A2M module: {e}"))?;
+            open_a2m(song, sample_rate, options, stopped)
+        }
+        SongFormat::Ahx | SongFormat::Sid => {
+            Err("this format is not under live control yet (MOD, S3M, XM and A2M are)".into())
+        }
+    }
+}
+
+/// An Adlib Tracker II song the host already holds (an edited one) as a song under live
+/// control: see [`open_controlled_song`]. `options.subsong` is the order to start at.
+/// Builds the player and plays its first second to warm it up: do it off the audio thread.
+/// An error says why the song cannot play (its order list holds no pattern).
+pub fn open_a2m(
+    song: cubed_opl::a2::A2mSong,
+    sample_rate: f32,
+    options: SongOptions,
+    stopped: bool,
+) -> Result<Box<dyn Source>, String> {
+    let mut player = A2mPlayer::new(song, sample_rate)?;
+    if options.subsong > 0 {
+        player.control(SongControl::Seek {
+            order: options.subsong.min(u16::MAX as usize) as u16,
+            row: 0,
+        });
+    }
+    if !stopped {
+        player.control(SongControl::Play);
+    }
+    Ok(Box::new(PlayerSong::new(player, stopped, options.looped)))
+}
+
+/// An Adlib instrument to play by hand: a voice that takes `SourceEvent::NoteOn`, `NoteOff` and
+/// `AllNotesOff`, and `SongControl::SetInstrument` to change the instrument under the notes
+/// that sound (an instrument editor's keyboard). `voices` (1-18) notes sound at once. It
+/// never ends by itself and costs nothing while silent. Makes a chip: do it off the audio
+/// thread.
+pub fn open_opl_audition(
+    instrument: &SongInstrument,
+    sample_rate: f32,
+    voices: usize,
+) -> Box<dyn Source> {
+    Box::new(OplAuditionSource::new(sample_rate, instrument, voices))
 }
 
 /// [`open_module_song`] for a module the host already holds (an edited one).
@@ -335,6 +409,8 @@ impl ModuleSong {
                     },
                 );
             }
+            // Adlib's: a module's instruments and timing are a new song.
+            SongControl::SetInstrument(_) | SongControl::Timing { .. } => {}
         }
     }
 }
