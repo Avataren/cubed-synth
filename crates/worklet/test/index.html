@@ -274,6 +274,34 @@ async function swap() {
   return { ok, rms, replies, voices: last.voices };
 }
 
+// A swap whose patch is so big that making room for it grows the wasm memory:
+// the views must be taken after the pointer, or the buffer is detached and the
+// swap never happens.
+async function bigSwap() {
+  const text = await (await fetch('../../dsp/tests/real_patch.json')).text();
+  const patch = JSON.parse(text);
+  patch.editor = { padding: 'x'.repeat(24 * 1024 * 1024) };
+  const bytes = new TextEncoder().encode(JSON.stringify(patch));
+  const context = new OfflineAudioContext(2, RATE, RATE);
+  const replies = [];
+  const { node, ready } = await mixerNode(context, (m) => { if (m.type === 'swap' || m.type === 'song') replies.push(m); });
+  const send = (...parts) => {
+    const b = new Uint8Array(parts.flatMap((p) => [...p]));
+    node.port.postMessage({ type: 'commands', bytes: b.buffer }, [b.buffer]);
+  };
+  const small = await (await fetch('../../dsp/tests/real_patch.json')).arrayBuffer();
+  node.port.postMessage({ type: 'synth', source: 0, bytes: small, oneShot: false });
+  send(setBus(2, 0), playSource(1, 0, 2), sourceEvent(1, 0, 60, 1, 0));
+  node.port.postMessage({
+    type: 'swap', source: 1, bytes: bytes.buffer, play: playSource(2, 1, 2).buffer,
+    oldVoice: 1, fadeFrames: 600, held: [[60, 1]], warmBlocks: 20, sliceBlocks: 4,
+  });
+  await ready;
+  await context.startRendering();
+  const phases = replies.filter((r) => r.type === 'swap').map((r) => r.phase).join();
+  return { ok: phases === 'started,done', phases, replies };
+}
+
 async function run() {
   const clips = await clip();
   const songs = await song();
@@ -282,9 +310,11 @@ async function run() {
   const synthEdits = await synthEdit();
   const tapped = await taps();
   const swapped = await swap();
+  const bigSwapped = await bigSwap();
   return {
-    ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok && tapped.ok && swapped.ok,
-    clips, songs, modules, synths, synthEdits, tapped, swapped,
+    ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok && tapped.ok && swapped.ok
+      && bigSwapped.ok,
+    clips, songs, modules, synths, synthEdits, tapped, swapped, bigSwapped,
   };
 }
 

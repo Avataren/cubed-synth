@@ -120,7 +120,8 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         const at = x.cw_clip_buffer(frames, channels);
         new Float32Array(x.memory.buffer, at, frames).set(left);
         if (right) {
-          new Float32Array(x.memory.buffer, x.cw_clip_right(), frames).set(right.subarray(0, frames));
+          const rightAt = x.cw_clip_right();
+          new Float32Array(x.memory.buffer, rightAt, frames).set(right.subarray(0, frames));
         }
         x.cw_add_clip(message.id >>> 0, message.sampleRate, frames, channels);
       } else if (message.type === 'song') {
@@ -171,9 +172,13 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         this.port.postMessage(reply);
       } else if (message.type === 'swap') {
         const patch = new Uint8Array(message.bytes);
-        new Uint8Array(x.memory.buffer, x.cw_file_buffer(patch.length), patch.length).set(patch);
+        // The pointer first: asking for room can grow the wasm memory, which
+        // detaches `x.memory.buffer` as it was.
+        const patchAt = x.cw_file_buffer(patch.length);
+        new Uint8Array(x.memory.buffer, patchAt, patch.length).set(patch);
         const play = new Uint8Array(message.play);
-        new Uint8Array(x.memory.buffer, x.cw_swap_play_buffer(play.length), play.length).set(play);
+        const playAt = x.cw_swap_play_buffer(play.length);
+        new Uint8Array(x.memory.buffer, playAt, play.length).set(play);
         const held = message.held ?? [];
         const room = x.cw_held_buffer(held.length);
         const view = new Float32Array(x.memory.buffer, room, held.length * 2);
@@ -204,7 +209,8 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         this.port.postMessage({ type: 'tap', bus: message.bus, enable: !!message.enable, ok });
       } else if (message.type === 'effect') {
         const params = message.params ?? new Float32Array(0);
-        const room = new Float32Array(x.memory.buffer, x.cw_effect_params(), 6);
+        const paramsAt = x.cw_effect_params();
+        const room = new Float32Array(x.memory.buffer, paramsAt, 6);
         room.fill(0);
         room.set(params.subarray(0, 6));
         const kind = message.kind >= 0 ? message.kind >>> 0 : 0xffffffff;
