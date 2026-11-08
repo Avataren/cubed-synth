@@ -100,6 +100,51 @@ synth with them (`cw_prepare_synth` is unchanged). The processor's `'synth'` mes
 `held: [[note, velocity], ...]` and `warmBlocks` (at most 32 are used). Parameter edits and the
 swap's `PlaySource`, `FadeVoice` and `Stop` are ordinary `'commands'`.
 
+## Analysis: taps, spectrum, levels
+
+What an editor shows of the sound (a scope, a spectrum, level meters) comes from
+`cubed-mixer`, the same API natively and on the web.
+
+**Taps** (`cubed_mixer::Tap`). A bus can keep its latest frames, after its fader (what its
+meter reads), in a single-writer ring of atomics: written once per block on the audio thread
+(a copy, no allocation, no lock), read from any thread by copying out and checking the writer
+did not lap the read. A bus has no tap until the host gives it one with `Command::SetTap(bus,
+Some(tap))`, so a bus nobody looks at costs nothing; `SetTap(bus, None)` takes it away. A tap
+replaced, removed or on a removed bus comes back as `Returned::Tap`, to be freed off the audio
+thread. `Tap::new(frames)` makes one (4,096 frames is the default, `TAP_FRAMES`); `TapSet` is the
+host's table of them.
+
+**Reading** (`cubed_mixer::Analysis`), from the main thread, once per frame:
+
+```rust
+trait Analysis {
+    fn sample_rate(&self) -> f32;
+    fn scope(&self, bus: BusId, left: &mut [f32], right: &mut [f32]) -> usize; // latest frames, oldest first
+    fn scope_position(&self, bus: BusId) -> u64;       // frames seen so far: changes when there is new data
+    fn levels(&self, bus: BusId) -> Option<BusMeter>;  // peak and RMS per channel, linear
+}
+```
+
+`scope` fills as many frames as fit in the shorter slice and returns that many (0 for a bus
+without a tap, fewer while a tap fills up). Natively `NativeHost` implements it (4,096 frames
+after `NativeHost::enable_tap(bus, true)`, which needs the bus to exist). On the web the worklet
+posts a `'taps'` message about 40 times a second (init's `tapHz`) while any tap is on, with the
+latest 2,048 frames of each (a transferable `Float32Array`: messages, not a `SharedArrayBuffer`,
+which would need cross-origin isolation); `WebAnalysis` parses it (`update_taps(buses, written,
+frames, data)`, and `update_meters(meters)` for the telemetry message's meters) and implements
+the same trait over the latest message. Switch a tap on with the processor's `{type: 'tap',
+bus, enable}` message (`cw_set_tap`); call `WebAnalysis::forget(bus)` when switching one off.
+`levels` is the existing bus meter (peak falling 24 dB a second, RMS over 300 ms): the UI does
+its own peak hold.
+
+**Spectrum** (`cubed_mixer::Spectrum`). `Spectrum::new(2048)` (a radix-2 FFT of its own, nothing
+to depend on); `log_bins(&mut self, left, right, rate, bins: &mut [f32], min_hz, max_hz,
+floor_db)` sums the ends of the two channels to mono, applies a Hann window, and fills the bars
+logarithmically spaced between the two frequencies with 0 to 1 (the bar's loudest frequency in
+dBFS, `floor_db` at 0, a full-scale sine at 1; silence is 0; a bar narrower than an FFT bin reads
+between its two nearest bins). It does not allocate. `smooth_bins(bins, &mut state, rise, fall)` is
+the usual fast-rise slow-fall smoothing for a display.
+
 ## Building, testing, benchmarks
 
 ```sh

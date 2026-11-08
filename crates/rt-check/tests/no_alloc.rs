@@ -433,6 +433,75 @@ fn mixer() {
     });
 }
 
+/// Taps on the master and two buses, switched on, replaced and off again every
+/// few blocks, with a reader on the same thread: the tap's write, its read, the
+/// spectrum and its smoothing allocate nothing.
+#[test]
+fn mixer_taps() {
+    use cubed_mixer::{smooth_bins, Spectrum, Tap, TapSet};
+    let rate = RATE as f32;
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        ..MixerConfig::default()
+    });
+    for bus in 1..=2 {
+        mixer.apply(Command::SetBus(BusId(bus), BusSettings::default()));
+    }
+    let samples = (0..5_000).map(|i| (i as f32 * 0.07).sin() * 0.3).collect();
+    mixer.apply(Command::AddClip(
+        ClipId(0),
+        std::sync::Arc::new(Clip::mono(rate, samples)),
+    ));
+    for v in 0..6u64 {
+        mixer.apply(Command::Play(Play {
+            looped: true,
+            ..Play::new(VoiceId(v), ClipId(0), BusId(1 + (v % 2) as u16))
+        }));
+    }
+    let mut taps = TapSet::new(mixer.config().max_buses);
+    let spare: Vec<_> = (0..3).map(|_| Tap::new(4096)).collect();
+    for bus in 0..=2u16 {
+        let tap = taps.enable(BusId(bus), 4096).unwrap();
+        mixer.apply(Command::SetTap(BusId(bus), Some(tap)));
+    }
+
+    let mut spectrum = Spectrum::new(2048);
+    let mut bars = vec![0.0f32; 64];
+    let mut previous = Vec::with_capacity(64);
+    let (mut sl, mut sr) = (vec![0f32; 2048], vec![0f32; 2048]);
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    // The smoothing state is sized by its first call.
+    smooth_bins(&mut bars, &mut previous, 0.5, 0.1);
+    assert_no_alloc("Taps", 3, |block| {
+        // A tap put in place of the bus's and then taken off, by command.
+        let bus = BusId((block % 3) as u16);
+        match block % 7 {
+            0 => mixer.apply(Command::SetTap(bus, Some(spare[block % 3].clone()))),
+            3 => mixer.apply(Command::SetTap(bus, None)),
+            _ => {}
+        }
+        mixer.process(&mut left, &mut right);
+        mixer.drain_events(|_| {});
+        mixer.take_returned(drop);
+        // The host's side: read a scope and make bars of it, every block.
+        for bus in 0..=2u16 {
+            let got = taps.scope(BusId(bus), &mut sl, &mut sr);
+            if got > 0 {
+                spectrum.log_bins(
+                    &sl[..got],
+                    &sr[..got],
+                    rate,
+                    &mut bars,
+                    20.0,
+                    20_000.0,
+                    -90.0,
+                );
+                smooth_bins(&mut bars, &mut previous, 0.6, 0.12);
+            }
+        }
+    });
+}
+
 /// Songs through the mixer, counted from their first block (the songs are
 /// built and warmed up off the audio thread): two at a time crossfading on
 /// a music bus that ducks under effects, through every built-in effect with

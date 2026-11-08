@@ -18,6 +18,10 @@
 //!    commands (notes, and parameter edits as wire tag 29). Effects arrive
 //!    as a kind and parameters: write them at `cw_effect_params()`, then
 //!    `cw_set_effect`.
+//!    Analysis taps: `cw_set_tap(bus, on)` gives a bus a tap that keeps its latest
+//!    frames; `cw_taps_prepare(frames)` cuts them (about 40 times a second) into
+//!    `cw_tap_buses`, `cw_tap_written` and `cw_tap_data` for the page, which
+//!    reads them with `cubed_mixer::WebAnalysis`.
 //! 4. Each render quantum, `cw_process(frames)` renders into `cw_left()` and
 //!    `cw_right()`; events (`cw_events`, encoded with `wire::encode_event`),
 //!    meters (`cw_meters`, 5 floats per bus: exists, peak L/R, RMS L/R) and
@@ -32,7 +36,7 @@ use std::sync::Arc;
 use cubed_mixer::effects::MAX_PARAMS;
 use cubed_mixer::{
     wire, BusId, Clip, ClipId, Command, Effect, EffectKind, HeldNote, Mixer, MixerConfig, Returned,
-    SynthBuild, SynthSource,
+    SynthBuild, SynthSource, TapSet, TAP_FRAMES,
 };
 
 /// The Web Audio render quantum.
@@ -41,6 +45,8 @@ pub const BLOCK: usize = 128;
 pub const METER_FIELDS: usize = 5;
 /// Events kept between `cw_clear_events` calls.
 const MAX_EVENTS: usize = 512;
+/// The most frames of each tap `cw_taps_prepare` hands out.
+pub const TAP_SEND_FRAMES: usize = 2048;
 
 struct State {
     mixer: Mixer,
@@ -64,6 +70,13 @@ struct State {
     released: Vec<Returned>,
     /// Command batches that did not decode fully.
     bad_batches: u32,
+    /// The buses' taps the page switched on, and what `cw_taps_prepare` cut from
+    /// them: the bus slots, how many frames each had seen, and their frames
+    /// (each bus's left frames then its right).
+    taps: TapSet,
+    tap_buses: Vec<u32>,
+    tap_written: Vec<f64>,
+    tap_data: Vec<f32>,
 }
 
 struct Global(UnsafeCell<Option<State>>);
@@ -118,6 +131,10 @@ pub extern "C" fn cw_init(
         meters: vec![0.0; buses * METER_FIELDS],
         released: Vec::with_capacity(released),
         bad_batches: 0,
+        taps: TapSet::new(buses),
+        tap_buses: Vec::with_capacity(buses),
+        tap_written: Vec::with_capacity(buses),
+        tap_data: Vec::new(),
     };
     // SAFETY: see `state`.
     unsafe { *STATE.0.get() = Some(state) };
@@ -442,6 +459,96 @@ pub extern "C" fn cw_set_effect(bus: u32, slot: u32, kind: u32) -> u32 {
     built
 }
 
+/// Switches the tap of bus slot `bus` on (`enable` 1) or off (0): the bus keeps
+/// its latest frames after its fader, which `cw_taps_prepare` cuts for the page.
+/// The bus must exist. Returns 1 on success. Allocates (it makes the tap and
+/// room for what is sent): it runs in the message handler.
+#[no_mangle]
+pub extern "C" fn cw_set_tap(bus: u32, enable: u32) -> u32 {
+    let s = state();
+    s.released.clear();
+    let id = BusId(bus.min(u16::MAX as u32) as u16);
+    if enable == 0 {
+        s.taps.disable(id);
+        s.mixer.apply(Command::SetTap(id, None));
+    } else {
+        if s.mixer.meter(id).is_none() {
+            return 0;
+        }
+        let Some(tap) = s.taps.enable(id, TAP_FRAMES) else {
+            return 0;
+        };
+        s.mixer.apply(Command::SetTap(id, Some(tap)));
+    }
+    let wanted = s.taps.enabled().count() * 2 * TAP_SEND_FRAMES;
+    s.tap_data.resize(wanted, 0.0);
+    1
+}
+
+/// How many taps are switched on.
+#[no_mangle]
+pub extern "C" fn cw_tap_count() -> u32 {
+    state().taps.enabled().count() as u32
+}
+
+/// Cuts the latest `frames` (at most 2048) of every tap that is on into the
+/// buffers `cw_tap_buses`, `cw_tap_written` and `cw_tap_data` describe, and
+/// returns how many buses that is. Runs in the render callback's thread and
+/// does not allocate; a tap that has not seen that many frames yet is padded
+/// with silence in front.
+#[no_mangle]
+pub extern "C" fn cw_taps_prepare(frames: u32) -> u32 {
+    let State {
+        taps,
+        tap_buses,
+        tap_written,
+        tap_data,
+        ..
+    } = state();
+    let frames = (frames as usize).clamp(1, TAP_SEND_FRAMES);
+    tap_buses.clear();
+    tap_written.clear();
+    let mut at = 0;
+    for bus in taps.enabled() {
+        if at + 2 * frames > tap_data.len() {
+            break;
+        }
+        let (left, rest) = tap_data[at..].split_at_mut(frames);
+        let right = &mut rest[..frames];
+        let got = taps.scope(bus, left, right);
+        if got < frames {
+            // Newest frames last, silence before them.
+            left.copy_within(..got, frames - got);
+            right.copy_within(..got, frames - got);
+            left[..frames - got].fill(0.0);
+            right[..frames - got].fill(0.0);
+        }
+        tap_buses.push(bus.0 as u32);
+        tap_written.push(taps.position(bus) as f64);
+        at += 2 * frames;
+    }
+    tap_buses.len() as u32
+}
+
+/// The bus slots `cw_taps_prepare` cut, as `u32`s.
+#[no_mangle]
+pub extern "C" fn cw_tap_buses() -> *const u32 {
+    state().tap_buses.as_ptr()
+}
+
+/// How many frames each of those taps had seen in all, as `f64`s.
+#[no_mangle]
+pub extern "C" fn cw_tap_written() -> *const f64 {
+    state().tap_written.as_ptr()
+}
+
+/// The frames `cw_taps_prepare` cut: for each bus in order, its left frames,
+/// then its right frames (`frames` each).
+#[no_mangle]
+pub extern "C" fn cw_tap_data() -> *const f32 {
+    state().tap_data.as_ptr()
+}
+
 /// The encoded events since `cw_clear_events`.
 #[no_mangle]
 pub extern "C" fn cw_events() -> *const u8 {
@@ -560,6 +667,72 @@ mod tests {
     }
 
     /// A song file through the exports, on a bus with a built effect.
+    /// A bus's tap through the exports: switched on, cut after rendering, the
+    /// frames in order, and the page's reader sees them.
+    #[test]
+    fn the_exports_cut_a_taps_message() {
+        use cubed_mixer::{Analysis, BusSettings, Play, WebAnalysis};
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 7, 8);
+        send(Command::SetBus(BusId(1), BusSettings::default()));
+        assert_eq!(cw_set_tap(1, 1), 1);
+        assert_eq!(cw_set_tap(0, 1), 1);
+        assert_eq!(cw_set_tap(9, 1), 0, "a bus that does not exist");
+        assert_eq!(cw_tap_count(), 2);
+
+        // A ramp clip on bus 1: 0, 1/1000, 2/1000 ...
+        let frames = 600;
+        let ptr = cw_clip_buffer(frames, 1);
+        // SAFETY: cw_clip_buffer made room for `frames` floats.
+        let ramp = unsafe { std::slice::from_raw_parts_mut(ptr, frames as usize) };
+        for (i, s) in ramp.iter_mut().enumerate() {
+            *s = i as f32 / 1000.0;
+        }
+        cw_add_clip(0, 48_000.0, frames, 1);
+        send(Command::Play(Play::new(
+            cubed_mixer::VoiceId(1),
+            cubed_mixer::ClipId(0),
+            BusId(1),
+        )));
+        for _ in 0..2 {
+            cw_process(128);
+        }
+        // Two blocks seen: 256 frames, the rest silence in front.
+        assert_eq!(cw_taps_prepare(512), 2);
+        let buses = unsafe { std::slice::from_raw_parts(cw_tap_buses(), 2) }.to_vec();
+        let written = unsafe { std::slice::from_raw_parts(cw_tap_written(), 2) }.to_vec();
+        let data = unsafe { std::slice::from_raw_parts(cw_tap_data(), 2 * 2 * 512) }.to_vec();
+        assert_eq!(buses, [0, 1]);
+        assert_eq!(written, [256.0, 256.0]);
+
+        let mut web = WebAnalysis::new(48_000.0);
+        web.update_taps(&buses, &written, 512, &data);
+        let (mut l, mut r) = (vec![0.0; 512], vec![0.0; 512]);
+        assert_eq!(web.scope(BusId(1), &mut l, &mut r), 512);
+        assert!(l[..256].iter().all(|&s| s == 0.0), "padded in front");
+        // The bus is at unity and the clip is centred (a -3 dB pan law): the ramp's
+        // last frame is 255/1000 times that.
+        let last = l[511];
+        assert!(last > 0.15 && last < 0.26, "{last}");
+        assert!(l[300] < last && l[300] > 0.0, "rising in order");
+        // The master has the same frames (bus 1 feeds it at unity).
+        let mut master = vec![0.0; 512];
+        web.scope(BusId(0), &mut master, &mut r);
+        assert!((master[511] - last).abs() < 1e-4);
+
+        // The meters come back by the same reader.
+        let meters = unsafe { std::slice::from_raw_parts(cw_meters(), METER_FIELDS * 2) };
+        web.update_meters(meters);
+        assert!(web.levels(BusId(1)).unwrap().peak[0] > 0.1);
+
+        // Switched off, a tap is gone from the next message.
+        assert_eq!(cw_set_tap(1, 0), 1);
+        assert_eq!(cw_tap_count(), 1);
+        cw_process(128);
+        assert_eq!(cw_taps_prepare(512), 1);
+        assert_eq!(cw_bad_batches(), 0);
+    }
+
     /// A synth patch through the exports: prepared, played, edited by a
     /// parameter event, and a rebuilt one swapped in with its held note.
     #[test]

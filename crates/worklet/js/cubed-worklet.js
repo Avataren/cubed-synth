@@ -6,7 +6,7 @@
 // outputChannelCount: [2]})` and talk to its port.
 //
 // From the page, in order (messages before 'ready' are queued):
-//   {type: 'init', wasm: ArrayBuffer, maxVoices, maxBuses, maxClips, seedLo, seedHi}
+//   {type: 'init', wasm: ArrayBuffer, maxVoices, maxBuses, maxClips, seedLo, seedHi, tapHz?}
 //   {type: 'commands', bytes: ArrayBuffer}  cubed_mixer::wire commands
 //   {type: 'clip', id, sampleRate, left: Float32Array, right?: Float32Array}
 //   {type: 'song', source, format (0 AHX/HVL, 1 A2M, 2 SID, 3 MOD, 4 S3M, 5 XM), bytes: ArrayBuffer,
@@ -14,6 +14,8 @@
 //    PlaySource command; separation (0-1) is a module's stereo width
 //   {type: 'effect', bus, slot, kind (EffectKind index; -1 empties the slot),
 //    params: Float32Array}
+//   {type: 'tap', bus, enable}  switches the analysis tap of a bus on or off
+//    (the bus must exist); answered by {type: 'tap', bus, enable, ok}
 //   {type: 'synth', source, bytes: ArrayBuffer (the patch JSON, UTF-8), oneShot,
 //    held?: [[note, velocity], ...], warmBlocks?}
 //    prepares source slot `source` with a synth patch, played by
@@ -27,12 +29,18 @@
 //   {type: 'song', source, ok, error?}  after each 'song' or 'synth' message
 //   {type: 'telemetry', frame, voices, rejected, badBatches,
 //    events: ArrayBuffer (wire events), meters: Float32Array (5 per bus)}
+//   {type: 'taps', frame, frames: 2048, buses: Uint32Array, written: Float64Array,
+//    data: Float32Array}  about 40 times a second (init's `tapHz`) while a tap is
+//    on: for each bus in `buses`, its latest `frames` frames, left then right,
+//    in `data`; `written` is how many frames each tap had seen
 //   {type: 'error', message}
 
 // Telemetry goes out every this many render quanta (about 21 ms at 48 kHz),
 // and at once when there are events.
 const TELEMETRY_BLOCKS = 8;
 const METER_FIELDS = 5;
+const TAP_FRAMES = 2048;
+const TAP_HZ = 40;
 
 class CubedMixerProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -40,6 +48,8 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
     this.exports = null;
     this.pending = [];
     this.blocks = 0;
+    this.tapsOn = false;
+    this.tapEvery = 1;
     this.port.onmessage = (event) => this.receive(event.data);
   }
 
@@ -66,6 +76,8 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         message.seedHi >>> 0,
       );
       this.exports = x;
+      // Taps go out about `tapHz` times a second (a render quantum is 128 frames).
+      this.tapEvery = Math.max(1, Math.round(sampleRate / 128 / (message.tapHz > 0 ? message.tapHz : TAP_HZ)));
       for (const queued of this.pending) this.handle(queued);
       this.pending = [];
       this.port.postMessage({ type: 'ready' });
@@ -140,6 +152,10 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
           reply.error = String.fromCharCode(...why);
         }
         this.port.postMessage(reply);
+      } else if (message.type === 'tap') {
+        const ok = x.cw_set_tap(message.bus >>> 0, message.enable ? 1 : 0) === 1;
+        this.tapsOn = x.cw_tap_count() > 0;
+        this.port.postMessage({ type: 'tap', bus: message.bus, enable: !!message.enable, ok });
       } else if (message.type === 'effect') {
         const params = message.params ?? new Float32Array(0);
         const room = new Float32Array(x.memory.buffer, x.cw_effect_params(), 6);
@@ -182,7 +198,21 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         [events.buffer, meters.buffer],
       );
     }
+    if (this.tapsOn && this.blocks % this.tapEvery === 0) this.postTaps(x);
     return true;
+  }
+
+  postTaps(x) {
+    const count = x.cw_taps_prepare(TAP_FRAMES);
+    if (count === 0) return;
+    const memory = x.memory.buffer;
+    const buses = new Uint32Array(memory, x.cw_tap_buses(), count).slice();
+    const written = new Float64Array(memory, x.cw_tap_written(), count).slice();
+    const data = new Float32Array(memory, x.cw_tap_data(), count * 2 * TAP_FRAMES).slice();
+    this.port.postMessage(
+      { type: 'taps', frame: x.cw_frame(), frames: TAP_FRAMES, buses, written, data },
+      [buses.buffer, written.buffer, data.buffer],
+    );
   }
 }
 

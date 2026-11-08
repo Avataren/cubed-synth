@@ -201,15 +201,50 @@ async function synthEdit() {
   return { ok, plain: plain.rms, quiet: quiet.rms, swapped: swapped.rms, voices: last.voices, ended, replies: swapped.replies };
 }
 
+// Analysis taps: a bus tapped, the page gets its frames in 'taps' messages and
+// reads them with the meters.
+async function taps() {
+  const context = new OfflineAudioContext(2, RATE, RATE);
+  const messages = [];
+  const replies = [];
+  const telemetry = [];
+  const { node, ready } = await mixerNode(context, (m) => {
+    if (m.type === 'taps') messages.push(m);
+    else if (m.type === 'tap') replies.push(m);
+    else if (m.type === 'telemetry') telemetry.push(m);
+  });
+  node.port.postMessage({ type: 'clip', id: 0, sampleRate: RATE, left: new Float32Array(CLIP_FRAMES * 4).fill(0.25) });
+  const commands = new Uint8Array([...setBus(1, -6.0206), ...play(7, 0, 1)]);
+  node.port.postMessage({ type: 'commands', bytes: commands.buffer }, [commands.buffer]);
+  node.port.postMessage({ type: 'tap', bus: 1, enable: true });
+  node.port.postMessage({ type: 'tap', bus: 5, enable: true });
+  await ready;
+  await context.startRendering();
+  const last = messages[messages.length - 1];
+  const bus1 = last ? [...last.buses].indexOf(1) : -1;
+  const frames = last?.frames ?? 0;
+  const left = last ? last.data.subarray(bus1 * 2 * frames, bus1 * 2 * frames + frames) : [];
+  const right = last ? last.data.subarray(bus1 * 2 * frames + frames, bus1 * 2 * frames + 2 * frames) : [];
+  // Bus 1 at -6 dB with a 0.25 DC clip (centred, -3 dB pan law): 0.125 / sqrt(2) * ... just check it is steady and non-zero.
+  const steady = left.length > 0 && left[frames - 1] > 0.05 && Math.abs(left[frames - 1] - left[frames - 500]) < 1e-3
+    && Math.abs(left[frames - 1] - right[frames - 1]) < 1e-6;
+  // Messages come about 40 times a second: a second of audio is 30 to 60 of them.
+  const ok = replies.length === 2 && replies[0].ok && !replies[1].ok && last?.type === 'taps'
+    && messages.length >= 25 && messages.length <= 60 && frames === 2048
+    && last.written[bus1] > 40000 && steady && telemetry.length > 0;
+  return { ok, messages: messages.length, frames, written: last?.written?.[bus1], replies, sample: left[frames - 1] };
+}
+
 async function run() {
   const clips = await clip();
   const songs = await song();
   const modules = await module();
   const synths = await synth();
   const synthEdits = await synthEdit();
+  const tapped = await taps();
   return {
-    ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok,
-    clips, songs, modules, synths, synthEdits,
+    ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok && tapped.ok,
+    clips, songs, modules, synths, synthEdits, tapped,
   };
 }
 
