@@ -71,6 +71,14 @@ struct Transport {
     step_wait_frames: i32,
     song_end_reached: bool,
     playing_time: u32,
+    /// Rows started since the subsong began (a held row counts once).
+    rows_started: u32,
+    /// The row the last tick played: its position, row and tick of the row.
+    /// `pos_nr` and `note_nr` already point past a row whose last tick was just
+    /// run, so a display reads these.
+    shown_pos: i32,
+    shown_row: i32,
+    shown_tick: i32,
 }
 
 /// What [`AhxEngine::prewarm_hifi`] did.
@@ -139,6 +147,9 @@ pub struct AhxEngine {
     dropped_channels: usize,
     mixgain: i32,
     defstereo: usize,
+    /// The `defstereo` argument the engine was made with (AHX songs only),
+    /// kept for [`reload`](AhxEngine::reload).
+    stereo_arg: u8,
     /// `ht_Version`. Only HVL files set it (`hvl_load_hvl:384`); the AHX
     /// loader leaves it uninitialised in the reference, so AHX is 0 here.
     version: u8,
@@ -175,7 +186,73 @@ pub struct AhxEngine {
     /// Live mode: `(instrument, note)` pairs whose tables have been prewarmed
     /// (see [`live_note_on`](AhxEngine::live_note_on)); cleared with the bank.
     live_warm: FxHashSet<(u8, i32)>,
+    /// See [`set_loop`](AhxEngine::set_loop).
+    loop_range: Loop,
+    /// The note played on the side; always built (a note-on allocates nothing).
+    audition: Box<Audition>,
+    /// Each channel's recent peak, then the audition's (see
+    /// [`set_levels`](AhxEngine::set_levels)).
+    levels: [f32; LEVEL_SLOTS],
+    levels_on: bool,
+    /// What a peak keeps of itself after one tick (24 dB a second).
+    level_decay: f32,
+    /// Frames rendered since the engine was made.
+    frames_rendered: u64,
 }
+
+/// What a playing song repeats (see [`AhxEngine::set_loop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Loop {
+    /// The song plays on.
+    #[default]
+    None,
+    /// One position, from its first row to its last.
+    Position(usize),
+    /// Positions `first..=last`: running off the last starts the first.
+    Positions { first: usize, last: usize },
+    /// Rows `row0..=row1` of one position.
+    Rows {
+        position: usize,
+        row0: usize,
+        row1: usize,
+    },
+}
+
+/// A note played on the side (see [`AhxEngine::audition_on`]): one extra voice
+/// with its own tick clock, mixed into the output after the song's voices.
+struct Audition {
+    voice: Voice,
+    live: Live,
+    /// A note is sounding or releasing.
+    active: bool,
+    /// Frames left of this tick; the audition ticks on its own clock, so it
+    /// runs while the song is stopped.
+    tick_remaining: usize,
+    /// Frames until the note lets go by itself (`None` holds until
+    /// [`AhxEngine::audition_off`]).
+    hold_frames: Option<usize>,
+}
+
+impl Audition {
+    fn new() -> Self {
+        let mut voice = Voice::new();
+        voice.pan = 128;
+        voice.set_pan = 128;
+        voice.pan_mult_left = panning_left(128);
+        voice.pan_mult_right = panning_right(128);
+        Audition {
+            voice,
+            live: Live::default(),
+            active: false,
+            tick_remaining: 0,
+            hold_frames: None,
+        }
+    }
+}
+
+/// Slots in [`AhxEngine::levels`]: every channel (up to [`MAX_CHANNELS`]), then
+/// the audition's voice.
+pub const LEVEL_SLOTS: usize = MAX_CHANNELS + 1;
 
 /// Live-mode state (see [`AhxEngine::enable_live`]): one monophonic voice
 /// played by note-on / note-off instead of by the song's pattern data.
@@ -391,6 +468,7 @@ impl AhxEngine {
     }
 
     fn build(song: Song, freq: u32, defstereo: u8, cap: usize) -> Result<Self, EngineError> {
+        let defstereo_arg = defstereo;
         let tick_samples = (freq / 50 / song.speed_multiplier.max(1) as u32) as usize;
         if tick_samples == 0 {
             return Err(EngineError::SampleRateTooLow);
@@ -424,6 +502,7 @@ impl AhxEngine {
             dropped_channels: song.channels - channels,
             mixgain,
             defstereo,
+            stereo_arg: defstereo_arg,
             version,
             voices: Vec::new(),
             t: Transport::default(),
@@ -439,8 +518,25 @@ impl AhxEngine {
             live: None,
             continue_phase_on_trigger: false,
             live_warm: FxHashSet::default(),
+            loop_range: Loop::None,
+            audition: Box::new(Audition::new()),
+            levels: [0.0; LEVEL_SLOTS],
+            levels_on: false,
+            level_decay: 10f32.powf(-1.2 * tick_samples as f32 / freq as f32),
+            frames_rendered: 0,
             song,
         };
+        // Room for the tracks and instruments a live edit adds, so a song that
+        // is playing takes them without allocating (see `push_track`).
+        let (tracks, instruments) = (engine.song.tracks.len(), engine.song.instruments.len());
+        engine
+            .song
+            .tracks
+            .reserve(crate::write::MAX_TRACKS.saturating_sub(tracks));
+        engine
+            .song
+            .instruments
+            .reserve((crate::write::MAX_INSTRUMENTS + 1).saturating_sub(instruments));
         engine.init_subsong(0);
         Ok(engine)
     }
@@ -466,14 +562,20 @@ impl AhxEngine {
 
         // hvl_reset_some_stuff (`:26-64`) is a fresh Voice; the pan fields it
         // does not touch are then (re)set here, as InitSubsong does before it.
-        self.voices = (0..self.channels)
-            .map(|i| {
-                let mut v = Voice::new();
-                v.set_default_pan(i, self.defstereo);
-                v
-            })
-            .collect();
+        // The voices already there are reset in place, so a rewind or a seek
+        // allocates nothing.
+        self.voices.truncate(self.channels);
+        for v in &mut self.voices {
+            v.reset();
+        }
+        while self.voices.len() < self.channels {
+            self.voices.push(Voice::new());
+        }
+        for (i, v) in self.voices.iter_mut().enumerate() {
+            v.set_default_pan(i, self.defstereo);
+        }
         self.tick_remaining = 0;
+        self.levels = [0.0; LEVEL_SLOTS];
         // A rewound song must not show the previous run's tail.
         if let Some(c) = self.capture.as_mut() {
             c.clear();
@@ -516,6 +618,7 @@ impl AhxEngine {
             return None;
         }
         let looping = std::mem::replace(&mut self.loop_position, false);
+        let looped = std::mem::replace(&mut self.loop_range, Loop::None);
         self.init_subsong(self.subsong);
         let mut kind = SeekKind::Cold;
         for _ in 0..=MAX_SEEK_TICKS {
@@ -543,6 +646,7 @@ impl AhxEngine {
             self.t.note_nr = row as i32;
         }
         self.loop_position = looping;
+        self.loop_range = looped;
         Some(kind)
     }
 
@@ -913,6 +1017,20 @@ impl AhxEngine {
             self.tick_remaining -= n;
             done += n;
         }
+        self.frames_rendered += frames as u64;
+        if self.audition.active {
+            self.mix_audition(out);
+        }
+    }
+
+    /// The song stopped: `out` is silence, with the audition (if one is
+    /// sounding) mixed into it, and the song does not move.
+    pub fn render_silence(&mut self, out: &mut [i16]) {
+        out.fill(0);
+        self.frames_rendered += (out.len() / 2) as u64;
+        if self.audition.active {
+            self.mix_audition(out);
+        }
     }
 
     fn step_at(&self, track: usize, note: i32) -> Step {
@@ -931,6 +1049,444 @@ impl AhxEngine {
             })
             .copied()
             .unwrap_or_default()
+    }
+
+    // ----- transport control ----------------------------------------------------
+
+    /// What the song repeats: one position, a run of positions, or some rows of
+    /// one position. It does not move the playhead (seek first): the song plays
+    /// on until it reaches the loop, then wraps there. While a loop covers the
+    /// position being played a position jump (`Bxx`) to somewhere outside it
+    /// wraps to the loop's start, `Dxx` keeps its row when it lands inside a rows
+    /// loop, and the song never reaches its end. `false`, changing nothing, for
+    /// a position or row the song does not have or a range that runs backwards.
+    /// Kept across [`init_subsong`](Self::init_subsong) and [`seek`](Self::seek)
+    /// (a seek replays in the song's own flow, then puts it back). Allocates
+    /// nothing.
+    pub fn set_loop(&mut self, l: Loop) -> bool {
+        let positions = self.song.position_nr;
+        let rows = self.song.track_length as usize;
+        let ok = match l {
+            Loop::None => true,
+            Loop::Position(p) => p < positions,
+            Loop::Positions { first, last } => first <= last && last < positions,
+            Loop::Rows {
+                position,
+                row0,
+                row1,
+            } => position < positions && row0 <= row1 && row1 < rows,
+        };
+        if ok {
+            self.loop_range = l;
+        }
+        ok
+    }
+
+    pub fn loop_range(&self) -> Loop {
+        self.loop_range
+    }
+
+    /// The transport at the end of a row, with a loop set: `played` and
+    /// `played_row` are the position and row that just ran, `note_nr` the row
+    /// after it (or a pending jump or break).
+    fn apply_loop(&mut self, played: i32, played_row: i32) {
+        let played = played as usize;
+        let track_length = self.song.track_length as i32;
+        match self.loop_range {
+            Loop::None => {}
+            Loop::Position(p) => self.loop_positions(played, p, p),
+            Loop::Positions { first, last } => self.loop_positions(played, first, last),
+            Loop::Rows {
+                position,
+                row0,
+                row1,
+            } => {
+                let (row0, row1) = (row0 as i32, row1 as i32);
+                // A row outside the rows (sought to beyond them, or not reached
+                // yet) plays on as the song says.
+                if played != position || !(row0..=row1).contains(&played_row) {
+                    return;
+                }
+                let next = if self.t.pattern_break {
+                    // Bxx, Dxx or the end of the track: stay here. A Dxx row
+                    // inside the loop is kept.
+                    let want = self.t.pos_jump_note;
+                    self.t.pattern_break = false;
+                    self.t.pos_jump = 0;
+                    self.t.pos_jump_note = 0;
+                    if want != 0 && (row0..=row1).contains(&want) {
+                        want
+                    } else {
+                        row0
+                    }
+                } else if self.t.note_nr > row1 {
+                    row0
+                } else {
+                    self.t.note_nr
+                };
+                self.t.note_nr = next.clamp(0, track_length - 1);
+                self.t.song_end_reached = false;
+            }
+        }
+    }
+
+    fn loop_positions(&mut self, played: usize, first: usize, last: usize) {
+        if played < first || played > last || !self.t.pattern_break {
+            return;
+        }
+        // The row left its position: the end of the track, Bxx or Dxx. A target
+        // outside the loop wraps to its start.
+        if self.t.pos_jump < first as i32 || self.t.pos_jump > last as i32 {
+            self.t.pos_jump = first as i32;
+        }
+        self.t.song_end_reached = false;
+    }
+
+    /// Turns each channel's peak level on or off (see [`levels`](Self::levels)).
+    /// Off by default: the output never depends on it.
+    pub fn set_levels(&mut self, on: bool) {
+        self.levels_on = on;
+        if !on {
+            self.levels = [0.0; LEVEL_SLOTS];
+        }
+    }
+
+    pub fn levels_enabled(&self) -> bool {
+        self.levels_on
+    }
+
+    /// Each channel's recent peak, linear (1.0 is a full-scale output), in `out`
+    /// (as many as fit), then the audition's; returns how many it wrote (the
+    /// channel count plus one at most), 0 while levels are off. A peak is what
+    /// the channel's loudest wave sample would make of its volume, pan and the
+    /// mix gain at the latest tick (a bound: the sample that sounds is at most
+    /// that), falling 24 dB a second after it; a silenced channel (muted, or not
+    /// soloed) reads 0.
+    pub fn levels(&self, out: &mut [f32]) -> usize {
+        if !self.levels_on {
+            return 0;
+        }
+        let n = out.len().min(self.channels + 1);
+        for (i, o) in out[..n].iter_mut().enumerate() {
+            *o = self.levels[if i < self.channels { i } else { MAX_CHANNELS }];
+        }
+        n
+    }
+
+    /// All the level slots at once (the probe's copy).
+    pub(crate) fn levels_into(&self, out: &mut [f32; LEVEL_SLOTS]) {
+        *out = if self.levels_on {
+            self.levels
+        } else {
+            [0.0; LEVEL_SLOTS]
+        };
+    }
+
+    fn update_levels(&mut self) {
+        for i in 0..self.channels {
+            self.levels[i] = if self.voice_silenced(i) {
+                0.0
+            } else {
+                voice_level(&self.voices[i], self.mixgain).max(self.levels[i] * self.level_decay)
+            };
+        }
+    }
+
+    /// Where the tick that was rendered last is: `(position, row, tick)`, the
+    /// tick counted from 0 within its row. (`pos_nr` and `note_nr` have already
+    /// moved on at the end of a row's last tick.)
+    pub fn position(&self) -> (i32, i32, i32) {
+        (self.t.shown_pos, self.t.shown_row, self.t.shown_tick)
+    }
+
+    /// Rows started since the subsong began: it goes up by one for every row, so
+    /// a follower that polls slower than the song counts the rows it missed.
+    pub fn rows_started(&self) -> u32 {
+        self.t.rows_started
+    }
+
+    /// Frames rendered since the engine was made.
+    pub fn frames_rendered(&self) -> u64 {
+        self.frames_rendered
+    }
+
+    // ----- the audition ---------------------------------------------------------
+
+    /// Plays `instrument` (1-based, as a step numbers it) at `note` (1 to 60, C-1
+    /// to B-5; clamped) with `velocity` (0 to 127) on a voice of its own, mixed
+    /// over the song, or alone while the song is stopped (see
+    /// [`render_silence`](Self::render_silence)). `hold_frames` frames after it
+    /// starts it lets go by itself (0 holds until
+    /// [`audition_off`](Self::audition_off)). The instrument plays as a step
+    /// plays it (envelope, filter and square sweeps, vibrato, PList) but through
+    /// the plain oscillators, centred, whatever is muted and whether or not
+    /// hi-fi is on; a new note cuts the last. `false`, changing nothing, for an
+    /// instrument the song does not have. Allocates nothing.
+    pub fn audition_on(
+        &mut self,
+        instrument: usize,
+        note: i32,
+        velocity: u32,
+        hold_frames: usize,
+    ) -> bool {
+        if instrument == 0 || instrument > self.song.instrument_nr as usize {
+            return false;
+        }
+        let note = note.clamp(1, 60);
+        let volume = ((velocity.min(127) as i32 * 0x40) + 63) / 127;
+        let a = &mut *self.audition;
+        a.live = Live {
+            pending_on: Some((instrument as u8, note, volume.max(1))),
+            ..Live::default()
+        };
+        a.active = true;
+        a.tick_remaining = 0;
+        a.hold_frames = (hold_frames > 0).then_some(hold_frames);
+        true
+    }
+
+    /// Lets the audition's note go (the instrument's release, or its hard cut).
+    pub fn audition_off(&mut self) {
+        if self.audition.active {
+            self.audition.live.pending_off = true;
+            self.audition.hold_frames = None;
+        }
+    }
+
+    /// A note is sounding or releasing.
+    pub fn audition_active(&self) -> bool {
+        self.audition.active
+    }
+
+    /// The PList row the audition's note ran last: `(instrument, row)`.
+    pub fn audition_plist_state(&self) -> Option<(usize, usize)> {
+        let a = &*self.audition;
+        let v = &a.voice;
+        if !a.active || v.instrument_idx == 0 || v.perf_row < 0 {
+            return None;
+        }
+        Some((v.instrument_idx as usize, v.perf_row as usize))
+    }
+
+    fn audition_tick(&mut self) {
+        let tick = self.tick_samples;
+        let a = &mut *self.audition;
+        if let Some(left) = a.hold_frames {
+            if left <= tick {
+                a.live.pending_off = true;
+                a.hold_frames = None;
+            } else {
+                a.hold_frames = Some(left - tick);
+            }
+        }
+        Self::live_tick(
+            &mut a.voice,
+            &mut a.live,
+            &self.song,
+            self.waves,
+            self.t.tempo,
+            self.continue_phase_on_trigger,
+        );
+        a.voice.set_audio(self.waves, self.freq_f);
+        if self.levels_on {
+            let level = voice_level(&a.voice, self.mixgain);
+            self.levels[MAX_CHANNELS] = level.max(self.levels[MAX_CHANNELS] * self.level_decay);
+        }
+        if a.live.released && a.voice.adsr.r_frames <= 0 {
+            a.active = false;
+            self.levels[MAX_CHANNELS] = 0.0;
+        }
+    }
+
+    /// Adds the audition's voice to `out` (interleaved stereo), tick by tick on
+    /// its own clock.
+    fn mix_audition(&mut self, out: &mut [i16]) {
+        const END: u32 = 0x280 << 16;
+        let frames = out.len() / 2;
+        let mut done = 0;
+        while done < frames && self.audition.active {
+            if self.audition.tick_remaining == 0 {
+                self.audition_tick();
+                self.audition.tick_remaining = self.tick_samples;
+                if !self.audition.active {
+                    break;
+                }
+            }
+            let n = self.audition.tick_remaining.min(frames - done);
+            let mixgain = self.mixgain;
+            let v = &mut self.audition.voice;
+            let (vol, pl, pr, delta) = (v.voice_volume, v.pan_mult_left, v.pan_mult_right, v.delta);
+            let mut pos = v.sample_pos;
+            for k in 0..n {
+                if pos >= END {
+                    pos -= END;
+                }
+                let j = v.voice_buffer[(pos >> 16) as usize] as i32 * vol;
+                let l = ((j * pl) >> 7).wrapping_mul(mixgain) >> 8;
+                let r = ((j * pr) >> 7).wrapping_mul(mixgain) >> 8;
+                let at = (done + k) * 2;
+                out[at] = (out[at] as i32 + l).clamp(-0x8000, 0x7fff) as i16;
+                out[at + 1] = (out[at + 1] as i32 + r).clamp(-0x8000, 0x7fff) as i16;
+                pos = pos.wrapping_add(delta);
+            }
+            v.sample_pos = pos;
+            self.audition.tick_remaining -= n;
+            done += n;
+        }
+    }
+
+    // ----- live edits -------------------------------------------------------------
+
+    /// Tracks the song has.
+    pub fn track_count(&self) -> usize {
+        self.song.tracks.len()
+    }
+
+    /// Replaces the step at `row` of `track`. A song that is playing reads its
+    /// steps as it reaches them: the row playing now is not retriggered, the next
+    /// time the row comes round it plays the new step. `false`, changing nothing,
+    /// for a track or row the song does not have. Allocates nothing.
+    pub fn set_step(&mut self, track: usize, row: usize, step: Step) -> bool {
+        match self.song.tracks.get_mut(track).and_then(|t| t.get_mut(row)) {
+            Some(slot) => {
+                *slot = step;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Makes channel `channel` of `position` play `track` at `transpose`
+    /// semitones. A voice caches its track and transpose when the song enters a
+    /// position, so the cache is refreshed at the next row. `false` for a
+    /// position or channel the song does not have, or a track it lacks. Allocates
+    /// nothing.
+    pub fn set_position_entry(
+        &mut self,
+        position: usize,
+        channel: usize,
+        track: u8,
+        transpose: i8,
+    ) -> bool {
+        if track as usize >= self.song.tracks.len() {
+            return false;
+        }
+        let Some(p) = self.song.positions.get_mut(position) else {
+            return false;
+        };
+        if channel >= p.track.len() {
+            return false;
+        }
+        p.track[channel] = track;
+        p.transpose[channel] = transpose;
+        self.t.get_new_position = true;
+        true
+    }
+
+    /// Moves the restart position (where the song starts over at its end).
+    pub fn set_restart(&mut self, position: usize) -> bool {
+        if position >= self.song.position_nr {
+            return false;
+        }
+        self.song.restart = position as u16;
+        true
+    }
+
+    /// Appends a track (`track_length` steps). Room for 256 tracks is reserved
+    /// when the engine is made, so this allocates nothing once `steps` is built.
+    /// `false` for a track of the wrong length or a song with 256 tracks.
+    pub fn push_track(&mut self, steps: Vec<Step>) -> bool {
+        if steps.len() != self.song.track_length as usize
+            || self.song.tracks.len() >= crate::write::MAX_TRACKS
+        {
+            return false;
+        }
+        self.song.tracks.push(steps);
+        self.song.track_nr = (self.song.tracks.len() - 1) as u8;
+        true
+    }
+
+    /// Removes the last track (the only one is kept). A position that names it
+    /// then plays silence.
+    pub fn pop_track(&mut self) -> bool {
+        if self.song.tracks.len() <= 1 {
+            return false;
+        }
+        self.song.tracks.pop();
+        self.song.track_nr = (self.song.tracks.len() - 1) as u8;
+        true
+    }
+
+    /// Appends an instrument (its number is the new `instrument_nr`). Room is
+    /// reserved when the engine is made. `false` at 64 instruments.
+    pub fn push_instrument(&mut self, ins: Instrument) -> bool {
+        if self.song.instruments.len() > crate::write::MAX_INSTRUMENTS {
+            return false;
+        }
+        self.song.instruments.push(ins);
+        self.song.instrument_nr = (self.song.instruments.len() - 1) as u8;
+        true
+    }
+
+    /// Removes the last instrument; a voice that held it falls silent.
+    pub fn pop_instrument(&mut self) -> bool {
+        if self.song.instruments.len() <= 1 {
+            return false;
+        }
+        self.song.instruments.pop();
+        let count = self.song.instruments.len();
+        self.song.instrument_nr = (count - 1) as u8;
+        for v in self
+            .voices
+            .iter_mut()
+            .chain(std::iter::once(&mut self.audition.voice))
+        {
+            if v.instrument_idx as usize >= count {
+                v.instrument_idx = 0;
+            }
+        }
+        if self.audition.voice.instrument_idx == 0 {
+            self.audition.active = false;
+        }
+        true
+    }
+
+    /// Swaps in `song` (an edited version of the one playing) and carries on from
+    /// `place` (`(position, row)`, clamped into the new song) or from the top: the
+    /// mute and solo masks, loop, levels, capture, hi-fi setting and phase option
+    /// stay; voices start clean at the place (see [`seek`](Self::seek)), and a note
+    /// being auditioned is cut. This allocates (it is a new engine): call it from
+    /// a message handler, not the render callback, and with hi-fi on the caller
+    /// prewarms the new song's tables. On an error the engine is untouched.
+    pub fn reload(&mut self, song: Song, place: Option<(usize, usize)>) -> Result<(), EngineError> {
+        let mut next = Self::build(song, self.freq, self.stereo_arg, MAX_CHANNELS)?;
+        next.mute_mask = self.mute_mask;
+        next.solo_mask = self.solo_mask;
+        next.loop_position = self.loop_position;
+        next.mix_lanes = self.mix_lanes;
+        next.continue_phase_on_trigger = self.continue_phase_on_trigger;
+        next.levels_on = self.levels_on;
+        if self.capture.is_some() {
+            next.enable_capture(true);
+        }
+        if self.hifi.is_some() {
+            next.set_hifi(true);
+        }
+        let _ = next.set_loop(self.loop_range);
+        next.subsong = if self.subsong <= next.song.subsong_nr as usize {
+            self.subsong
+        } else {
+            0
+        };
+        next.init_subsong(next.subsong);
+        if let Some((p, r)) = place {
+            let p = p.min(next.song.position_nr.saturating_sub(1));
+            let r = r.min((next.song.track_length as usize).saturating_sub(1));
+            next.seek(p, r);
+        }
+        next.frames_rendered = self.frames_rendered;
+        *self = next;
+        Ok(())
     }
 
     /// Switches the engine to live mode: the song's transport is never run
@@ -1237,6 +1793,20 @@ impl AhxEngine {
         }
         let position_nr = self.song.position_nr as i32;
 
+        // Where the tick about to run is, for a display: `pos_nr` and `note_nr`
+        // are the row it plays (they move on at the end of a row's last tick).
+        let row_start = self.t.step_wait_frames == 0;
+        self.t.shown_pos = self.t.pos_nr;
+        self.t.shown_row = self.t.note_nr;
+        self.t.shown_tick = if row_start {
+            0
+        } else {
+            (self.t.tempo - self.t.step_wait_frames).max(0)
+        };
+        if row_start {
+            self.t.rows_started = self.t.rows_started.wrapping_add(1);
+        }
+
         if self.t.step_wait_frames == 0 {
             if self.t.get_new_position {
                 let cur = self.t.pos_nr as usize;
@@ -1268,6 +1838,7 @@ impl AhxEngine {
         self.t.playing_time += 1;
         self.t.step_wait_frames = (self.t.step_wait_frames - 1) & 0xffff;
         if self.t.step_wait_frames == 0 {
+            let (played_pos, played_row) = (self.t.pos_nr, self.t.note_nr);
             if !self.t.pattern_break {
                 self.t.note_nr += 1;
                 if self.t.note_nr >= self.song.track_length as i32 {
@@ -1279,6 +1850,9 @@ impl AhxEngine {
                     self.t.pos_jump_note = 0;
                     self.t.pattern_break = true;
                 }
+            }
+            if self.loop_range != Loop::None {
+                self.apply_loop(played_pos, played_row);
             }
 
             if self.t.pattern_break {
@@ -1304,6 +1878,9 @@ impl AhxEngine {
             for v in self.voices.iter_mut().take(self.channels) {
                 v.select_hifi(bank);
             }
+        }
+        if self.levels_on {
+            self.update_levels();
         }
     }
 
@@ -1630,6 +2207,25 @@ impl AhxEngine {
             self.voices[i].ring_sample_pos = rpos[i];
         }
     }
+}
+
+/// What a voice's loudest wave sample makes of its volume, pan and the mix
+/// gain: 1.0 is a full-scale output. A ring-modulated voice is bounded by the
+/// product of its two waves.
+fn voice_level(v: &Voice, mixgain: i32) -> f32 {
+    let peak = |b: &[i8]| {
+        b[..0x280]
+            .iter()
+            .map(|&s| (s as i32).abs())
+            .max()
+            .unwrap_or(0)
+    };
+    let mut sample = peak(&v.voice_buffer) as f32;
+    if v.ring_mix_active {
+        sample *= peak(&v.ring_voice_buffer) as f32 / 128.0;
+    }
+    let pan = v.pan_mult_left.max(v.pan_mult_right) as f32;
+    sample * v.voice_volume as f32 * pan / 128.0 * mixgain as f32 / 256.0 / 32768.0
 }
 
 /// `hvl_process_stepfx_1`, `hvl_replay.c:621-685`: transport-affecting and

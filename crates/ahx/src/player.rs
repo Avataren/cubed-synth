@@ -11,8 +11,10 @@
 //! same way `audio_engine/wasm.rs` does it, so the whole class also compiles
 //! and is unit-tested natively.
 
-use super::engine::{AhxEngine, SeekKind};
-use super::format;
+use super::engine::{AhxEngine, Loop, SeekKind, LEVEL_SLOTS};
+use super::format::{self, Song, Step};
+use super::probe::{AhxProbe, AhxStatus};
+use std::sync::Arc;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -57,6 +59,16 @@ pub struct AhxPlayer {
     /// that may reach a table the bank lacks: the walk they owe, paid by
     /// [`finish_instrument_edits`](AhxPlayer::finish_instrument_edits).
     prewarm_owed: bool,
+    /// Shared with other threads when the host attached one.
+    probe: Option<Arc<AhxProbe>>,
+}
+
+impl Drop for AhxPlayer {
+    fn drop(&mut self) {
+        if let Some(p) = &self.probe {
+            p.set_alive(false);
+        }
+    }
 }
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
@@ -75,6 +87,7 @@ impl AhxPlayer {
             gain: 1.0,
             playing: false,
             prewarm_owed: false,
+            probe: None,
         })
     }
 
@@ -279,19 +292,29 @@ impl AhxPlayer {
 
     /// Fills `left`/`right` with planar `f32` and returns the number of
     /// frames written (`min(left.len(), right.len())`). While paused the
-    /// engine does not advance and the output is zeroed.
+    /// engine does not advance and the output is zeroed (apart from a note
+    /// being auditioned). Allocates nothing once it has rendered a block of
+    /// this size.
     pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) -> usize {
         let frames = left.len().min(right.len());
-        if !self.playing {
+        if !self.playing && !self.engine.audition_active() {
             left[..frames].fill(0.0);
             right[..frames].fill(0.0);
+            self.publish();
             return frames;
         }
         if self.scratch.len() < frames * 2 {
             self.scratch.resize(frames * 2, 0);
         }
-        self.engine.render_block(&mut self.scratch[..frames * 2]);
-        deinterleave_to_f32(&self.scratch[..frames * 2], left, right, self.gain)
+        if self.playing {
+            self.engine.render_block(&mut self.scratch[..frames * 2]);
+        } else {
+            // Stopped: the song does not move, a note being auditioned still sounds.
+            self.engine.render_silence(&mut self.scratch[..frames * 2]);
+        }
+        let n = deinterleave_to_f32(&self.scratch[..frames * 2], left, right, self.gain);
+        self.publish();
+        n
     }
 
     /// Per-voice waveform capture for oscilloscopes; off by default and
@@ -410,6 +433,329 @@ impl AhxPlayer {
 
     pub fn track_length(&self) -> usize {
         self.engine.song().track_length as usize
+    }
+
+    // ----- live control of a playing song (an editor's transport) ------------------
+
+    /// Plays on from where the song is (a song that has played to its end
+    /// starts over from the top).
+    pub fn resume(&mut self) {
+        if self.engine.song_end_reached() && !self.engine.loop_position() {
+            self.engine.seek(0, 0);
+        }
+        self.playing = true;
+    }
+
+    /// Stops repeating anything (see [`AhxEngine::set_loop`]).
+    pub fn loop_off(&mut self) {
+        self.engine.set_loop(Loop::None);
+    }
+
+    /// Repeats positions `first..=last` (one position: `first == last`) once
+    /// the song reaches them; seek first to start there. `false`, changing
+    /// nothing, for positions the song does not have.
+    pub fn loop_positions(&mut self, first: usize, last: usize) -> bool {
+        self.engine.set_loop(Loop::Positions { first, last })
+    }
+
+    /// Repeats rows `row0..=row1` of `position`.
+    pub fn loop_rows(&mut self, position: usize, row0: usize, row1: usize) -> bool {
+        self.engine.set_loop(Loop::Rows {
+            position,
+            row0,
+            row1,
+        })
+    }
+
+    /// Mutes or unmutes one channel (a muted channel keeps running unheard).
+    pub fn set_mute(&mut self, channel: usize, on: bool) {
+        let (mute, solo) = self.engine.mute_solo();
+        let bit = 1u32.checked_shl(channel as u32).unwrap_or(0);
+        self.engine
+            .set_mute_solo(if on { mute | bit } else { mute & !bit }, solo);
+    }
+
+    /// Solos or unsolos one channel: with any solo on, only the soloed channels
+    /// are heard (a muted one stays silent).
+    pub fn set_solo(&mut self, channel: usize, on: bool) {
+        let (mute, solo) = self.engine.mute_solo();
+        let bit = 1u32.checked_shl(channel as u32).unwrap_or(0);
+        self.engine
+            .set_mute_solo(mute, if on { solo | bit } else { solo & !bit });
+    }
+
+    /// `(position, row, tick)` of the tick rendered last, the tick counted from 0
+    /// within its row (see [`AhxEngine::position`]); `play_position` and
+    /// `play_row` are two of them for hosts that read a scalar at a time.
+    pub fn play_position(&self) -> i32 {
+        self.engine.position().0
+    }
+
+    pub fn play_row(&self) -> i32 {
+        self.engine.position().1
+    }
+
+    pub fn play_tick(&self) -> i32 {
+        self.engine.position().2
+    }
+
+    /// Rows started since the song began (see [`AhxEngine::rows_started`]).
+    pub fn rows_started(&self) -> u32 {
+        self.engine.rows_started()
+    }
+
+    /// Turns the per-channel peak levels on or off (off by default).
+    pub fn set_levels(&mut self, on: bool) {
+        self.engine.set_levels(on);
+    }
+
+    /// Fills `out` with each channel's recent peak, then the audition's, and
+    /// returns how many it wrote (0 while levels are off); see
+    /// [`AhxEngine::levels`].
+    pub fn levels(&self, out: &mut [f32]) -> usize {
+        self.engine.levels(out)
+    }
+
+    /// Plays `instrument` (1-based) at MIDI note `midi` (24 is C-1, 83 is B-5)
+    /// with `velocity` (0 to 127) on a voice of its own, over the song or alone
+    /// while it is stopped, whatever is muted; `duration_frames` after it
+    /// starts it lets go (0 holds until `audition_off`). A new note cuts the last.
+    /// `false` for an instrument the song does not have. Allocates nothing (see
+    /// [`AhxEngine::audition_on`]).
+    pub fn audition_on(
+        &mut self,
+        instrument: usize,
+        midi: i32,
+        velocity: u32,
+        duration_frames: usize,
+    ) -> bool {
+        self.engine.audition_on(
+            instrument,
+            midi - format::MIDI_OFFSET,
+            velocity,
+            duration_frames,
+        )
+    }
+
+    /// Lets the audition's note go.
+    pub fn audition_off(&mut self) {
+        self.engine.audition_off();
+    }
+
+    pub fn audition_active(&self) -> bool {
+        self.engine.audition_active()
+    }
+
+    /// The PList row the audition's note ran last, `-1` when there is none.
+    pub fn audition_plist_row(&self) -> i32 {
+        self.engine
+            .audition_plist_state()
+            .map_or(-1, |(_, row)| row as i32)
+    }
+
+    /// The instrument (1-based) that row belongs to, `0` when there is none.
+    pub fn audition_plist_instrument(&self) -> u32 {
+        self.engine
+            .audition_plist_state()
+            .map_or(0, |(instrument, _)| instrument as u32)
+    }
+
+    /// Tracks the song has.
+    pub fn track_count(&self) -> usize {
+        self.engine.track_count()
+    }
+
+    /// A live edit: the step at `row` of `track`, read the next time the song
+    /// reaches the row. With hi-fi on, a step that names an instrument owes the
+    /// tables walk [`finish_instrument_edits`](Self::finish_instrument_edits)
+    /// pays. `false` for a track or row the song does not have.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_step(
+        &mut self,
+        track: usize,
+        row: usize,
+        note: u8,
+        instrument: u8,
+        fx: u8,
+        fx_param: u8,
+        fxb: u8,
+        fxb_param: u8,
+    ) -> bool {
+        let ok = self.engine.set_step(
+            track,
+            row,
+            Step {
+                note,
+                instrument,
+                fx,
+                fx_param,
+                fxb,
+                fxb_param,
+            },
+        );
+        if ok && instrument != 0 && self.engine.hifi_enabled() && !self.engine.live_enabled() {
+            self.prewarm_owed = true;
+        }
+        ok
+    }
+
+    /// A live edit: channel `channel` of `position` plays `track` at `transpose`
+    /// semitones from the next row on. `false` for a position, channel or track
+    /// the song does not have.
+    pub fn set_position_entry(
+        &mut self,
+        position: usize,
+        channel: usize,
+        track: u8,
+        transpose: i32,
+    ) -> bool {
+        self.engine
+            .set_position_entry(position, channel, track, transpose.clamp(-128, 127) as i8)
+    }
+
+    /// A live edit: where the song starts over when it ends.
+    pub fn set_restart(&mut self, position: usize) -> bool {
+        self.engine.set_restart(position)
+    }
+
+    /// A live edit: appends a track. `steps` is `track_length` steps of six bytes
+    /// (`note, instrument, fx, param, fxb, fxb_param`). Allocates the track and
+    /// nothing else, so call it from a message handler.
+    pub fn push_track(&mut self, steps: &[u8]) -> bool {
+        let rows = self.engine.song().track_length as usize;
+        if steps.len() != rows * 6 {
+            return false;
+        }
+        let track = steps
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|c| Step {
+                note: c[0],
+                instrument: c[1],
+                fx: c[2],
+                fx_param: c[3],
+                fxb: c[4],
+                fxb_param: c[5],
+            })
+            .collect();
+        self.engine.push_track(track)
+    }
+
+    /// A live edit: takes the last track off (undoing an append).
+    pub fn pop_track(&mut self) -> bool {
+        self.engine.pop_track()
+    }
+
+    /// A live edit: appends an instrument from its wire form (see
+    /// [`replace_instrument`](Self::replace_instrument); the name is empty).
+    pub fn push_instrument(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let song = self.engine.song();
+        let ins = format::parse_instrument(bytes, song.format, song.version, String::new())
+            .map_err(|e| e.to_string())?;
+        if self.engine.push_instrument(ins) {
+            Ok(())
+        } else {
+            Err("the song already has 64 instruments".into())
+        }
+    }
+
+    /// A live edit: takes the last instrument off (undoing an append).
+    pub fn pop_instrument(&mut self) -> bool {
+        self.engine.pop_instrument()
+    }
+}
+
+impl AhxPlayer {
+    /// A paused player for a song the caller holds (an edited one), without
+    /// writing it to bytes first. As [`new`](Self::new) otherwise.
+    pub fn from_song(song: Song, sample_rate: u32, stereo_mode: u8) -> Result<AhxPlayer, String> {
+        let engine = AhxEngine::new(song, sample_rate, stereo_mode).map_err(|e| e.to_string())?;
+        Ok(AhxPlayer {
+            engine,
+            scratch: Vec::new(),
+            gain: 1.0,
+            playing: false,
+            prewarm_owed: false,
+            probe: None,
+        })
+    }
+
+    /// The song being played.
+    pub fn song(&self) -> &Song {
+        self.engine.song()
+    }
+
+    /// The engine, for what the player does not forward.
+    pub fn engine(&self) -> &AhxEngine {
+        &self.engine
+    }
+
+    pub fn engine_mut(&mut self) -> &mut AhxEngine {
+        &mut self.engine
+    }
+
+    /// What the loop is set to.
+    pub fn loop_range(&self) -> Loop {
+        self.engine.loop_range()
+    }
+
+    /// Sets the loop (see [`AhxEngine::set_loop`]); `false` for one the song
+    /// cannot have.
+    pub fn set_loop(&mut self, l: Loop) -> bool {
+        self.engine.set_loop(l)
+    }
+
+    /// Where the song is now: see [`AhxStatus`].
+    pub fn status(&self) -> AhxStatus {
+        let (position, row, tick) = self.engine.position();
+        AhxStatus {
+            playing: self.playing,
+            audition: self.engine.audition_active(),
+            song_end: self.engine.song_end_reached(),
+            position: position.max(0) as u16,
+            row: row.max(0) as u16,
+            tick: tick.clamp(0, 255) as u8,
+            speed: self.engine.tempo().clamp(0, 255) as u8,
+            speed_multiplier: self.engine.song().speed_multiplier,
+            rows: self.engine.rows_started(),
+            frames: self.engine.frames_rendered(),
+            version: 0,
+        }
+    }
+
+    /// Shares the position and levels with other threads: `render` publishes them
+    /// at the end of every block. The probe is built off the audio thread
+    /// (`AhxProbe::new(player.channels())`) and the player marks it dead when
+    /// dropped.
+    pub fn attach_probe(&mut self, probe: Arc<AhxProbe>) {
+        self.probe = Some(probe);
+        self.publish();
+    }
+
+    fn publish(&self) {
+        if let Some(p) = &self.probe {
+            let mut levels = [0.0f32; LEVEL_SLOTS];
+            self.engine.levels_into(&mut levels);
+            p.publish(&self.status(), &levels);
+        }
+    }
+
+    /// Swaps in an edited `song` and carries on from `place` (`(position, row)`,
+    /// clamped) or from the top, keeping the transport state, mute and solo,
+    /// loop, levels and hi-fi setting (see [`AhxEngine::reload`]). This is the
+    /// rebuild an edit needs when [`AhxDoc::live_edits`](crate::edit::AhxDoc::live_edits)
+    /// says `None`: it allocates, so call it from a message handler. With hi-fi
+    /// on it prewarms the new song's tables before it returns. An error, with the
+    /// player untouched, for a song the engine cannot play.
+    pub fn reload_song(&mut self, song: Song, place: Option<(usize, usize)>) -> Result<(), String> {
+        self.engine.reload(song, place).map_err(|e| e.to_string())?;
+        self.prewarm_owed = false;
+        if self.engine.hifi_enabled() && !self.engine.live_enabled() {
+            self.engine.prewarm_hifi();
+        }
+        self.publish();
+        Ok(())
     }
 }
 
