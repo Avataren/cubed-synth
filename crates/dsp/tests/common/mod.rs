@@ -115,3 +115,61 @@ pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .map(|(x, y)| (x - y).abs())
         .fold(0.0, f32::max)
 }
+
+/// The DAW patches checked in for the tests (a few of the factory bank, without
+/// their embedded samples), as `(name, patch)`.
+pub fn daw_patches() -> Vec<(String, Value)> {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/daw_patches.json"
+    ))
+    .expect("the fixture bank");
+    bank_patches(&text)
+}
+
+/// Every patch of the DAW's factory bank (`default-patch.json`, 38 MB), when it
+/// is on this machine: `CUBED_DAW_BANK`, else `../another_synth` next to this
+/// workspace. Empty when absent.
+pub fn full_daw_bank() -> Vec<(String, Value)> {
+    let path = std::env::var_os("CUBED_DAW_BANK")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("..")
+                .join("another_synth")
+                .join("public")
+                .join("default-patch.json")
+        });
+    match std::fs::read_to_string(&path) {
+        Ok(text) => bank_patches(&text),
+        Err(_) => {
+            eprintln!("(the DAW's bank is not at {}: skipped)", path.display());
+            Vec::new()
+        }
+    }
+}
+
+fn bank_patches(text: &str) -> Vec<(String, Value)> {
+    let bank: Value = serde_json::from_str(text).expect("a bank");
+    bank["patches"]
+        .as_array()
+        .expect("patches")
+        .iter()
+        .map(|p| {
+            (
+                p["metadata"]["name"].as_str().unwrap_or("?").to_string(),
+                p.clone(),
+            )
+        })
+        .collect()
+}
+
+/// A note held 40 blocks then released: the peak and the RMS of the left channel
+/// of voice 0, and whether every sample is finite.
+pub fn note_stats(engine: &mut AudioEngine) -> (f32, f32, bool) {
+    let out = play(engine, 261.63, 40, 20);
+    let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    (peak, rms(&out), out.iter().all(|s| s.is_finite()))
+}

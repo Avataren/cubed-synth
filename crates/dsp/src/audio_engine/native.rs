@@ -1,7 +1,9 @@
 use crate::audio_engine::patch::{
     AudioAsset, GlideState, LfoState, PatchFile, PatchNode, VoiceLayout as PatchVoiceLayout,
 };
-use crate::audio_engine::patch_loader::for_each_node_in_creation_order;
+use crate::audio_engine::patch_loader::{
+    effect_chain, for_each_node_in_creation_order, is_effect_id,
+};
 use crate::audio_engine::patch_loader::{
     filter_type_from_i32, find_node_id, parse_audio_asset_id, parse_node_id, source_port,
 };
@@ -51,6 +53,9 @@ pub struct AudioEngine {
     wavetable_synthbank: Rc<RefCell<WavetableSynthBank>>,
     wavetable_banks: Arc<FxHashMap<Waveform, Arc<WavetableBank>>>,
     effect_stack: EffectStack,
+    /// The patch id of each effect in the stack, in step with it (`10000 +
+    /// index` for the DAW's fixed chain).
+    effect_ids: Vec<usize>,
     ir_generator: ImpulseResponseGenerator,
     cpu_time_accum: f64,
     audio_time_accum: f64,
@@ -156,6 +161,7 @@ impl AudioEngine {
             wavetable_synthbank,
             wavetable_banks: Arc::new(banks),
             effect_stack: EffectStack::new(block_size),
+            effect_ids: Vec::new(),
             ir_generator: ImpulseResponseGenerator::new(sample_rate),
             cpu_time_accum: 0.0,
             audio_time_accum: 0.0,
@@ -188,41 +194,10 @@ impl AudioEngine {
 
         self.effect_stack = EffectStack::new(self.block_size);
         self.ir_generator = ImpulseResponseGenerator::new(sample_rate);
-
-        let mut chorus = Chorus::new(sample_rate, 65.0, 15.0, 5.0, 0.5, 0.3, 0.5, 90.0);
-        chorus.set_active(false);
-        self.effect_stack.add_effect(Box::new(chorus));
-
-        let mut delay = Delay::new(sample_rate, 2000.0, 500.0, 0.5, 0.1);
-        delay.set_active(false);
-        self.effect_stack.add_effect(Box::new(delay));
-
-        let mut reverb = Freeverb::new(sample_rate, 0.95, 0.5, 0.3, 0.7, 1.0);
-        reverb.set_active(false);
-        self.effect_stack.add_effect(Box::new(reverb));
-
-        let plate_ir = self.ir_generator.plate(2.0, 0.6);
-        let partition_size = self.block_size.next_power_of_two().max(32);
-        let mut plate = Convolver::new(plate_ir, partition_size, sample_rate);
-        plate.set_wet_level(0.1);
-        plate.set_enabled(false);
-        self.effect_stack.add_effect(Box::new(plate));
-
-        let mut limiter = Limiter::new(sample_rate, -0.5, 0.1, 50.0, 1.5, true);
-        limiter.set_active(true);
-        self.effect_stack.add_effect(Box::new(limiter));
-
-        let mut compressor = Compressor::new(sample_rate, -12.0, 4.0, 10.0, 80.0, 3.0, 0.5);
-        compressor.set_active(true);
-        self.effect_stack.add_effect(Box::new(compressor));
-
-        let mut saturation = Saturation::new(2.0, 0.5);
-        saturation.set_active(false);
-        self.effect_stack.add_effect(Box::new(saturation));
-
-        let mut bitcrusher = Bitcrusher::new(12, 4, 0.5);
-        bitcrusher.set_active(false);
-        self.effect_stack.add_effect(Box::new(bitcrusher));
+        self.effect_ids.clear();
+        for (slot, spec) in crate::catalog::EFFECTS.iter().enumerate() {
+            self.add_default_effect(crate::catalog::EFFECT_ID_BASE + slot, spec.type_name);
+        }
 
         // Voice graphs own global frequency/velocity/gate nodes; effects remain
         // separate. `init` only needs to rebuild the shared effect chain.
@@ -283,40 +258,10 @@ impl AudioEngine {
 
         self.effect_stack = EffectStack::new(self.block_size);
         self.ir_generator = ImpulseResponseGenerator::new(self.sample_rate);
-        let mut chorus = Chorus::new(self.sample_rate, 65.0, 15.0, 5.0, 0.5, 0.3, 0.5, 90.0);
-        chorus.set_active(false);
-        self.effect_stack.add_effect(Box::new(chorus));
-
-        let mut delay = Delay::new(self.sample_rate, 2000.0, 500.0, 0.5, 0.1);
-        delay.set_active(false);
-        self.effect_stack.add_effect(Box::new(delay));
-
-        let mut reverb = Freeverb::new(self.sample_rate, 0.95, 0.5, 0.3, 0.7, 1.0);
-        reverb.set_active(false);
-        self.effect_stack.add_effect(Box::new(reverb));
-
-        let plate_ir = self.ir_generator.plate(2.0, 0.6);
-        let partition_size = self.block_size.next_power_of_two().max(32);
-        let mut plate = Convolver::new(plate_ir, partition_size, self.sample_rate);
-        plate.set_wet_level(0.1);
-        plate.set_enabled(false);
-        self.effect_stack.add_effect(Box::new(plate));
-
-        let mut limiter = Limiter::new(self.sample_rate, -0.5, 0.1, 50.0, 1.5, true);
-        limiter.set_active(true);
-        self.effect_stack.add_effect(Box::new(limiter));
-
-        let mut compressor = Compressor::new(self.sample_rate, -12.0, 4.0, 10.0, 80.0, 3.0, 0.5);
-        compressor.set_active(true);
-        self.effect_stack.add_effect(Box::new(compressor));
-
-        let mut saturation = Saturation::new(2.0, 0.5);
-        saturation.set_active(false);
-        self.effect_stack.add_effect(Box::new(saturation));
-
-        let mut bitcrusher = Bitcrusher::new(12, 4, 0.5);
-        bitcrusher.set_active(false);
-        self.effect_stack.add_effect(Box::new(bitcrusher));
+        self.effect_ids.clear();
+        for (id, type_name) in effect_chain(&patch.synth_state) {
+            self.add_default_effect(id, type_name);
+        }
 
         let canonical_voice = layout
             .canonical_voice()
@@ -384,9 +329,7 @@ impl AudioEngine {
     /// Replaces the convolver at `effect_id` with one of this WAV's impulse
     /// response (mono, resampled to the engine's rate), keeping its wet level.
     pub fn import_wave_impulse(&mut self, effect_id: usize, wav: &[u8]) -> Result<(), String> {
-        let index = effect_id
-            .checked_sub(EFFECT_NODE_ID_OFFSET)
-            .ok_or("Invalid effect id")?;
+        let index = self.effect_index(effect_id).ok_or("Invalid effect id")?;
         let effect = self
             .effect_stack
             .effects
@@ -617,6 +560,73 @@ impl AudioEngine {
         }
     }
 
+    /// Appends an effect of `type_name` with the DAW's starting settings to the
+    /// stack, under the patch id `id`.
+    fn add_default_effect(&mut self, id: usize, type_name: &str) {
+        let rate = self.sample_rate;
+        let effect: Box<dyn AudioNode> = match type_name {
+            "chorus" => {
+                let mut chorus = Chorus::new(rate, 65.0, 15.0, 5.0, 0.5, 0.3, 0.5, 90.0);
+                chorus.set_active(false);
+                Box::new(chorus)
+            }
+            "delay" => {
+                let mut delay = Delay::new(rate, 2000.0, 500.0, 0.5, 0.1);
+                delay.set_active(false);
+                Box::new(delay)
+            }
+            "freeverb" => {
+                let mut reverb = Freeverb::new(rate, 0.95, 0.5, 0.3, 0.7, 1.0);
+                reverb.set_active(false);
+                Box::new(reverb)
+            }
+            "convolver" => {
+                let plate_ir = self.ir_generator.plate(2.0, 0.6);
+                let partition_size = self.block_size.next_power_of_two().max(32);
+                let mut plate = Convolver::new(plate_ir, partition_size, rate);
+                plate.set_wet_level(0.1);
+                plate.set_enabled(false);
+                Box::new(plate)
+            }
+            "limiter" => {
+                let mut limiter = Limiter::new(rate, -0.5, 0.1, 50.0, 1.5, true);
+                limiter.set_active(true);
+                Box::new(limiter)
+            }
+            "compressor" => {
+                let mut compressor = Compressor::new(rate, -12.0, 4.0, 10.0, 80.0, 3.0, 0.5);
+                compressor.set_active(true);
+                Box::new(compressor)
+            }
+            "saturation" => {
+                let mut saturation = Saturation::new(2.0, 0.5);
+                saturation.set_active(false);
+                Box::new(saturation)
+            }
+            "bitcrusher" => {
+                let mut bitcrusher = Bitcrusher::new(12, 4, 0.5);
+                bitcrusher.set_active(false);
+                Box::new(bitcrusher)
+            }
+            other => {
+                eprintln!("Unknown effect type {other}");
+                return;
+            }
+        };
+        self.effect_stack.add_effect(effect);
+        self.effect_ids.push(id);
+    }
+
+    /// Where the effect with patch id `node_id` is in the stack.
+    fn effect_index(&self, node_id: usize) -> Option<usize> {
+        self.effect_ids.iter().position(|&id| id == node_id)
+    }
+
+    /// The patch ids of the effects in the stack, in processing order.
+    pub fn effect_ids(&self) -> &[usize] {
+        &self.effect_ids
+    }
+
     /// The effects in the stack by type name (`chorus`, `delay`, ...), in the
     /// order they process.
     pub fn effect_kinds(&self) -> Vec<String> {
@@ -637,7 +647,7 @@ impl AudioEngine {
     /// The effect-stack node with this patch id (`EFFECT_NODE_ID_OFFSET` +
     /// its index), if it is a `T`; otherwise a warning.
     fn effect_mut<T: 'static>(&mut self, node_id: usize) -> Option<&mut T> {
-        let index = node_id.checked_sub(EFFECT_NODE_ID_OFFSET)?;
+        let index = self.effect_index(node_id)?;
         let found = self
             .effect_stack
             .effects
@@ -789,6 +799,11 @@ impl AudioEngine {
         canonical_voice: &PatchVoiceLayout,
     ) -> Result<(), String> {
         for conn_data in &canonical_voice.connections {
+            // Effects are the chain, not graph nodes: a connection that names
+            // one (a stray in a few DAW patches) has nothing to connect.
+            if is_effect_id(&conn_data.from_id) || is_effect_id(&conn_data.to_id) {
+                continue;
+            }
             let from_node = parse_node_id(&conn_data.from_id)?;
             let to_node = parse_node_id(&conn_data.to_id)?;
 
@@ -1293,8 +1308,8 @@ impl AudioEngine {
         active: bool,
         wet_level: f32,
     ) -> Result<(), String> {
-        let effect_id = node_id
-            .checked_sub(EFFECT_NODE_ID_OFFSET)
+        let effect_id = self
+            .effect_index(node_id)
             .ok_or_else(|| "Invalid convolver node id".to_string())?;
 
         let effect = self
@@ -1370,8 +1385,8 @@ impl AudioEngine {
         makeup_gain_db: f32,
         mix: f32,
     ) -> Result<(), String> {
-        let effect_id = node_id
-            .checked_sub(EFFECT_NODE_ID_OFFSET)
+        let effect_id = self
+            .effect_index(node_id)
             .ok_or_else(|| "Invalid compressor node id".to_string())?;
 
         let effect = self
@@ -1401,8 +1416,8 @@ impl AudioEngine {
         mix: f32,
         active: bool,
     ) -> Result<(), String> {
-        let effect_id = node_id
-            .checked_sub(EFFECT_NODE_ID_OFFSET)
+        let effect_id = self
+            .effect_index(node_id)
             .ok_or_else(|| "Invalid saturation node id".to_string())?;
 
         let effect = self
@@ -1432,8 +1447,8 @@ impl AudioEngine {
         mix: f32,
         active: bool,
     ) -> Result<(), String> {
-        let effect_id = node_id
-            .checked_sub(EFFECT_NODE_ID_OFFSET)
+        let effect_id = self
+            .effect_index(node_id)
             .ok_or_else(|| "Invalid bitcrusher node id".to_string())?;
 
         let effect = self

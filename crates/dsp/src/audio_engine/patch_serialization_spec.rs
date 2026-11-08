@@ -87,6 +87,9 @@ mod tests {
             bitcrushers: Default::default(),
             noise: Default::default(),
             velocity: Default::default(),
+            macros: Default::default(),
+            instrument_gain: Default::default(),
+            effect_chain: Default::default(),
         };
 
         let metadata = PatchMetadata {

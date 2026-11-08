@@ -63,6 +63,55 @@ pub struct SynthState {
     pub noise: Option<NoiseState>,
     #[serde(default)]
     pub velocity: Option<VelocityState>,
+    /// The macros' values and what they drive.
+    #[serde(default)]
+    pub macros: Option<MacroState>,
+    /// The instrument's output gain (1 when absent).
+    #[serde(default, rename = "instrumentGain")]
+    pub instrument_gain: Option<f32>,
+    /// The effects in processing order, as ids (`"10003"`); absent, the fixed
+    /// chain of ten thousand and up that the DAW has.
+    #[serde(default, rename = "effectChain")]
+    pub effect_chain: Option<Vec<String>>,
+}
+
+/// The four macros of a patch: their values (0 to 1) and their routes.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct MacroState {
+    #[serde(default, deserialize_with = "null_is_empty")]
+    pub values: Vec<f32>,
+    #[serde(default, deserialize_with = "null_is_empty")]
+    pub routes: Vec<MacroRoute>,
+}
+
+/// A macro driving one input of a node, as the DAW's `connect_macro` does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MacroRoute {
+    #[serde(rename = "macroIndex")]
+    pub macro_index: usize,
+    #[serde(rename = "targetId")]
+    pub target_id: String,
+    #[serde(rename = "targetPort", default)]
+    pub target_port: u32,
+    #[serde(default)]
+    pub amount: f32,
+    /// Additive (2) when absent, as the DAW has it.
+    #[serde(rename = "modulationType", default = "additive_modulation")]
+    pub modulation_type: i32,
+    #[serde(rename = "modulationTransformation", default)]
+    pub modulation_transform: i32,
+}
+
+fn additive_modulation() -> i32 {
+    2
+}
+
+fn null_is_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Serialize, Deserialize)]

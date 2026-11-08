@@ -123,6 +123,50 @@ pub fn source_port(
     }
 }
 
+/// An effect's id: a decimal number (`10000` and up), not a UUID. Effects are
+/// not graph nodes; a connection that names one cannot be built.
+#[allow(dead_code)] // the native engine's; the wasm engine keeps the DAW's fixed chain
+pub fn is_effect_id(id: &str) -> bool {
+    id.parse::<usize>().is_ok()
+}
+
+/// The effects of a patch in processing order, as (id, type name). A patch with
+/// an `effectChain` has that; any other has the DAW's fixed chain of eight at
+/// `10000` and up. An id in the chain takes its type from the voice's `nodes`,
+/// else from its place in the fixed chain; one with neither is left out.
+#[allow(dead_code)] // the native engine's; the wasm engine keeps the DAW's fixed chain
+pub fn effect_chain(synth: &crate::audio_engine::patch::SynthState) -> Vec<(usize, &'static str)> {
+    use crate::catalog::{effect_spec, EFFECTS, EFFECT_ID_BASE};
+    let by_slot = |id: usize| {
+        id.checked_sub(EFFECT_ID_BASE)
+            .and_then(|slot| EFFECTS.get(slot))
+            .map(|spec| spec.type_name)
+    };
+    let Some(chain) = synth.effect_chain.as_ref() else {
+        return EFFECTS
+            .iter()
+            .enumerate()
+            .map(|(slot, spec)| (EFFECT_ID_BASE + slot, spec.type_name))
+            .collect();
+    };
+    let listed = |id: usize| -> Option<&'static str> {
+        let nodes = &synth.layout.canonical_voice()?.nodes;
+        nodes.iter().find_map(|(type_name, list)| {
+            let spec = effect_spec(type_name)?;
+            list.iter()
+                .any(|n| n.id.parse::<usize>() == Ok(id))
+                .then_some(spec.type_name)
+        })
+    };
+    chain
+        .iter()
+        .filter_map(|id| {
+            let id = id.parse::<usize>().ok()?;
+            Some((id, listed(id).or_else(|| by_slot(id))?))
+        })
+        .collect()
+}
+
 /// Find the first node ID of a specific type in the voice layout
 pub fn find_node_id(voice_layout: &PatchVoiceLayout, node_type: &str) -> Option<String> {
     voice_layout
