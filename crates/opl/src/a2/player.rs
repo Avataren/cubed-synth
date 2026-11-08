@@ -34,6 +34,11 @@ impl RegisterSink for Chip {
 const TAP_SCALE: f32 = 1.0 / 8192.0;
 /// Full scale of the chip's 16-bit output.
 const FULL_SCALE: f32 = 1.0 / 32768.0;
+/// Frames of per-channel taps the player has room for from the start (a longer block
+/// grows the room once).
+const TAPS_ROOM: usize = 1024;
+/// Register writes a tick has room for from the start.
+const WRITES_ROOM: usize = 4096;
 /// Most ticks a seek replays before it gives up finding its row by playing
 /// and jumps there directly (about 40 minutes at 50 Hz).
 const SEEK_TICK_LIMIT: usize = 120_000;
@@ -135,36 +140,7 @@ impl A2Player {
     #[cfg_attr(feature = "wasm", wasm_bindgen(constructor))]
     pub fn new(bytes: &[u8], sample_rate: f64) -> Result<A2Player, String> {
         let song = parse(bytes).map_err(|e| format!("Cannot read this A2M module: {e}"))?;
-        if let Some(why) = A2Engine::refusal(&song) {
-            return Err(format!("Cannot play this A2M module: {why}"));
-        }
-        let mut chip = Chip::new();
-        let mut engine = A2Engine::new(song.clone());
-        engine.reset(&mut chip);
-        Ok(A2Player {
-            song,
-            engine,
-            chip,
-            resampler: Resampler::new(NATIVE_RATE, sample_rate),
-            out_rate: sample_rate,
-            playing: false,
-            gain: 1.0,
-            until_tick: 0.0,
-            loop_mode: A2Loop::None,
-            end_reached: false,
-            mute: 0,
-            solo: 0,
-            taps_enabled: false,
-            taps: Vec::new(),
-            tap_frames: 0,
-            levels_enabled: false,
-            levels: [0.0; CHANNELS],
-            block_peaks: [0.0; CHANNELS],
-            frames: 0,
-            rows_base: 0,
-            writes: Vec::new(),
-            next_write: 0,
-        })
+        A2Player::from_song(song, sample_rate)
     }
 
     pub fn play(&mut self) {
@@ -349,7 +325,8 @@ impl A2Player {
     pub fn set_taps_enabled(&mut self, enabled: bool) {
         self.taps_enabled = enabled;
         if !enabled {
-            self.taps = Vec::new();
+            // Keeps the room: a later switch-on allocates nothing.
+            self.taps.clear();
             self.tap_frames = 0;
         }
     }
@@ -476,6 +453,45 @@ impl A2Player {
 }
 
 impl A2Player {
+    /// A paused player at the start of a song the caller holds (an edited
+    /// one: no file is written or read). Refused with one sentence when its
+    /// order list plays nothing.
+    pub fn from_song(song: A2mSong, sample_rate: f64) -> Result<A2Player, String> {
+        if let Some(why) = A2Engine::refusal(&song) {
+            return Err(format!("Cannot play this A2M module: {why}"));
+        }
+        let mut chip = Chip::new();
+        let mut engine = A2Engine::new(song.clone());
+        engine.reset(&mut chip);
+        Ok(A2Player {
+            song,
+            engine,
+            chip,
+            resampler: Resampler::new(NATIVE_RATE, sample_rate),
+            out_rate: sample_rate,
+            playing: false,
+            gain: 1.0,
+            until_tick: 0.0,
+            loop_mode: A2Loop::None,
+            end_reached: false,
+            mute: 0,
+            solo: 0,
+            taps_enabled: false,
+            // Room for the taps of a block of `TAPS_ROOM` frames: switching them on or
+            // off later neither allocates nor frees (an audio thread may do it).
+            taps: Vec::with_capacity(CHANNELS * TAPS_ROOM),
+            tap_frames: 0,
+            levels_enabled: false,
+            levels: [0.0; CHANNELS],
+            block_peaks: [0.0; CHANNELS],
+            frames: 0,
+            rows_base: 0,
+            // A tick writes a few hundred registers at most; the room is made once.
+            writes: Vec::with_capacity(WRITES_ROOM),
+            next_write: 0,
+        })
+    }
+
     fn channel_mask(&self) -> u32 {
         let audible = |t: usize| {
             let bit = 1u32 << t;
@@ -746,6 +762,35 @@ mod tests {
         assert!(rms(&out) > 0.01, "no sound after 3 s");
         assert!(p.order() > 0 || p.row() > 0);
         assert!(!p.song_name().trim().is_empty());
+    }
+
+    #[test]
+    fn a_player_from_a_song_plays_as_one_from_the_file() {
+        let bytes = corpus(COT);
+        let mut a = A2Player::new(&bytes, 48_000.0).unwrap();
+        let mut b = A2Player::from_song(parse(&bytes).unwrap(), 48_000.0).unwrap();
+        a.play();
+        b.play();
+        assert_eq!(render(&mut a, 24_000), render(&mut b, 24_000));
+        // A song that plays nothing is refused as the file is.
+        let mut song = parse(&bytes).unwrap();
+        song.order = [0x80; 128];
+        assert!(A2Player::from_song(song, 48_000.0).is_err());
+    }
+
+    #[test]
+    fn taps_can_be_switched_off_and_on_again_in_place() {
+        let mut p = A2Player::new(&corpus(COT), 48_000.0).unwrap();
+        p.play();
+        let room = p.taps.capacity();
+        for _ in 0..3 {
+            p.set_taps_enabled(true);
+            render(&mut p, 512);
+            let mut tap = [0f32; 128];
+            p.read_tap(p.track_channel(0), &mut tap);
+            p.set_taps_enabled(false);
+            assert_eq!(p.taps.capacity(), room, "the room stays");
+        }
     }
 
     #[test]
