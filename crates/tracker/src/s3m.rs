@@ -233,6 +233,7 @@ pub fn parse(bytes: &[u8]) -> Result<Module, String> {
         title,
         channels: enabled.len(),
         orders,
+        restart: 0,
         patterns,
         samples,
         instruments: Vec::new(),
@@ -291,7 +292,7 @@ fn sample_preamp(master_volume: u8, format_version: usize) -> f32 {
 
 /// The OPL's level against the samples: OpenMPT's OPL mix level, against
 /// the sample pre-amp, at equal power.
-fn adlib_gain(master_volume: u8, format_version: usize) -> f32 {
+pub(crate) fn adlib_gain(master_volume: u8, format_version: usize) -> f32 {
     let openmpt_opl = 32768.0 * 6169.0 * (36.0 / 48.0) / 2f32.powi(27);
     std::f32::consts::FRAC_1_SQRT_2 * openmpt_opl * 128.0
         / sample_preamp(master_volume, format_version)

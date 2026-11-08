@@ -262,6 +262,7 @@ pub fn parse(bytes: &[u8]) -> Result<Module, String> {
             .copied()
             .filter(|&p| p < pattern_count)
             .collect(),
+        restart: 0,
         patterns,
         samples,
         instruments: Vec::new(),

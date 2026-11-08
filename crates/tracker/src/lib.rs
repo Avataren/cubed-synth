@@ -26,6 +26,7 @@ mod profile;
 mod protracker;
 mod s3m;
 mod voice;
+mod write;
 mod xm;
 
 pub use effects::{Command, PitchSource, Ramp};
@@ -34,6 +35,7 @@ pub use module::{
     Note, Pattern, Sample,
 };
 pub use player::{Observer, Player, PlayerOptions, Position};
+pub use write::{write, write_mod, write_s3m, write_xm};
 
 /// Whether `bytes` look like a module this crate reads, and which kind.
 pub fn sniff(bytes: &[u8]) -> Option<Format> {

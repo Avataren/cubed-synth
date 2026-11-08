@@ -226,6 +226,10 @@ pub struct Module {
     pub channels: usize,
     /// The song: pattern numbers in play order.
     pub orders: Vec<usize>,
+    /// XM: the order the song loops back to when it reaches its end (the
+    /// header's restart position; 0 when it is out of range). MOD and S3M
+    /// files cannot hold one: it is 0.
+    pub restart: usize,
     pub patterns: Vec<Pattern>,
     /// MOD and S3M: instrument `n` plays `samples[n - 1]`. XM: every
     /// instrument's samples, which `instruments` index.

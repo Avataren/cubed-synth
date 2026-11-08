@@ -719,7 +719,11 @@ impl Player {
     /// cut) or end the song. False when the song ends.
     fn wrap_or_finish(&mut self, observer: &mut dyn Observer) -> bool {
         if self.options.looped {
-            self.order = 0;
+            // An XM's restart position; 0 for the formats that have none.
+            self.order = self
+                .module
+                .restart
+                .min(self.module.orders.len().saturating_sub(1));
             let time = self.next_row_time;
             observer.all_notes_off(time);
             for c in &mut self.channels {

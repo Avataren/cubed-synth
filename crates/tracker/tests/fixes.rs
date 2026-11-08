@@ -31,6 +31,7 @@ fn module(format: Format, channels: usize, rows: usize) -> Module {
         title: String::new(),
         channels,
         orders: vec![0],
+        restart: 0,
         patterns: vec![Pattern::new(rows, channels)],
         samples: vec![sine(64), sine(32)],
         instruments: Vec::new(),

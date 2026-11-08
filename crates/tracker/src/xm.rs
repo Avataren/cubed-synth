@@ -249,6 +249,17 @@ pub fn parse(bytes: &[u8]) -> Result<Module, String> {
     }
 
     let order_length = song_length.min(256);
+    // The restart position counts the file's order list; `orders` leaves out
+    // entries that name no pattern.
+    let restart_raw = le16(bytes, 66);
+    let restart = if restart_raw < order_length {
+        orders_raw[..restart_raw]
+            .iter()
+            .filter(|&&p| p < patterns.len())
+            .count()
+    } else {
+        0
+    };
     Ok(Module {
         format: Format::Xm,
         title,
@@ -258,6 +269,7 @@ pub fn parse(bytes: &[u8]) -> Result<Module, String> {
             .copied()
             .filter(|&p| p < patterns.len())
             .collect(),
+        restart,
         patterns,
         samples,
         instruments,
