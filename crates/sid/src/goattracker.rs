@@ -22,6 +22,12 @@
 //! names.
 
 mod gt1;
+mod write;
+
+pub use write::{
+    export, export_problem, note_byte, orderlist_byte_length, orderlist_bytes, GtExport,
+    GT_MAX_ORDERLIST_BYTES, GT_MAX_TRANSPOSE, GT_MIN_TRANSPOSE,
+};
 
 use crate::song::{
     Instrument, OrderEntry, Orderlist, Pattern, Row, SidSong, SongError, Subsong, TableRow, Tables,

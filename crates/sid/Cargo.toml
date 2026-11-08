@@ -9,10 +9,15 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
+default = ["edit"]
 # wasm-bindgen classes for the browser (another_synth's SID worklet).
 wasm = ["dep:wasm-bindgen"]
+# The edit layer (`SidDoc`: operations as JSON, undo and redo, a `.sng` writer's
+# document).
+edit = ["dep:serde_json"]
 
 [dependencies]
+serde_json = { workspace = true, optional = true }
 wasm-bindgen = { workspace = true, optional = true }
 
 [dev-dependencies]
