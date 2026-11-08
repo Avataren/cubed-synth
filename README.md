@@ -9,7 +9,7 @@ in a browser AudioWorklet and in a native audio callback.
 |---|---|
 | `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, GoatTracker 1 and 2 `.sng` import (`goattracker`, another_synth's importer ported byte for byte), and a register-stream chip player (`stream`) |
 | `cubed-ahx` | AHX / HivelyTracker (`.ahx`, `.hvl`) parser and replayer, bit-exact against `hvl_replay.c`, with a band-limited "hifi" path |
-| `cubed-opl` | Yamaha OPL2/OPL3 FM chip (a port of ymfm's OPL path) and an Adlib Tracker II (`.a2m`) parser and player |
+| `cubed-opl` | Yamaha OPL2/OPL3 FM chip (a port of ymfm's OPL path), an Adlib Tracker II (`.a2m`) parser, writer and player (which takes live control: seek, loops, mute and solo, position, levels, live edits), `edit::A2mDoc` and `edit::OplInstrumentDoc` (a song and an instrument as data, with JSON operations and undo), and `audition::OplAudition`, an OPL instrument played by hand |
 | `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. The writers (`write_mod`, `write_s3m`, `write_xm`) and `edit::ModuleDoc`, which edits a module as data with JSON operations, format limits and undo. An `Observer` sees every row and command; a `Probe` shows the position, per-channel levels and scopes of a playing player, which also takes live control (stop and play, seek, loops, mute and solo, note preview) |
 | `cubed-dsp` | The synth engine: audio graph, oscillators (analog, wavetable), envelopes, LFOs, filters, chorus, delay, reverb, convolver, compressor, limiter, EQ, voices, automation and patch loading; a catalogue of its node types, patch documents that are edited as data, and live parameter edits |
 | `cubed-simd` | The slice of `std::simd` the crates above use, on stable Rust |
@@ -35,6 +35,8 @@ in a browser AudioWorklet and in a native audio callback.
   chip.
 - `edit` (`cubed-tracker`, on by default): `cubed_tracker::edit`, the module edit layer
   (needs `serde_json`; nothing in a player calls it, so a worklet drops it at link time).
+- `edit` (`cubed-opl`, on by default): `cubed_opl::edit`, the A2M song and OPL instrument edit layer
+  (nothing in a player calls it, so a worklet drops it at link time).
 
 Every crate builds for `wasm32-unknown-unknown` with its default features and no JS
 glue. There `cubed-dsp` seeds its random number generators from
@@ -386,6 +388,96 @@ S3M drum channels (channel settings 25-29 load as plain channels); the points of
 `vblank_timing` and `amiga_limits` are not in the file (loading derives them from the song, so an edit can make a
 reload differ in those flags; `info().flags` and `set_flag` show and set them); an S3M pan that is not on the
 pan table's 16 steps (or ST3's default left/right) is written as the nearest step.
+
+## Editing Adlib Tracker II songs and OPL instruments (an Adlib editor's data layer)
+
+`cubed_opl::edit::A2mDoc` holds an `A2mSong` (an `.a2m` file's song: 250 or 255 instruments, FM/arpeggio/vibrato
+macro tables from version 9, patterns, the order list, the header) and edits it the way Adlib Tracker II does, in
+the style of `ModuleDoc`: typed methods and one JSON entry point, `apply(&Value) -> Result<Value, String>`. Every
+change is checked against what the song's *version* holds and a change that does not fit is refused with a message
+and leaves the song as it was (a failed `batch` leaves none of its operations). `A2mDoc::new(opl3)` makes an empty
+version-14 song (9 or 18 tracks), `from_bytes` reads one, `to_bytes()` writes it (the document converts nothing between
+versions), `song()` borrows the `A2mSong` to play (`A2Player::new(&doc.to_bytes()?, rate)`).
+
+**Numbers.** Patterns, rows, tracks (`channel`) and order positions count from 0; instruments, macros and macro
+entries from 1 (0 is none in a cell). Every pattern of an A2M song has the same length (`pattern_len`, 64 before
+version 9) and `tracks` tracks (9 in versions 1-4, 18 in 5-8, 1-20 from 9). **A cell** is `[note, instrument, effect,
+param, effect2, param2]`: `note` 0 none, 255 key off, else a MIDI number from 12 (C-0, AT2's note 1) to 108 (C-8, note
+97, which real songs use and AT2 plays as block 7's top), `60` is `C-4` (`info().note.octave_offset` is 1, as for
+XM). A fixed note (version 9 up) is the number plus 128 (`set_cell` takes `fixed: true`; they are not transposed);
+a note byte the format does not define reads as 256 plus the byte, so nothing is lost. `effect` is the command number
+as the file holds it (0-9, then `A`=10 .. `Z`=35, then ``&%!@=#$~^`><``=36-47; versions 1-4 stop at `F`; the operations also
+take the letter) in the song's own version's numbering, with its parameter byte; the second column is version 9 up.
+
+Reads: `info()` (version, title, tracks, patterns, orders, restart, tempo, speed, timer rate, flags, limits, history
+state, `playable`), `rows(pattern, row0, count, flat)` (`cells[row][track]`), `order()` (the pattern numbers before the
+first jump marker, where that marker jumps to as `restart`, the `tail`), `instruments()` (every slot in brief),
+`instrument(n)` (name, the eleven FM bytes, `voice` with both operators' fields, panning, fine-tune, voice type, the
+FM macro summary), `macros()`, `macro(kind, n)`, `validate()` (what the version cannot hold; `validate_content()` skips
+the writer), `copy_range`, `live_edits()`.
+
+**Operations** (`{"op": ..., fields}`):
+
+| group | ops |
+|---|---|
+| cells | `set_cell` (`pattern`, `row`, `channel`, `cell: [..]` or any of `note`, `instrument`, `effect`, `param`, `effect2`, `param2`; notes may be `"C-4"`, `"###"`, effects letters), `clear_range` (+ `columns`), `insert_row` / `delete_row`, `transpose` (range, `semitones`, `clamp`, `instrument`), `copy_range` -> clip, `paste` (`cells`, `mode`: `overwrite` or `mix`) |
+| patterns | `set_pattern_len` (alias `set_pattern_rows`: the song's length, 1-256 from version 9; shortening over data needs `force`), `new_pattern`, `duplicate_pattern`, `delete_pattern` (its orders go, later numbers shift), `set_pattern_name` (version 11 up) |
+| orders | `set_order`, `insert_order`, `delete_order`, `move_order`, `set_restart` (the first jump marker's target), `set_orders` (`orders`, `restart`) |
+| song | `set_title`, `set_composer`, `set_tempo`, `set_speed`, `set_flag` (`update_speed`, `track_volume_lock`, `volume_peak_lock`, `tremolo_depth`, `vibrato_depth`, `track_panning_lock`, `percussion`, `volume_scaling`; version 5 up), `set_tracks` (version 9 up; dropping tracks with data needs `force`), `set_macro_speedup`, `set_four_op_tracks` (`mask` or `pair` + `on`; version 10 up), `set_lock_flags`, `set_four_op_instrument` (version 12 up), `set_rows_per_beat`, `set_tempo_finetune` (version 14) |
+| instruments | `set_instrument` (`name`, `panning`, `finetune`, `voice_type`, `fm`, and the voice: `modulator` / `carrier` objects of `tremolo`, `vibrato`, `sustain`, `ksr`, `multiplier`, `key_scale_level` (`ksl`), `total_level` or `level` (63 loudest, as the DAW's slider), `attack`, `decay`, `sustain_level`, `release`, `waveform`, plus `feedback` and `connection`: `fm` or `additive`), `set_operator` (`operator` and the fields flat), `swap_operators`, `reset_instrument` (the plain sine voice), `clear_instrument`, `copy_instrument` (with its FM macro), `set_disabled_columns` (version 11 up) |
+| macros | `set_fm_macro` (header fields and `steps: [{step, fm or voice fields, freq_slide, panning, duration}]`), `set_arpeggio_macro`, `set_vibrato_macro` (header fields and `data: [..]` from entry 1 or `entries: [{entry, value}]`), `clear_macro` |
+| history | `begin_group`, `end_group`, `undo`, `redo`, `batch` (`ops`: one undo step, all or none) |
+
+Every JSON edit returns `{"changed": {"patterns": [{pattern, row0, row1}], "layout", "orders", "header", "timing", "song",
+"names", "instruments": [n], "macros": [{kind, macro}]}}` and its own fields. Every operation is checked: a range
+(attack 0-15, level 0-63, key scale 0-3, multiplier 0-15, waveform 0-7, feedback 0-7), a version's own limits
+(250 instruments and one effect column before 9, no panning before 5, no voice types before 9, macros from 9, pattern
+names and disabled columns from 11, 4-op instruments from 12, rows per beat in 14), the 128 order positions, 64 or 128
+patterns, a macro's loop and key-off positions against its length.
+
+**Undo and redo.** The inverse-change log of `ModuleDoc` (`edit/history.rs`): an edit records the change that puts
+back what it overwrites (a rectangle of cells, the order list, an instrument, one macro table, the header, the
+names), so typing a note costs one cell and not the 1 MB songdata. `begin_group` / `end_group` nest; `undo()` / `redo()`
+return a `Changes`; bounded by steps (1000) and bytes (128 MiB); `revision()` counts every change.
+
+**Writer.** `to_bytes()` is `a2::write::write`: versions 9-11 aPLib, 12-14 LZH, 4 and 8 stored; versions 1 and 5
+(SIXPACK) are written as the stored 4 and 8. *Checked* (`tests/a2m_doc.rs`): on all 266 fixtures (and every `.a2m` in
+`CUBED_A2M=<dir>`) `A2mDoc::from_bytes(x).to_bytes()` loads back to the same song and saving that gives the same
+bytes; a random-operation soak on one song of each version (1, 5, 9, 10, 11, 12, 13, 14) and on new ones saves and
+reloads after every few steps, undoes everything to the start and redoes to the end; the bytes of two songs built by
+operations are pinned by hashes (`cargo run -p cubed-opl --release --example a2m_edit -- in.a2m ops.json out.a2m` applies an operation list to a file or to `new`/`new3`). 19 fixtures have an order list that names patterns past the file's pattern count (Adlib
+Tracker II plays them as empty, or from the rest of the file's last block): the document shows them, so such a song
+saves with the larger count; no other song changes.
+
+**Live edits.** A playing `A2Player` takes what a document's `live_edits()` returns after an edit
+(`Option<Vec<LiveEdit>>`) with `A2Player::apply_edit(&edit)`, in place and without allocating: cells (read when the row
+comes), instrument data (a track that holds the edited instrument loads it again at its next instrument cell), FM,
+arpeggio and vibrato macro tables (read as they run) and the tempo and speed. `None` means the shape moved (the
+pattern list, the order list, the pattern length, the track count, the flags, the macro speed-up, lock flags, 4-op
+pairs, or more than 1024 cells): open the edited song as a new player, seek it to where the old one is and swap them.
+A note sounding now goes on with what it loaded; `OplAudition` is how an edit is *heard* at once.
+
+**The instrument alone.** `OplInstrumentDoc` is the DAW's Adlib instrument editor without a song:
+`OplInstrumentDoc::from_s3m(&Adlib::registers)` (or `new`, `from_a2m`) takes the same `set_instrument`, `set_operator`,
+`swap_operators`, `reset`, `clear`, `undo`, `batch` operations; `s3m_registers()` is what to give
+`cubed_tracker::edit::ModuleDoc`'s `set_sample` (`adlib.registers`) and `patch()` what the audition plays. An S3M's
+OPL2 has the waveforms 0-3 and no name, panning, fine-tune or voice type: those are refused. `cubed_opl::fm` has the
+shared types (`Voice`, `Operator`, `FmPatch`: the eleven FM bytes are the same in A2M and S3M).
+
+**Audition.** `audition::OplAudition` plays an instrument with no song: a chip of its own with up to 18 voices, notes
+loaded the way the song player loads them (same register order, the AT2 note table and fine-tune, the empty-envelope
+workaround). `note_on(note, velocity, duration)`, `note_off(note)`, `all_notes_off()`, `set_patch(&FmPatch)` (a live
+edit: sounding notes are rewritten at once), `render(&mut left, &mut right)` (writes over the buffers, allocates nothing),
+`peak()`. It maps one to one onto `cubed_mixer::Source` (`render` -> true) and `SourceEvent::{NoteOn, NoteOff,
+AllNotesOff}`; a patch edit needs a message of 11 FM bytes, panning and fine-tune. Percussion voice types and 4-op
+pairs play as plain 2-op voices.
+
+**Playback control** (`A2Player`, beside `seek`, `set_mute_solo`, taps): `status()` (order, pattern, row, tick, speed, tempo,
+timer rate, a rows counter that a seek bumps, frames, loops, ended), `set_loop(A2Loop::{None, Pattern, Range})`,
+`set_mute(track, on)` / `set_solo(track, on)`, `set_levels_enabled` + `track_levels(&mut out)` (each track's peak,
+falling 24 dB a second, as the tracker `Probe`'s), `apply_edit`. `seek` and everything above allocate nothing now
+(`Chip::reset`, `Resampler::reset`, `A2Engine::restart` reset in place): `cubed-rt-check` runs them on the audio-thread
+path.
 
 ## Building, testing, benchmarks
 

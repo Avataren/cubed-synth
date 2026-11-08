@@ -22,7 +22,11 @@ use cubed_mixer::{
     VoiceId,
 };
 use cubed_mixer::{PlaySfx, SfxPreset, SourceEvent, SynthSource};
-use cubed_opl::a2::player::A2Player;
+use cubed_opl::a2::live::LiveEdit;
+use cubed_opl::a2::player::{A2Loop, A2Player};
+use cubed_opl::audition::OplAudition;
+use cubed_opl::edit::A2mDoc;
+use cubed_opl::fm::FmPatch;
 use cubed_rt_check::{allocations_during, trace_allocations, CountingAllocator};
 use cubed_sid::stream::SidChipPlayer;
 use cubed_sid::{SidModel, SidSong, SidSongPlayer};
@@ -127,6 +131,114 @@ fn a2m_player() {
             player.render(&mut left, &mut right);
         });
     }
+}
+
+/// An Adlib Tracker II song under live control: seeks (the chip, the resampler
+/// and the engine reset in place), mutes and solos, every kind of loop, the
+/// position and levels read every block, and live edits of cells, instruments,
+/// macros and timing landing in the song as it plays.
+#[test]
+fn a2m_live_control() {
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    let bytes = fixture("opl/tests/fixtures/a2m/NAB622/corridors of time.a2m");
+    let mut doc = A2mDoc::from_bytes(&bytes).unwrap();
+    // Edits made up front, off the audio thread: what the host would send.
+    let mut edits: Vec<LiveEdit> = Vec::new();
+    for (i, op) in [
+        serde_json::json!({"op": "set_cell", "pattern": 0, "row": 20, "channel": 2, "note": 60, "instrument": 1}),
+        serde_json::json!({"op": "set_instrument", "instrument": 1, "carrier": {"attack": 9}, "feedback": 3}),
+        serde_json::json!({"op": "set_arpeggio_macro", "macro": 2, "length": 2, "entries": [{"entry": 2, "value": 7}]}),
+        serde_json::json!({"op": "set_fm_macro", "macro": 3, "length": 1, "steps": [{"step": 1, "duration": 3}]}),
+        serde_json::json!({"op": "set_vibrato_macro", "macro": 2, "length": 2, "data": [0, 5]}),
+        serde_json::json!({"op": "set_tempo", "tempo": 80}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        doc.apply(&op).unwrap_or_else(|e| panic!("op {i}: {e}"));
+        edits.extend(doc.live_edits().expect("a live edit"));
+    }
+    assert!(edits.len() >= 6);
+    let mut player = A2Player::new(&bytes, RATE as f64).expect("player builds");
+    player.set_levels_enabled(true);
+    player.play();
+    let tracks = player.track_count();
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let mut levels = [0f32; 32];
+    let mut sounded = 0.0f32;
+    // One warm-up second, then 30 counted ones.
+    for block in 0..BLOCKS_PER_SECOND {
+        player.render(&mut left, &mut right);
+        let _ = block;
+    }
+    for block in 0..30 * BLOCKS_PER_SECOND {
+        let (second, in_second) = (block / BLOCKS_PER_SECOND, block % BLOCKS_PER_SECOND);
+        let events = allocations_during(|| {
+            if in_second == 0 {
+                player.seek(second % 4, second % 7 * 4);
+                match second {
+                    2 => player.set_mute(1, true),
+                    3 => player.set_loop(A2Loop::Pattern(1)),
+                    4 => player.pause(),
+                    5 => player.play(),
+                    6 => player.set_loop(A2Loop::Range {
+                        order: 0,
+                        row0: 2,
+                        row1: 9,
+                    }),
+                    7 => player.set_solo(0, true),
+                    8 => player.set_solo(0, false),
+                    9 => player.set_loop(A2Loop::None),
+                    10..=15 => {
+                        let landed = player.apply_edit(&edits[second - 10]);
+                        assert!(landed, "edit {} did not land", second - 10);
+                    }
+                    _ => {}
+                }
+            }
+            player.render(&mut left, &mut right);
+            let status = player.status();
+            assert!(status.speed > 0);
+            let n = player.track_levels(&mut levels);
+            assert_eq!(n, tracks);
+        });
+        assert_eq!(
+            events, 0,
+            "second {second}: block {block} made {events} allocations or frees"
+        );
+        sounded += levels.iter().cloned().fold(0.0, f32::max);
+    }
+    assert!(sounded > 0.0, "the song sounded");
+}
+
+/// The instrument audition: notes on and off, a patch edit under a held note, and
+/// a note struck every few blocks (voices stolen), with no allocation.
+#[test]
+fn opl_audition() {
+    let mut a = OplAudition::new(RATE as f64, FmPatch::plain());
+    let mut patch = FmPatch::plain();
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    assert_no_alloc("OplAudition", 10, |block| {
+        if block % 7 == 0 {
+            a.note_on(
+                48 + (block % 29) as u8,
+                0.5 + (block % 3) as f32 * 0.25,
+                if block % 2 == 0 { 3_000 } else { 0 },
+            );
+        }
+        if block % 23 == 0 {
+            a.note_off(48 + ((block + 5) % 29) as u8);
+        }
+        if block % 31 == 0 {
+            patch.fm[9] = (block % 8) as u8;
+            patch.fm[10] = (block % 16) as u8;
+            a.set_patch(patch);
+        }
+        if block % 301 == 0 {
+            a.all_notes_off();
+        }
+        a.render(&mut left, &mut right);
+    });
 }
 
 /// A tracker module from its very first block (a player allocates nothing
