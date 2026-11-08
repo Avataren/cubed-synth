@@ -41,6 +41,7 @@ pub mod goattracker;
 pub mod noise;
 pub mod player;
 pub mod probe;
+pub mod psid;
 pub mod revision;
 pub mod song;
 pub mod stream;
@@ -80,6 +81,7 @@ mod tests_start_tempo;
 pub use chip::Chip;
 pub use player::{SeekError, SidLoop, SidSongPlayer, SEEK_MAX_FRAMES};
 pub use probe::{SidProbe, SidStatus};
+pub use psid::{PsidFile, PsidPlayer};
 pub use song::SidSong;
 pub use wasm::SidPlayer;
 
