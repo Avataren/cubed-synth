@@ -44,7 +44,9 @@
 //! equal ymfm's own render of them (`golden/regen.sh`).
 
 pub mod a2;
+pub mod audition;
 pub mod chip;
+pub mod fm;
 pub mod operator;
 pub mod resample;
 pub mod tables;
