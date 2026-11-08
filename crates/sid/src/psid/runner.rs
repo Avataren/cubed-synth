@@ -21,7 +21,7 @@
 //! worth, so a player that feeds a chip every few hundred cycles never makes it
 //! grow.
 
-use super::c64::{C64Clock, SidWrite, C64, KERNAL_BRK_HANDLER, NEVER};
+use super::c64::{C64Clock, Kernal, SidWrite, C64, KERNAL_BRK_HANDLER, NEVER};
 use super::file::{PsidError, PsidFile, PsidType};
 use std::fmt;
 
@@ -194,12 +194,22 @@ impl PsidRunner {
     /// [`INIT_MAX_CYCLES`] of it: build it off the audio thread. Never panics for
     /// a tune's behaviour.
     pub fn new(file: &PsidFile, subsong: usize) -> Result<PsidRunner, PsidError> {
+        PsidRunner::with_kernal(file, subsong, Kernal::default())
+    }
+
+    /// [`PsidRunner::new`] on a machine with the stand-in KERNAL of your choice
+    /// (`Kernal::Daw` runs a tune exactly as the DAW's runner does).
+    pub fn with_kernal(
+        file: &PsidFile,
+        subsong: usize,
+        kernal: Kernal,
+    ) -> Result<PsidRunner, PsidError> {
         let clock = if file.clock == super::file::PsidClock::Ntsc {
             C64Clock::Ntsc
         } else {
             C64Clock::Pal
         };
-        let mut machine = C64::new(clock, &file.extra_sids);
+        let mut machine = C64::with_kernal(clock, &file.extra_sids, kernal);
         machine.load(file.load_address, &file.data);
         let song = subsong.min(file.songs as usize - 1);
         let irq_mode = file.kind == PsidType::Rsid || file.play_address == 0;

@@ -82,7 +82,7 @@ const RTS: u8 = 0x60;
 /// "Never": the cycle of an event that cannot happen.
 pub const NEVER: u64 = u64::MAX;
 
-const fn stand_in_kernal() -> [u8; 0x2000] {
+const fn stand_in_kernal(extended: bool) -> [u8; 0x2000] {
     let mut rom = [RTS; 0x2000];
     // The bytes are copied in by address.
     macro_rules! put {
@@ -129,10 +129,40 @@ const fn stand_in_kernal() -> [u8; 0x2000] {
             (KERNAL_IRQ_ENTRY >> 8) as u8
         ]
     );
+    if extended {
+        // Interrupt handlers of RSID tunes end in the middle of the KERNAL's own handler: `$EA34` is where it
+        // goes on after updating the clock (cursor blink, keyboard scan, acknowledge, pull the registers and RTI)
+        // and `$EA7B` is its keyboard scan (`JSR $EA87`, then the acknowledge at `$EA7E`). Without them a
+        // handler that jumps there returns to whatever is on the stack.
+        put!(0xea34u16, [0x4c, 0x7b, 0xea]); // JMP $EA7B
+        put!(0xea7bu16, [0x20, 0x87, 0xea]); // JSR $EA87 (an RTS here), falls into $EA7E
+    }
     rom
 }
 
-static STAND_IN_KERNAL: [u8; 0x2000] = stand_in_kernal();
+static STAND_IN_KERNAL: [u8; 0x2000] = stand_in_kernal(false);
+static STAND_IN_KERNAL_EXTENDED: [u8; 0x2000] = stand_in_kernal(true);
+
+/// Which stand-in KERNAL a machine has (there are no ROM images: see the module docs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kernal {
+    /// The DAW's: the entries and exits listed above, an `RTS` everywhere else. Tunes whose interrupt
+    /// handler ends by jumping into the middle of the real handler (`$EA34`, `$EA7B`) run into it and stop.
+    Daw,
+    /// The DAW's, with those two entries (`$EA34`, `$EA7B`) leading on to the acknowledge and the exit. What
+    /// the DAW's runner does with a tune that does not use them is unchanged. The default.
+    #[default]
+    Extended,
+}
+
+impl Kernal {
+    fn rom(self) -> &'static [u8; 0x2000] {
+        match self {
+            Kernal::Daw => &STAND_IN_KERNAL,
+            Kernal::Extended => &STAND_IN_KERNAL_EXTENDED,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CIA 6526
@@ -669,6 +699,7 @@ pub struct System {
     voice3: Voice3,
     /// Cycle of the next timer/raster event to look at.
     next_event: u64,
+    kernal: &'static [u8; 0x2000],
 }
 
 /// What an interrupt check took.
@@ -687,6 +718,11 @@ impl C64 {
     /// A powered-on machine as the KERNAL leaves it. `extra_sids` are the base
     /// addresses of a second and third SID (at most two are used).
     pub fn new(clock: C64Clock, extra_sids: &[u16]) -> C64 {
+        C64::with_kernal(clock, extra_sids, Kernal::default())
+    }
+
+    /// [`C64::new`] with the stand-in KERNAL of your choice.
+    pub fn with_kernal(clock: C64Clock, extra_sids: &[u16], kernal: Kernal) -> C64 {
         let timing = clock.timing();
         let mut sid_bases = [0xd400, 0, 0];
         let mut sid_count = 1;
@@ -718,6 +754,7 @@ impl C64 {
             sid_bus: 0,
             voice3: Voice3::new(),
             next_event: NEVER,
+            kernal: kernal.rom(),
         };
         let ram = &mut sys.ram;
         ram[0x00] = 0x2f;
@@ -1087,7 +1124,7 @@ impl System {
                 }
             } else if addr >= 0xe000 {
                 if self.kernal_in {
-                    return STAND_IN_KERNAL[addr as usize - 0xe000];
+                    return self.kernal[addr as usize - 0xe000];
                 }
             } else if addr >= 0xd000 && self.io_in {
                 return self.read_io(addr, now);

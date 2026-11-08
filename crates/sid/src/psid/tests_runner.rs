@@ -1,6 +1,8 @@
 //! The C64 around the CPU, the runner and the file parser.
 
-use super::c64::{C64Clock, Taken, C64, KERNAL_BRK_HANDLER, KERNAL_IRQ_ENTRY, KERNAL_NMI_ENTRY};
+use super::c64::{
+    C64Clock, Kernal, Taken, C64, KERNAL_BRK_HANDLER, KERNAL_IRQ_ENTRY, KERNAL_NMI_ENTRY,
+};
 use super::cpu::{I, U};
 use super::file::{PsidClock, PsidError, PsidFile, PsidSidModel, PsidType};
 use super::runner::{
@@ -931,4 +933,62 @@ fn bad_files_are_refused_with_the_reason() {
     assert!(reason(&b).starts_with("it is a C64 BASIC program"));
     assert!(super::file::looks_like_psid(&ok));
     assert!(!super::file::looks_like_psid(b"PSI"));
+}
+
+/// An RSID whose CIA interrupt handler counts into `$D400` and leaves through `exit` (a jump into the real KERNAL).
+fn irq_tune_leaving_through(exit: u16) -> PsidFile {
+    let init: Vec<u8> = vec![
+        0x78, 0xa9, 0x30, 0x8d, 0x14, 0x03, 0xa9, 0x10, 0x8d, 0x15, 0x03, 0xa9, 0x7f, 0x8d, 0x0d,
+        0xdc, 0xa9, 0x0f, 0x8d, 0x04, 0xdc, 0xa9, 0x27, 0x8d, 0x05, 0xdc, 0xa9, 0x81, 0x8d, 0x0d,
+        0xdc, 0xa9, 0x11, 0x8d, 0x0e, 0xdc, 0x58, 0x60,
+    ];
+    let handler = [
+        0xe6,
+        0xf0,
+        0xa5,
+        0xf0,
+        0x8d,
+        0x00,
+        0xd4,
+        0x4c,
+        (exit & 0xff) as u8,
+        (exit >> 8) as u8,
+    ];
+    file_of(&build_psid(
+        &Header {
+            magic: b"RSID",
+            play: 0,
+            ..Header::default()
+        },
+        &place_code(&[(0x00, &init), (0x30, &handler)]),
+    ))
+}
+
+#[test]
+fn a_handler_that_ends_in_the_middle_of_the_real_kernal_handler_runs_on_the_extended_stand_in() {
+    // $EA34 (after the clock update) and $EA7B (the keyboard scan) both lead to the acknowledge at $EA7E and the exit.
+    for exit in [0xea34u16, 0xea7b, 0xea7e, 0xea81] {
+        let file = irq_tune_leaving_through(exit);
+        // ($EA81 pulls the registers and returns without acknowledging CIA 1: the interrupt line stays held and
+        // the handler runs again at once, so it counts far more often: only the first two exits are timed.)
+        let mut r = PsidRunner::with_kernal(&file, 0, Kernal::Extended).unwrap();
+        let w = writes_over(&mut r, 100_000, 700);
+        let d400: Vec<_> = w.iter().filter(|w| w.1 == 0).collect();
+        assert!(d400.len() >= 9, "exit {exit:#x}: {} writes", d400.len());
+        assert_eq!(r.ended(), None, "exit {exit:#x}");
+        if exit == 0xea34 || exit == 0xea7b || exit == 0xea7e {
+            let gaps: Vec<_> = d400.windows(2).map(|p| p[1].0 - p[0].0).collect();
+            assert!(
+                gaps.iter().all(|&g| g == 10_000),
+                "exit {exit:#x}: {gaps:?}"
+            );
+        }
+    }
+    // On the DAW's stand-in those two are RTS: the handler returns to the stack's contents, which are zeros: a BRK.
+    for exit in [0xea34u16, 0xea7b] {
+        let mut r =
+            PsidRunner::with_kernal(&irq_tune_leaving_through(exit), 0, Kernal::Daw).unwrap();
+        r.advance(200_000);
+        assert_eq!(r.ended(), Some(EndReason::Brk), "exit {exit:#x}");
+    }
 }

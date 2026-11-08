@@ -748,7 +748,7 @@ player.render_stereo(&mut left, &mut right);            // the mono signal in bo
 | | |
 |---|---|
 | `PsidFile::parse(bytes)` | The header of PSID and RSID, versions 1-4: load, init and play addresses, songs, start song, per-song speed bits (`uses_cia(song)`), PAL/NTSC, the SID model(s), the second and third SID's address, name/author/released. A file this cannot run is refused with a reason (`PsidError`, the DAW's words): no magic, bad header, Compute!'s Sidplayer data (MUS), an RSID that is a BASIC program, an init that jams, hits a BRK or runs past 60 million cycles |
-| `PsidPlayer::new / from_file` | Options: `subsong` (0-based; the header's start song when `None`) and `model` (`Sid6581`/`Sid8580`; the file's tag, else a 6581, as HVSC's players do). The chip runs at the file's clock (985 248 Hz PAL, 1 022 727 NTSC), so pitch and speed are the machine's |
+| `PsidPlayer::new / from_file` | Options: `subsong` (0-based; the header's start song when `None`), `model` (`Sid6581`/`Sid8580`; the file's tag, else a 6581, as HVSC's players do) and `kernal` (`Kernal::Extended`, the default, or `Kernal::Daw`: below). The chip runs at the file's clock (985 248 Hz PAL, 1 022 727 NTSC), so pitch and speed are the machine's |
 | `render`, `render_taps`, `render_stereo` | Mono mix of the chips (taps: the first chip's voices); `render_taps` gives the mix `render` does, sample for sample |
 | `ended() -> Option<EndReason>`, `song_end_reached()` | A tune has no length (nearly all loop for ever); the only end is a play routine or an RSID that jams the CPU, hits a BRK, or does not return from a play call in 2 million cycles. The chips keep sounding what they hold |
 | `position_seconds()`, `frames()`, `subsong()`, `subsongs()`, `file()`, `sid_count()`, `chip(i)`, `chip_mut(i)` | Reading it; `chip_mut` is for a settings change (`set_revision`, `set_model`), not for clocking |
@@ -782,7 +782,10 @@ KERNAL's IRQ entry (`$FF48`, `JMP ($0314)`), CIA 1 and 2 timers (timer B may cou
 interrupt, an NMI from CIA 2. **The machine** (`psid::c64`) is 64 KB of RAM with the 6510's `$01` banking, the
 SID (voice 3's `$D41B`/`$D41C` modelled, since players use them as random numbers), CIA 1/2, the VIC's raster
 (PAL 312 x 63, NTSC 263 x 65) and a small KERNAL of our own (no ROM images): its vectors and exits return, every
-other routine is an `RTS`. **The CPU** (`psid::cpu`) is every NMOS opcode, decimal-mode ADC/SBC included, the
+other routine is an `RTS`. The DAW's stand-in (`Kernal::Daw`) leaves two places of the real IRQ handler as `RTS`,
+`$EA34` (after the clock update) and `$EA7B` (the keyboard scan), which many RSID tunes' handlers end by
+jumping to; the default `Kernal::Extended` has them lead on to the acknowledge at `$EA7E` and the exit, and a
+tune that does not use them runs exactly as in the DAW. **The CPU** (`psid::cpu`) is every NMOS opcode, decimal-mode ADC/SBC included, the
 undocumented ones tunes use (SLO RLA SRE RRA SAX LAX DCP ISC ANC ALR ARR SBX, the NOPs, LAS, SHA/SHX/SHY/TAS,
 ANE/LXA with `$EE`), the twelve JAMs, and the documented cycle counts with page-crossing and branch penalties.
 A write is stamped with the cycle its instruction started on.
@@ -808,8 +811,11 @@ mirrors of the first.
 - Against the DAW: `tests/fixtures/psid/oracle.ts` runs the DAW's own `PsidRunner` over a list of tunes and records
   the first N seconds of writes to the first SID (cycle, register, value) as a count and a hash. `CUBED_PSID_ORACLE`
   makes `tests/psid.rs` compare. On HVSC 85 (61 157 `.sid` files, 10 seconds of the start song of each) **every
-  tune's write stream is identical to the DAW's**: the same files refused, the same failures, the same writes at the
-  same cycles.
+  tune's write stream is identical to the DAW's** (`Kernal::Daw`): the same files refused, the same failures, the same
+  writes at the same cycles; and identical on the extended KERNAL for every tune the DAW plays, bar one that the
+  DAW plays by luck (`3_Oversample.sid`, a sample player: its handler jumps into `$EA7B`, the DAW's run returns to
+  stack garbage and writes the volume register 7 500 times in ten seconds, the extended one 73 700, a 7.4 kHz
+  sample).
 
 ```sh
 cargo test -p cubed-sid --test psid                       # the synthetic tunes
@@ -828,16 +834,17 @@ cargo run --release -p cubed-sid --example psid_play -- tune.sid 1 30 out.wav   
 every n-th for real) and prints the tunes that do not play, grouped; `CUBED_PSID_STRICT=1` makes it fail on any
 but a refused file. Both tests skip when their variable is unset.
 
-**Known gaps** (the DAW's too, on the same files). HVSC 85: of 61 157 tunes 589 (1.0%) are RSID BASIC programs and
-are refused (they need the C64's BASIC ROM, which is not ours to ship); 362 hit a BRK, 79 stop the CPU and 3 never
-return from a play call or write nothing in their first ten seconds (about 0.7%): tunes that call into the real
-KERNAL (this one's routines are `RTS`) or read ROM contents, or lean on timing the model does not have. The
-rest play. Not modelled: sample playback through NMI handlers in a PSID that has a play address (the host-driven
-call runs with interrupts off, as the DAW's does; a PSID with play address 0 and every RSID run their interrupts
-and do play samples written to `$D418`), PlaySID's own sample registers, the VIC's bad lines and sprite DMA (a
-write is where the instruction count puts it, not where the cycles stolen from the CPU would), CIA TOD, serial
-and ports, the keyboard and joysticks. The unstable opcodes use their common behaviour. A tune has no stored
-length (HVSC's Songlengths database is not read): it loops until stopped.
+**Known gaps.** HVSC 85, 61 157 tunes: 589 (1.0%) are RSID BASIC programs and are refused (they need the C64's
+BASIC ROM, which is not ours to ship). The DAW's runner stops 444 others in their first ten seconds (0.7%: 362 hit a
+BRK, 79 stop the CPU, 3 never return from a play call), 441 of them RSIDs, and 353 of those play on with the extended
+KERNAL (the handler ends in the real handler at `$EA34`/`$EA7B`); 91 (0.15%) still stop or write nothing: a tune that
+calls into the real KERNAL or BASIC (here every routine is an `RTS`), reads ROM contents, jumps into a loader's
+address, or leans on timing the model does not have. Not modelled: sample playback through NMI handlers in a PSID
+that has a play address (the host-driven call runs with interrupts off, as the DAW's does; a PSID with play address 0
+and every RSID run their interrupts and do play samples written to `$D418`), PlaySID's own sample registers, the
+VIC's bad lines and sprite DMA (a write is where the instruction count puts it, not where the cycles stolen from
+the CPU would), CIA TOD, serial and ports, the keyboard and joysticks. The unstable opcodes use their common
+behaviour. A tune has no stored length (HVSC's Songlengths database is not read): it loops until stopped.
 
 ## Building, testing, benchmarks
 

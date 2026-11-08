@@ -82,6 +82,7 @@ fn psid_player_renders_without_allocating() {
                 PsidOptions {
                     subsong: None,
                     model: Some(model),
+                    ..Default::default()
                 },
             )
             .unwrap_or_else(|e| panic!("{name}: {e}"));

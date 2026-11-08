@@ -11,7 +11,7 @@
 //!
 //! cargo test --release -p cubed-sid --test psid -- --nocapture
 
-use cubed_sid::psid::{EndReason, PsidFile, PsidOptions, PsidPlayer, PsidRunner, RunMode};
+use cubed_sid::psid::{EndReason, Kernal, PsidFile, PsidOptions, PsidPlayer, PsidRunner, RunMode};
 use cubed_sid::{Chip, SidModel};
 use std::path::{Path, PathBuf};
 
@@ -312,6 +312,7 @@ fn the_player_renders_exactly_what_the_chip_does_with_the_same_writes() {
                 PsidOptions {
                     subsong: Some(subsong),
                     model: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -332,6 +333,7 @@ fn the_arpeggio_sounds_its_notes() {
         PsidOptions {
             subsong: Some(0),
             model: Some(SidModel::Sid8580),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -363,6 +365,7 @@ fn the_arpeggio_sounds_its_notes() {
         PsidOptions {
             subsong: Some(0),
             model: Some(SidModel::Sid8580),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -769,6 +772,11 @@ fn fnv(writes: &[(u64, u8, u8)]) -> u32 {
     h
 }
 
+/// Tunes the DAW plays by luck (its handler ends in the middle of the real KERNAL, which returns to whatever was on
+/// the stack and goes on) that play properly on the extended KERNAL. `3_Oversample.sid` is a sample player: the DAW's
+/// run writes the volume register 7 500 times in ten seconds, the extended one 73 700 times (a 7.4 kHz sample).
+const EXTENDED_PLAYS_ON: &[&str] = &["DEMOS/0-9/3_Oversample.sid"];
+
 #[test]
 fn oracle_the_daws_runner_writes_the_same() {
     let Some(json) = std::env::var_os("CUBED_PSID_ORACLE") else {
@@ -779,42 +787,87 @@ fn oracle_the_daws_runner_writes_the_same() {
     let oracle: serde_json::Value = serde_json::from_slice(&std::fs::read(json).unwrap()).unwrap();
     let entries: Vec<(&String, &serde_json::Value)> = oracle.as_object().unwrap().iter().collect();
     let threads = 4;
-    let mismatches: Vec<String> = std::thread::scope(|s| {
+    // Each tune runs on the DAW's own KERNAL stand-in, where it must write exactly what the DAW's runner does,
+    // and on the extended one, where it must write the same for every tune the DAW plays, and may play on
+    // where the DAW's tune stopped.
+    let results: Vec<(Vec<String>, Vec<String>, usize, usize)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|k| {
                 let entries = &entries;
                 s.spawn(move || {
-                    let mut bad = vec![];
+                    let (mut daw, mut ext, mut rescued, mut still) = (vec![], vec![], 0, 0);
                     for (path, want) in entries.iter().skip(k).step_by(threads) {
-                        if let Some(m) = compare_with_oracle(path, want, seconds) {
-                            bad.push(format!("{path}: {m}"));
+                        if let Some(m) = compare_with_oracle(path, want, seconds, Kernal::Daw) {
+                            daw.push(format!("{path}: {m}"));
+                        }
+                        if want["ok"] == true && want["ended"].is_string() {
+                            // A tune the DAW stops: what does the extended KERNAL do with it?
+                            match run_ten_seconds(path, seconds) {
+                                None => still += 1,
+                                Some(true) => rescued += 1,
+                                Some(false) => still += 1,
+                            }
+                        } else if let Some(m) =
+                            compare_with_oracle(path, want, seconds, Kernal::Extended)
+                        {
+                            if !EXTENDED_PLAYS_ON.iter().any(|name| path.ends_with(name)) {
+                                ext.push(format!("{path}: {m}"));
+                            }
                         }
                     }
-                    bad
+                    (daw, ext, rescued, still)
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect()
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    let daw: Vec<&String> = results.iter().flat_map(|r| &r.0).collect();
+    let ext: Vec<&String> = results.iter().flat_map(|r| &r.1).collect();
+    let rescued: usize = results.iter().map(|r| r.2).sum();
+    let still: usize = results.iter().map(|r| r.3).sum();
     eprintln!(
-        "oracle: {} tunes compared, {} differ",
+        "oracle: {} tunes compared; on the DAW's KERNAL {} differ; on the extended KERNAL {} differ; of the tunes the DAW stops, {rescued} play on for {seconds} s and {still} still stop or write nothing",
         entries.len(),
-        mismatches.len()
+        daw.len(),
+        ext.len()
     );
-    for m in mismatches.iter().take(40) {
+    for m in daw.iter().chain(ext.iter()).take(40) {
         eprintln!("  {m}");
     }
     assert!(
-        mismatches.is_empty(),
+        daw.is_empty(),
         "{} tunes differ from the DAW's runner",
-        mismatches.len()
+        daw.len()
+    );
+    assert!(
+        ext.is_empty(),
+        "{} tunes the DAW plays differ on the extended KERNAL",
+        ext.len()
     );
 }
 
-fn compare_with_oracle(path: &str, want: &serde_json::Value, seconds: f64) -> Option<String> {
+/// Whether a tune the DAW stops plays its first `seconds` on the extended KERNAL: it neither ends nor stays
+/// silent in its writes; `None` when it does not start.
+fn run_ten_seconds(path: &str, seconds: f64) -> Option<bool> {
+    let file = PsidFile::parse(&std::fs::read(path).ok()?).ok()?;
+    let mut r = PsidRunner::new(&file, file.start_subsong()).ok()?;
+    let cycles = (r.clock_hz() as f64 * seconds) as u64;
+    let mut writes = 0;
+    let mut t = 0;
+    while t < cycles {
+        t = (t + 100_000).min(cycles);
+        r.advance(t);
+        r.drain(t, 3, |_| writes += 1);
+    }
+    Some(r.ended().is_none() && writes > 0)
+}
+
+fn compare_with_oracle(
+    path: &str,
+    want: &serde_json::Value,
+    seconds: f64,
+    kernal: Kernal,
+) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     // The DAW's messages say "this importer" where this player says "this player".
     let mut want = want.clone();
@@ -832,7 +885,7 @@ fn compare_with_oracle(path: &str, want: &serde_json::Value, seconds: f64) -> Op
             };
         }
     };
-    let mut r = match PsidRunner::new(&file, file.start_subsong()) {
+    let mut r = match PsidRunner::with_kernal(&file, file.start_subsong(), kernal) {
         Ok(r) => r,
         Err(e) => {
             return if want["ok"] == false && want["reason"] == e.to_string() {

@@ -25,6 +25,7 @@
 //! They are summed into one mono signal, divided by the number of chips, so
 //! three chips never clip where one would not.
 
+use super::c64::Kernal;
 use super::file::{PsidError, PsidFile, PsidSidModel};
 use super::runner::{EndReason, PsidRunner};
 use crate::chip::{Chip, ALL_VOICES};
@@ -52,6 +53,9 @@ pub struct PsidOptions {
     /// The chip to play on; the file's own when `None`, and a 6581 when the
     /// file says nothing (or "either"), as HVSC's players do.
     pub model: Option<SidModel>,
+    /// The stand-in KERNAL (see [`Kernal`]): the DAW's plus two entries of the real
+    /// handler by default.
+    pub kernal: Kernal,
 }
 
 /// Why a seek did not happen.
@@ -87,6 +91,7 @@ pub struct PsidPlayer {
     subsong: usize,
     /// The model the user chose (kept across a restart), if any.
     chosen_model: Option<SidModel>,
+    kernal: Kernal,
     /// Time in cycles from the start of playback: where the runner has been run to.
     cycle: u64,
     /// Samples rendered since the start of playback.
@@ -118,7 +123,8 @@ impl PsidPlayer {
             .subsong
             .unwrap_or_else(|| file.start_subsong())
             .min(file.songs as usize - 1);
-        let (runner, chips) = Self::build(&file, subsong, sample_rate, options.model)?;
+        let (runner, chips) =
+            Self::build(&file, subsong, sample_rate, options.model, options.kernal)?;
         let cps = runner.clock_hz() as f64 / sample_rate;
         let stretch_samples = ((STRETCH_CYCLES / cps) as usize).clamp(1, MAX_STRETCH_SAMPLES);
         let mut player = PsidPlayer {
@@ -128,6 +134,7 @@ impl PsidPlayer {
             sample_rate,
             subsong,
             chosen_model: options.model,
+            kernal: options.kernal,
             cycle: 0,
             frames: 0,
             stretch_samples,
@@ -145,8 +152,9 @@ impl PsidPlayer {
         subsong: usize,
         sample_rate: f64,
         model: Option<SidModel>,
+        kernal: Kernal,
     ) -> Result<(PsidRunner, Vec<Chip>), PsidError> {
-        let runner = PsidRunner::new(file, subsong)?;
+        let runner = PsidRunner::with_kernal(file, subsong, kernal)?;
         let first = model.unwrap_or_else(|| model_of(file.sid_model, SidModel::Sid6581));
         let mut chips = Vec::with_capacity(runner.sid_count());
         for i in 0..runner.sid_count() {
@@ -291,8 +299,13 @@ impl PsidPlayer {
         let subsong = subsong
             .unwrap_or(self.subsong)
             .min(self.file.songs as usize - 1);
-        let (runner, chips) =
-            Self::build(&self.file, subsong, self.sample_rate, self.chosen_model)?;
+        let (runner, chips) = Self::build(
+            &self.file,
+            subsong,
+            self.sample_rate,
+            self.chosen_model,
+            self.kernal,
+        )?;
         self.runner = runner;
         self.chips = chips;
         self.subsong = subsong;

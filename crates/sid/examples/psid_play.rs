@@ -28,6 +28,7 @@ fn main() {
     let options = PsidOptions {
         subsong: subsong.checked_sub(1),
         model: None,
+        ..Default::default()
     };
     let mut player = PsidPlayer::new(&bytes, rate, options).unwrap_or_else(|e| {
         eprintln!("{path}: {e}");
