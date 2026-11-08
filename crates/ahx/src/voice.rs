@@ -311,6 +311,22 @@ pub struct Voice {
 impl Voice {
     /// `hvl_reset_some_stuff`, `hvl_replay.c:26-64`.
     pub fn new() -> Self {
+        Voice::with_buffers(vec![0i8; 0x281], vec![0i8; 0x281])
+    }
+
+    /// [`Voice::new`] in place: the same voice, built from this one's own wave
+    /// buffers (cleared), so a rewind or a seek allocates nothing.
+    pub fn reset(&mut self) {
+        let mut wave = std::mem::take(&mut self.voice_buffer);
+        let mut ring = std::mem::take(&mut self.ring_voice_buffer);
+        wave.clear();
+        wave.resize(0x281, 0);
+        ring.clear();
+        ring.resize(0x281, 0);
+        *self = Voice::with_buffers(wave, ring);
+    }
+
+    fn with_buffers(voice_buffer: Vec<i8>, ring_voice_buffer: Vec<i8>) -> Self {
         Voice {
             track: 0,
             next_track: 0,
@@ -364,7 +380,7 @@ impl Voice {
             note_cut_on: false,
             note_cut_wait: 0,
             wn_random: 0x280,
-            voice_buffer: vec![0i8; 0x281],
+            voice_buffer,
             hifi: None,
             square_temp_buffer: [0i8; 0x80],
             track_on: true,
@@ -384,7 +400,7 @@ impl Voice {
             ring_new_waveform: false,
             ring_waveform: 0,
             ring_fixed_period: false,
-            ring_voice_buffer: vec![0i8; 0x281],
+            ring_voice_buffer,
         }
     }
 

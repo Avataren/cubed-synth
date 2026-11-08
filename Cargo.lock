@@ -137,6 +137,7 @@ dependencies = [
  "once_cell",
  "rustc-hash",
  "rustfft",
+ "serde_json",
  "wasm-bindgen",
 ]
 

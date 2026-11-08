@@ -33,11 +33,14 @@
 #![allow(clippy::doc_overindented_list_items)]
 
 pub mod chip;
+#[cfg(feature = "edit")]
+pub mod edit;
 pub mod envelope;
 pub mod filter;
 pub mod goattracker;
 pub mod noise;
 pub mod player;
+pub mod probe;
 pub mod revision;
 pub mod song;
 pub mod stream;
@@ -75,7 +78,8 @@ mod tests_soasc;
 mod tests_start_tempo;
 
 pub use chip::Chip;
-pub use player::SidSongPlayer;
+pub use player::{SeekError, SidLoop, SidSongPlayer, SEEK_MAX_FRAMES};
+pub use probe::{SidProbe, SidStatus};
 pub use song::SidSong;
 pub use wasm::SidPlayer;
 

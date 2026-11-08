@@ -62,3 +62,7 @@ opt-level = 1
 # the edit layer's tests save a song after every operation.
 [profile.dev.package.cubed-opl]
 opt-level = 1
+
+# The chip is cycle-counted: unoptimized, a second of song takes seconds to test.
+[profile.dev.package.cubed-sid]
+opt-level = 1

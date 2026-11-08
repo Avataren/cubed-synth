@@ -82,12 +82,10 @@ impl SidPlayer {
     pub fn set_mute_solo(&mut self, mute: u32, solo: u32) {
         self.mute = mute;
         self.solo = solo;
-        let heard = if solo & ALL_VOICES as u32 != 0 {
-            solo
-        } else {
-            ALL_VOICES as u32
-        };
-        self.player.chip_mut().set_voice_mask((heard & !mute) as u8);
+        self.player.set_mute_solo(
+            (mute & ALL_VOICES as u32) as u8,
+            (solo & ALL_VOICES as u32) as u8,
+        );
     }
 
     /// Fills `out` with the mix and `v0`..`v2` with the three voices' taps;
