@@ -9,6 +9,10 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
+default = ["edit"]
+# The edit layer (`AhxDoc`: operations as JSON, undo and redo). Nothing in a
+# player calls it, so a worklet drops it at link time.
+edit = ["dep:serde_json"]
 # wasm-bindgen classes for the browser (another_synth's AHX worklet).
 wasm = ["dep:wasm-bindgen"]
 # std::simd on a nightly toolchain instead of the stable fallback.
@@ -19,6 +23,7 @@ cubed-simd.workspace = true
 once_cell.workspace = true
 rustc-hash.workspace = true
 rustfft.workspace = true
+serde_json = { workspace = true, optional = true }
 wasm-bindgen = { workspace = true, optional = true }
 
 [dev-dependencies]

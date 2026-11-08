@@ -198,20 +198,27 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Reads a NUL-terminated string starting at `offset`. Returns an empty
-/// string if `offset` is out of bounds (mirrors the reference's `nptr <
-/// buf+buflen` guard for instrument names run off the end of a truncated
-/// file, rather than treating it as fatal).
-fn read_cstring(buf: &[u8], offset: usize) -> String {
+/// Reads a NUL-terminated string starting at `offset`: its text and how many
+/// bytes it took (without the NUL). Returns an empty string if `offset` is out
+/// of bounds (mirrors the reference's `nptr < buf+buflen` guard for instrument
+/// names run off the end of a truncated file, rather than treating it as fatal).
+///
+/// The bytes are Latin-1, one character each (the DAW's reader does the same,
+/// and the writer in `write.rs` is its inverse): `from_utf8_lossy` would turn
+/// every byte over 0x7f into U+FFFD, and the length of that text is not the
+/// length of the bytes, so the instrument names after it were read from the
+/// wrong place.
+fn read_cstring(buf: &[u8], offset: usize) -> (String, usize) {
     if offset >= buf.len() {
-        return String::new();
+        return (String::new(), 0);
     }
     let end = buf[offset..]
         .iter()
         .position(|&b| b == 0)
         .map(|i| offset + i)
         .unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[offset..end]).into_owned()
+    let text = buf[offset..end].iter().map(|&b| b as char).collect();
+    (text, end - offset)
 }
 
 /// Shared 22-byte instrument core, identical byte layout in AHX and HVL
@@ -384,8 +391,8 @@ fn parse_ahx(buf: &[u8]) -> Result<Song, AhxParseError> {
     let blank_first_track = (b6 & 0x80) != 0;
 
     let name_offset = r.u16be(4, "name offset")? as usize;
-    let name = read_cstring(buf, name_offset);
-    let mut nptr = name_offset + name.len() + 1;
+    let (name, name_len) = read_cstring(buf, name_offset);
+    let mut nptr = name_offset + name_len + 1;
 
     let mut pos = 14usize;
 
@@ -440,8 +447,8 @@ fn parse_ahx(buf: &[u8]) -> Result<Song, AhxParseError> {
     instruments.push(Instrument::default());
     for _ in 1..=insn {
         let iname = if nptr < buf.len() {
-            let s = read_cstring(buf, nptr);
-            nptr += s.len() + 1;
+            let (s, len) = read_cstring(buf, nptr);
+            nptr += len + 1;
             s
         } else {
             String::new()
@@ -518,8 +525,8 @@ fn parse_hvl(buf: &[u8]) -> Result<Song, AhxParseError> {
     let defstereo = r.u8(15, "header")?;
 
     let name_offset = r.u16be(4, "name offset")? as usize;
-    let name = read_cstring(buf, name_offset);
-    let mut nptr = name_offset + name.len() + 1;
+    let (name, name_len) = read_cstring(buf, name_offset);
+    let mut nptr = name_offset + name_len + 1;
 
     let mut pos = 16usize;
 
@@ -577,8 +584,8 @@ fn parse_hvl(buf: &[u8]) -> Result<Song, AhxParseError> {
     instruments.push(Instrument::default());
     for _ in 1..=insn {
         let iname = if nptr < buf.len() {
-            let s = read_cstring(buf, nptr);
-            nptr += s.len() + 1;
+            let (s, len) = read_cstring(buf, nptr);
+            nptr += len + 1;
             s
         } else {
             String::new()

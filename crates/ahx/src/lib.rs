@@ -16,6 +16,7 @@ pub mod player;
 pub mod plist;
 pub mod voice;
 pub mod waveform;
+pub mod write;
 
 /// Stores into the reference's `int16` fields (`hvl_replay.h:91-188`) wrap
 /// modulo 2^16 (gcc, two's complement). Rust `i32` arithmetic would not, so
