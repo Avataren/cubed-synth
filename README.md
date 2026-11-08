@@ -10,7 +10,7 @@ in a browser AudioWorklet and in a native audio callback.
 | `cubed-sid` | MOS 6581/8580 SID chip (with measured 6581 revisions), a GoatTracker-style song player for the `ASID` song file, GoatTracker 1 and 2 `.sng` import (`goattracker`, another_synth's importer ported byte for byte), and a register-stream chip player (`stream`) |
 | `cubed-ahx` | AHX / HivelyTracker (`.ahx`, `.hvl`) parser and replayer, bit-exact against `hvl_replay.c`, with a band-limited "hifi" path |
 | `cubed-opl` | Yamaha OPL2/OPL3 FM chip (a port of ymfm's OPL path) and an Adlib Tracker II (`.a2m`) parser and player |
-| `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. An `Observer` sees every row and command; a `Probe` shows the position, per-channel levels and scopes of a playing player, which also takes live control (stop and play, seek, loops, mute and solo, note preview) |
+| `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. The writers (`write_mod`, `write_s3m`, `write_xm`) and `edit::ModuleDoc`, which edits a module as data with JSON operations, format limits and undo. An `Observer` sees every row and command; a `Probe` shows the position, per-channel levels and scopes of a playing player, which also takes live control (stop and play, seek, loops, mute and solo, note preview) |
 | `cubed-dsp` | The synth engine: audio graph, oscillators (analog, wavetable), envelopes, LFOs, filters, chorus, delay, reverb, convolver, compressor, limiter, EQ, voices, automation and patch loading; a catalogue of its node types, patch documents that are edited as data, and live parameter edits |
 | `cubed-simd` | The slice of `std::simd` the crates above use, on stable Rust |
 | `cubed-mixer` | A game audio mixer: named buses with faders, mute/solo, inserts (built-in `effects` with live parameters), sends and ducking; clip voices and sources (chip songs, streams, synth patches played by note events), 2D/3D placement with doppler, long fades, meters; nothing allocates while it runs. `native` adds a cpal output host and streams fed from another thread; `songs` plays AHX/HVL, A2M and SID songs and MOD/S3M/XM modules as sources (a module can be steered and read while it plays); `wire` encodes its commands as bytes |
@@ -33,6 +33,8 @@ in a browser AudioWorklet and in a native audio callback.
   chip-music and module players as mixer sources.
 - `adlib` (`cubed-tracker`, on by default): S3M AdLib instruments, on a `cubed-opl`
   chip.
+- `edit` (`cubed-tracker`, on by default): `cubed_tracker::edit`, the module edit layer
+  (needs `serde_json`; nothing in a player calls it, so a worklet drops it at link time).
 
 Every crate builds for `wasm32-unknown-unknown` with its default features and no JS
 glue. There `cubed-dsp` seeds its random number generators from
@@ -275,6 +277,109 @@ a new song: build the edited module (`open_module(.., stopped = true)`), `Prepar
 slot, and send one batch: `swap_commands(old, PlaySource{..}, fade)` followed by `Seek` to the old
 song's position, the same `Loop`, mute and solo masks and `Play` for the new voice. The old voice
 fades out under the new one, which starts the row from a clean state.
+
+## Editing and writing tracker modules (a pattern editor's data layer)
+
+`cubed_tracker::edit::ModuleDoc` holds a `Module` (MOD, S3M or XM) and edits it the way the original
+trackers did, in the style of `PatchDoc`: typed methods and one JSON entry point, `apply(&Value) ->
+Result<Value, String>`. Every change is checked against the format's limits and a change that does not
+fit is refused with a message and leaves the module as it was (a failed `batch` leaves none of its
+operations). `to_bytes(format)` writes the module (the module's own format only: nothing converts
+between formats), `from_bytes` reads one, `ModuleDoc::new(format)` makes an empty one, `module()`
+borrows the `Module` to play (`cubed_mixer::songs::open_module(doc.module().clone(), ...)`).
+
+**Numbers.** Patterns, rows, channels, orders count from 0; instruments and samples as a cell names them
+from 1 (0 is none); inside an XM instrument its samples count from 0. Ranges (`row0..row1`,
+`channel0..channel1`) include both ends. **A cell** is `[note, instrument, volume, effect, param]`:
+
+| field | meaning |
+|---|---|
+| `note` | 0 none, 255 key off, else a MIDI number (60 is middle C) in every format. MOD: C-1 (24) to B-3 (59), or seven octaves down to 1 when the module is not limited to ProTracker's periods. S3M: C-0 (24) to B-7 (119). XM: C-0 (12) to B-7 (107). Trackers count octaves differently: `info().note.octave_offset` is what to take from `note / 12` (MOD, XM 1: 60 is `C-4`; S3M 2: 72 is `C-4`, as ST3 shows it). `note_name`/`parse_note` do the text. MIDI 0 cannot be told from an empty note: a 7-octave MOD's lowest note is 1. |
+| `instrument` | MOD, S3M: the sample number; XM: the instrument. Must exist. |
+| `volume` | The volume column byte as the file holds it, 0 for none: 0x10-0x50 is volume 0-64; an XM's 0x60-0xFF are its volume-column commands. A MOD has none (use `C`). |
+| `effect`, `param` | The command number as the file holds it: MOD and XM `0`-`9`, `A`=10 .. (XM: `G`=16, `H`=17, `K`=20, `L`=21, `P`=25, `R`=27, `T`=29, `X`=33), S3M `A`=1 .. `Z`=26. Operations also take the letter as text. A MOD's are 0-F; an S3M's `C` takes two decimal digits (ST3 drops others). |
+
+A MOD cell also keeps the Amiga period; it follows the note (ProTracker's table) and `copy_range` adds the exact
+period as a sixth number when a cell's is not the table's. Reads: `info()` (format, title, sizes, speed and tempo,
+flags, note range, limits, history state), `rows(pattern, row0, count, flat)` (`cells[row][channel]`, or one flat
+array), `order()`, `samples()`, `instruments()` (a MOD's or S3M's sample slots are instruments of one sample),
+`sample_peaks` (min/max buckets for a waveform), `sample_wav`, `validate()` (what the format cannot hold, and what
+the writer refuses). Every JSON edit returns `{"changed": {"patterns": [{pattern, row0, row1}], "layout",
+"orders", "header", "channels", "instruments": [n], "instrument_list"}}` and its own fields.
+
+**Operations** (`{"op": ..., fields}`):
+
+| group | ops |
+|---|---|
+| cells | `set_cell` (`pattern`, `row`, `channel`, `cell: [..]` or any of `note`, `instrument`, `volume`, `effect`, `param`; notes may be `"C-4"`, `"off"`, effects letters), `clear_range` (+ `columns`), `insert_row` / `delete_row` (`row`, `count`, optional channel range; rows pushed off the end are lost), `transpose` (range, `semitones`, `clamp`, `instrument`; a note out of the format's range refuses the edit unless `clamp`), `copy_range` -> clip, `paste` (`cells`, `mode`: `overwrite` or `mix` which fills only empty fields; a cell the format cannot hold refuses the paste, one running past the pattern is cut and `clipped` says so) |
+| patterns | `set_pattern_rows` (XM 1-256; MOD and S3M are 64; shortening over data needs `force`), `new_pattern` (appends), `duplicate_pattern`, `delete_pattern` (its orders go, later numbers shift) |
+| orders | `set_order`, `insert_order`, `delete_order`, `move_order`, `set_restart` (XM; a MOD or S3M has none: use `Bxx`) |
+| song | `set_speed`, `set_tempo` (a MOD has no header field: they become `Fxx` on the first row), `set_title`, `set_global_volume` (S3M), `set_flag` (`linear_frequency` XM; `amiga_limits`, `fast_volume_slides` S3M; `amiga_limits`, `vblank_timing` MOD), `set_channels` (MOD 1-32 by signature, 4 in the Soundtracker layouts; S3M, XM 1-32; dropping channels with data needs `force`), `set_channel` (S3M pan 0-15, mute), `set_mod_flavor` |
+| samples | `set_sample` (`name`, `volume`, `finetune` MOD -8..7 / XM -128..127, `relative_note`, `pan`, `c2spd` S3M, `loop_kind` `off`/`forward`/`pingpong` (XM only), `loop_start`, `loop_len`, `adlib` registers; loops are fitted into the data, to whole words in a MOD), `import_sample`, `normalize_sample`, `reverse_sample`, `clear_sample`, `generate_wave` (sine, triangle, saw, square, pulse, noise) |
+| instruments | `add_instrument` (XM with one empty sample, S3M an empty slot; a MOD's 31 are fixed), `remove_instrument` (cells that play it are cleared and later ones renumbered; refused while any does unless `force`), XM: `add_sample`, `remove_sample`, `set_instrument` (`name`, `fadeout` 0-4095, `vibrato_*`), `set_envelope` (`kind`, `enabled`, `points` as [tick, value] at most 12 from tick 0, `sustain`, `loop`), `set_keymap` (`from`..`to` as MIDI notes, `sample`, or all 96) |
+| history | `begin_group`, `end_group`, `undo`, `redo`, `batch` (`ops`: one undo step, all or none) |
+
+**Loading audio** (`import_sample`, Rust `import_sample(SampleRef, bytes, &ImportOptions)`): the audio is a WAV file
+(PCM 8/16/24/32-bit, float; any channels, mixed down or one side via `mix`; the `smpl` loop is kept) or raw PCM
+(`pcm8`, `pcm8u`, `pcm16`, with `rate` and `channels`); `data` is base64 in JSON. A MOD sample is resampled
+(windowed sinc, or `linear` as the DAW does) to the Paula rate of the note it should sound at its own pitch
+at (`note`, default C-2, 8287 Hz), 8-bit, whole words. An S3M keeps the rate as `c2spd` (or resamples to
+`target_rate`; 8-bit by default, 16 with `bits`). An XM keeps the rate too, in the relative note and finetune
+exactly as the DAW's `fromPcm` does (16-bit by default). Audio longer than the format holds is refused
+(`truncate` cuts it); `normalize` scales to the grid's full scale.
+
+**Undo and redo.** An inverse-change log (`edit/history.rs`): before an edit overwrites anything it records the
+change that puts it back (a rectangle of cells, one pattern, the order list, a sample's fields, its data moved
+out rather than copied), so typing a note costs one cell and a volume tweak on a 2 MB sample costs nothing for
+its data. Applying a change returns its own inverse, which is how redo comes for free. `begin_group` /
+`end_group` nest: one user action is one step; `undo()` / `redo()` return a `Changes` (pattern and rows,
+`orders`, `header`, `instruments` ..., and the exact `cells`) to redraw, and do nothing while a group is open. The log is bounded by steps
+(1000) and bytes (128 MiB), the oldest dropped first (`set_history_limits`); `revision()` counts every change.
+
+**Live edits.** A song playing the module takes cell edits without reopening: after an edit,
+`doc.live_edits() -> Option<Vec<CellEdit>>` is `Some` with the current content of each cell that changed when the
+edit changed nothing but cell content (typing, clear, paste, transpose, insert or delete rows, a MOD's speed, and
+undo or redo of those) and `None` for anything that moves the module's shape (patterns, orders, header, channels,
+samples, instruments, or more than 1024 cells): open the edited module as a new song. `CellEdit` is field for field
+`cubed_mixer::SongCell` (`pattern` number, `row`, `channel`, `note` 0/255/MIDI, `period`, `instrument`, `volume`,
+`effect`, `param`), and `CellEdit::cell()` is what `Player::set_cell` takes. `{"op": "live_edits"}` returns the same
+as `{"cells": [..] | null}`. A test keeps a `Player` in step with a `ModuleDoc` through an edit session and its
+undo this way.
+
+**Writers** (`write_mod`, `write_s3m`, `write_xm`, `write(&Module)`) are the inverses of the parsers:
+`load(write(m)) == m` for every module a parser produced and every state an operation can reach (up to the
+MOD's flags the file cannot hold, below). What a file cannot hold is an error naming the cell or sample: a
+note outside a MOD's periods, effects over F in a MOD, a MOD pattern that is not 64 rows, a ping-pong loop in a
+MOD or S3M, an odd-length MOD sample, more channels or patterns than the format, envelopes on an XM instrument
+with no sample. Choices: samples are written at the narrowest width that keeps every value (S3M, XM: 8-bit on the
+8-bit grid, else 16; a MOD's are 8-bit, which parsing guarantees); text is Latin-1 cut to the field; a MOD gets
+`M.K.` (4 channels, limited to ProTracker's octaves), `N.T.`, `4CHN`, `6CHN`, `8CHN`, `10CH` ..., or its
+Soundtracker layout (15 samples, 600-byte header; the file cannot say Soundtracker from Ultimate Soundtracker
+or ProTracker-shaped, so the writer refuses a flavor that would load back as another: `set_mod_flavor` converts
+to 31 samples first); its restart byte is 0x7F and a pattern past the last one played is kept by an order-table
+entry beyond the song's end. An S3M is written with unsigned samples (format 2), its channel settings, pan table
+and master volume rebuilt from the channel pans, mutes and AdLib channels, its order list from `orders` and
+`jump_targets` (separators as 254, ended by 255; the first order edit folds the map into the `Bxx` jumps). ST3 plays
+channels that share a hardware channel as one: a channel merged away on load stays empty and writes fine, one
+with notes is refused. An XM is version 1.04, tracker name `FastTracker v2.00`, patterns packed as the DAW packs
+them. `Module::differences(&other)` lists how two modules differ (it is how the writers are checked), and
+`restart` is new in `Module` (the XM restart position, which `Player` now loops back to).
+
+*Checked* (`tests/write.rs`, `tests/edit.rs`): `load(write(load(x)))` equals `load(x)` on the three synthetic fixtures
+(their written bytes are pinned by hashes) and on 330 real songs (`CUBED_MODULES=<dir>`, searched recursively:
+ProTracker, both Soundtracker layouts, S3M with separators and AdLib, XM); a random-operation soak (every operation
+kind, grouped and not, on the fixtures, on empty modules, and with `CUBED_MODULES` on every real song) saves and
+reloads after every step, undoes everything to the start and redoes to the end. `cargo run --example tracker_write`
+writes a directory back, `tracker_diff` compares two directories by content, `tracker_edit` applies an operation list.
+
+*Against the DAW's exporters* (`mod-writer.ts`, `xm-writer.ts`; the DAW's S3M exporter is a placeholder, so
+`write_s3m` follows the format and the OpenMPT/ST3 files above): on 135 MODs 106 are byte-identical and 115 load to
+the same module; the others differ where the DAW changes the song (it writes a Soundtracker module in the
+31-sample layout, so the flavor and the sample count differ; it re-derives a few loops and periods; it keeps the
+order table beyond the song's end and a truncated sample's header length where this writes what is there). On 113
+XMs none is byte-identical and all 113 load to the same module: the DAW keeps the source's tracker name, each
+sample's bit depth (this writes the narrowest exact width) and the points of a *disabled* envelope, which
+`Module` does not hold (an envelope is `None` when off, so loading an XM drops them: a known limit).
 
 ## Building, testing, benchmarks
 

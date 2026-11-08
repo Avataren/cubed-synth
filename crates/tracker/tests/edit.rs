@@ -1610,3 +1610,149 @@ fn real_songs_edit() {
     }
     eprintln!("{count} real songs edited at random, saved after every operation, and undone");
 }
+
+// ---------------------------------------------------------------------------
+// live edits: what a playing song takes
+
+/// A player that has been given every live edit of an edit session holds the
+/// same pattern cells as the document.
+fn follow(name: &str, ops: &[Value]) {
+    use cubed_tracker::{Player, PlayerOptions};
+    let mut d = doc(name);
+    let mut player = Player::new(d.module().clone(), 48_000.0, PlayerOptions::default());
+    for op in ops {
+        let r = d.apply(op);
+        assert!(r.is_ok(), "{op}: {r:?}");
+        match d.live_edits() {
+            Some(edits) => {
+                for e in edits {
+                    assert!(
+                        player.set_cell(
+                            e.pattern as usize,
+                            e.row as usize,
+                            e.channel as usize,
+                            e.cell()
+                        ),
+                        "{op}: the player has no cell {e:?}"
+                    );
+                }
+            }
+            None => player = Player::new(d.module().clone(), 48_000.0, PlayerOptions::default()),
+        }
+        assert_eq!(
+            player.module().patterns,
+            d.module().patterns,
+            "{name}: after {op}"
+        );
+    }
+    // Undo and redo are live edits too.
+    while let Some(_) = d.undo() {
+        match d.live_edits() {
+            Some(edits) => {
+                for e in edits {
+                    assert!(player.set_cell(
+                        e.pattern as usize,
+                        e.row as usize,
+                        e.channel as usize,
+                        e.cell()
+                    ));
+                }
+            }
+            None => player = Player::new(d.module().clone(), 48_000.0, PlayerOptions::default()),
+        }
+        assert_eq!(
+            player.module().patterns,
+            d.module().patterns,
+            "{name}: after an undo"
+        );
+    }
+}
+
+#[test]
+fn live_edits_keep_a_player_in_step() {
+    let ops = [
+        json!({"op":"set_cell","pattern":0,"row":3,"channel":1,"note":48,"instrument":1,"effect":"C","param":20}),
+        json!({"op":"clear_range","pattern":0,"row0":0,"row1":7,"channel0":0,"channel1":1}),
+        json!({"op":"insert_row","pattern":0,"row":4,"count":2}),
+        json!({"op":"delete_row","pattern":0,"row":1,"channel":0}),
+        json!({"op":"transpose","pattern":0,"row0":0,"row1":20,"channel0":0,"channel1":1,"semitones":2,"clamp":true}),
+        json!({"op":"batch","ops":[
+            {"op":"set_cell","pattern":0,"row":9,"channel":0,"note":50,"instrument":1},
+            {"op":"set_cell","pattern":0,"row":10,"channel":0,"note":52,"instrument":1},
+        ]}),
+        json!({"op":"set_speed","speed":3}),
+    ];
+    for name in ["demo.mod", "demo.s3m", "demo.xm"] {
+        follow(name, &ops);
+    }
+}
+
+#[test]
+fn live_edits_say_when_the_song_must_be_reopened() {
+    let mut x = doc("demo.xm");
+    ok(
+        &mut x,
+        json!({"op":"set_cell","pattern":0,"row":2,"channel":0,"note":60,"instrument":1}),
+    );
+    let edits = x.live_edits().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(
+        (
+            edits[0].pattern,
+            edits[0].row,
+            edits[0].channel,
+            edits[0].note
+        ),
+        (0, 2, 0, 60)
+    );
+    let r = ok(&mut x, json!({"op":"live_edits"}));
+    assert_eq!(r["cells"][0]["note"], 60);
+    // A change with no effect has nothing to send.
+    ok(
+        &mut x,
+        json!({"op":"set_cell","pattern":0,"row":2,"channel":0,"note":60}),
+    );
+    assert_eq!(x.live_edits().unwrap().len(), 0);
+    // Shape changes need a new song.
+    for op in [
+        json!({"op":"set_speed","speed":3}),
+        json!({"op":"set_pattern_rows","pattern":0,"rows":32,"force":true}),
+        json!({"op":"insert_order","index":0,"pattern":0}),
+        json!({"op":"set_sample","instrument":1,"volume":3}),
+        json!({"op":"new_pattern"}),
+        json!({"op":"set_channels","count":3,"force":true}),
+        json!({"op":"set_title","title":"x"}),
+    ] {
+        ok(&mut x, op.clone());
+        assert!(x.live_edits().is_none(), "{op}");
+        assert_eq!(
+            x.apply(&json!({"op":"live_edits"})).unwrap()["cells"],
+            Value::Null
+        );
+    }
+    // A change too big to list.
+    let mut big = ModuleDoc::new(Format::Xm);
+    ok(
+        &mut big,
+        json!({"op":"set_pattern_rows","pattern":0,"rows":256}),
+    );
+    ok(&mut big, json!({"op":"set_channels","count":32}));
+    let one = json!({"op":"set_cell","pattern":0,"row":0,"channel":0,"note":60});
+    ok(&mut big, one);
+    let clip = json!({"cells": (0..256).map(|_| (0..32).map(|_| json!([60, 0, 0, 0, 0])).collect::<Vec<_>>()).collect::<Vec<_>>()});
+    ok(
+        &mut big,
+        json!({"op":"paste","pattern":0,"row":0,"channel":0,"cells":clip}),
+    );
+    assert!(big.live_edits().is_none());
+    // Undo reports the cell it put back.
+    let mut u = ModuleDoc::new(Format::Mod);
+    ok(
+        &mut u,
+        json!({"op":"set_cell","pattern":0,"row":5,"channel":2,"note":"C-2","instrument":1}),
+    );
+    u.undo().unwrap();
+    let edits = u.live_edits().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].cell(), Default::default());
+}

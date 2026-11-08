@@ -25,7 +25,10 @@ fn main() {
             continue;
         };
         let (Ok(mx), Ok(my)) = (cubed_tracker::load(&x), cubed_tracker::load(&y)) else {
-            kinds.entry("one does not load".into()).or_default().push(name.to_string_lossy().into());
+            kinds
+                .entry("one does not load".into())
+                .or_default()
+                .push(name.to_string_lossy().into());
             continue;
         };
         total += 1;
@@ -36,7 +39,10 @@ fn main() {
         }
         for line in d.iter().take(3) {
             let key: String = line.chars().take(70).collect();
-            kinds.entry(key).or_default().push(name.to_string_lossy().into());
+            kinds
+                .entry(key)
+                .or_default()
+                .push(name.to_string_lossy().into());
         }
     }
     println!("{same} of {total} load to the same module");

@@ -37,9 +37,43 @@ pub struct Changes {
     pub instruments: Vec<usize>,
     /// Instruments or sample slots were added or removed.
     pub instrument_list: bool,
+    /// The cells whose content changed, as (pattern, row, channel), each once
+    /// (up to [`MAX_CELLS`]; past that `cells_overflow` is set and the list is
+    /// not complete). Cells of patterns that were swapped whole are not
+    /// listed: those set `layout`.
+    pub cells: Vec<(usize, usize, usize)>,
+    pub cells_overflow: bool,
 }
 
+/// How many changed cells a [`Changes`] lists.
+pub const MAX_CELLS: usize = 1024;
+
 impl Changes {
+    /// Whether only the content of existing cells changed: what a live song
+    /// can take as cell edits (nothing about the module's shape, order list,
+    /// header, channels, samples or instruments moved).
+    pub fn is_cells_only(&self) -> bool {
+        !self.layout
+            && !self.orders
+            && !self.header
+            && !self.channels
+            && !self.instrument_list
+            && self.instruments.is_empty()
+            && !self.cells_overflow
+    }
+
+    pub(crate) fn cell(&mut self, pattern: usize, row: usize, channel: usize) {
+        let key = (pattern, row, channel);
+        if self.cells.contains(&key) {
+            return;
+        }
+        if self.cells.len() >= MAX_CELLS {
+            self.cells_overflow = true;
+        } else {
+            self.cells.push(key);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         *self == Changes::default()
     }
@@ -61,6 +95,10 @@ impl Changes {
         for (&p, &(a, b)) in &other.patterns {
             self.pattern_rows(p, a, b);
         }
+        for &(p, r, c) in &other.cells {
+            self.cell(p, r, c);
+        }
+        self.cells_overflow |= other.cells_overflow;
         self.layout |= other.layout;
         self.orders |= other.orders;
         self.header |= other.header;
@@ -455,9 +493,27 @@ impl Change {
             Change::Block {
                 pattern,
                 row0,
+                channel0,
                 rows,
-                ..
-            } => out.pattern_rows(*pattern, *row0, row0 + rows.saturating_sub(1)),
+                channels,
+                cells,
+            } => {
+                out.pattern_rows(*pattern, *row0, row0 + rows.saturating_sub(1));
+                // The change holds what the cells were; the module what they are.
+                if let Some(p) = m.patterns.get(*pattern) {
+                    for r in 0..*rows {
+                        for c in 0..*channels {
+                            let (row, ch) = (row0 + r, channel0 + c);
+                            if row < p.rows()
+                                && ch < p.channels()
+                                && cells[r * channels + c] != *p.cell(row, ch)
+                            {
+                                out.cell(*pattern, row, ch);
+                            }
+                        }
+                    }
+                }
+            }
             Change::Pattern { index, pattern } => {
                 out.pattern_rows(*index, 0, pattern.rows().saturating_sub(1));
                 out.layout = true;

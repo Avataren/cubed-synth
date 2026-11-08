@@ -52,6 +52,12 @@ fn fixtures_round_trip() {
         assert_eq!(sniff(&bytes), Some(format));
         let out = round_trip(name, &bytes).unwrap();
         assert_eq!(sniff(&out), Some(format), "{name}");
+        // The mixer opens a module song by format and bytes (`open_module_song`).
+        assert_eq!(
+            cubed_tracker::load_format(format, &out).unwrap(),
+            load(&out).unwrap(),
+            "{name}"
+        );
     }
 }
 

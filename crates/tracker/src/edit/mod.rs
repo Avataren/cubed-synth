@@ -56,7 +56,7 @@ mod wav;
 use serde_json::{json, Value};
 
 pub use cells::{CellUpdate, ClearMask, Clip, PasteMode, Pasted, Region};
-pub use history::Changes;
+pub use history::{Changes, MAX_CELLS};
 pub use instruments::{
     parse_loop_kind, EnvelopeEdit, EnvelopeKind, ImportOptions, InstrumentEdit, SampleEdit,
     SampleRef, SampleSource, Wave,
@@ -84,6 +84,67 @@ pub struct ModuleDoc {
     module: Module,
     history: History,
     revision: u64,
+    /// What the last edit, undo or redo changed.
+    last: Changes,
+}
+
+/// One pattern cell's content as a live song takes it: field for field the
+/// numbers of `cubed_mixer::SongCell` (the mixer's `SongControl::SetCell`) and
+/// of [`Cell`](crate::Cell). See [`ModuleDoc::live_edits`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CellEdit {
+    /// The pattern's number (not its position in the order list).
+    pub pattern: u16,
+    pub row: u16,
+    pub channel: u8,
+    /// 0 none, 255 key off, otherwise a MIDI note number.
+    pub note: u8,
+    /// MOD: the Amiga period of the note; 0 elsewhere.
+    pub period: u16,
+    pub instrument: u8,
+    pub volume: u8,
+    pub effect: u8,
+    pub param: u8,
+}
+
+impl CellEdit {
+    pub fn of(pattern: usize, row: usize, channel: usize, c: &crate::module::Cell) -> CellEdit {
+        CellEdit {
+            pattern: pattern as u16,
+            row: row as u16,
+            channel: channel as u8,
+            note: note_number(c.note) as u8,
+            period: c.period,
+            instrument: c.instrument,
+            volume: c.volume,
+            effect: c.effect,
+            param: c.param,
+        }
+    }
+
+    /// The cell (what `Player::set_cell` takes).
+    pub fn cell(&self) -> crate::module::Cell {
+        crate::module::Cell {
+            note: match self.note {
+                0 => crate::module::Note::None,
+                255 => crate::module::Note::Off,
+                n => crate::module::Note::On(n),
+            },
+            period: self.period,
+            instrument: self.instrument,
+            volume: self.volume,
+            effect: self.effect,
+            param: self.param,
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "pattern": self.pattern, "row": self.row, "channel": self.channel,
+            "note": self.note, "period": self.period, "instrument": self.instrument,
+            "volume": self.volume, "effect": self.effect, "param": self.param,
+        })
+    }
 }
 
 impl ModuleDoc {
@@ -183,6 +244,7 @@ impl ModuleDoc {
             module,
             history: History::new(),
             revision: 0,
+            last: Changes::default(),
         }
     }
 
@@ -217,6 +279,42 @@ impl ModuleDoc {
 
     pub fn format(&self) -> Format {
         self.module.format
+    }
+
+    /// What the last edit, undo or redo changed (also what its result's
+    /// `changed` says).
+    pub fn last_changes(&self) -> &Changes {
+        &self.last
+    }
+
+    /// The last change as live cell edits, for a song that is playing the
+    /// module: `Some` with the current content of each cell that changed when
+    /// the change was nothing but cell content (a note typed, a range cleared
+    /// or pasted, rows inserted, a MOD's speed `Fxx`), to send to the
+    /// player (`Player::set_cell`, the mixer's `SongControl::SetCell`) one by
+    /// one; `None` when the change moved the module's shape (patterns, order
+    /// list, header, channels, samples, instruments) or touched more than
+    /// [`MAX_CELLS`] cells, which is a new song: open the edited module and
+    /// swap it in.
+    pub fn live_edits(&self) -> Option<Vec<CellEdit>> {
+        self.cell_edits(&self.last)
+    }
+
+    /// [`live_edits`](Self::live_edits) for a [`Changes`] this module's edits
+    /// returned.
+    pub fn cell_edits(&self, changes: &Changes) -> Option<Vec<CellEdit>> {
+        if !changes.is_cells_only() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(changes.cells.len());
+        for &(p, r, c) in &changes.cells {
+            let pattern = self.module.patterns.get(p)?;
+            if r >= pattern.rows() || c >= pattern.channels() {
+                return None;
+            }
+            out.push(CellEdit::of(p, r, c, pattern.cell(r, c)));
+        }
+        Some(out)
     }
 
     /// Counts every change made (and every undo and redo): a UI can cache by it.
@@ -422,6 +520,7 @@ impl ModuleDoc {
         }
         self.history.push_redo(produced);
         self.revision += 1;
+        self.last = changes.clone();
         Some(changes)
     }
 
@@ -440,6 +539,7 @@ impl ModuleDoc {
         }
         self.history.push_undo_keep_redo(produced);
         self.revision += 1;
+        self.last = changes.clone();
         Some(changes)
     }
 
@@ -466,6 +566,7 @@ impl ModuleDoc {
                 if self.history.open.len() > mark {
                     self.revision += 1;
                 }
+                self.last = changes.clone();
                 Ok((v, changes))
             }
             Err(e) => {
@@ -493,6 +594,11 @@ impl ModuleDoc {
     /// Reading:
     /// - `{"op": "info"}`, `{"op": "order"}`, `{"op": "samples"}`,
     ///   `{"op": "instruments"}`, `{"op": "validate"}` -> `{"problems": [..]}`
+    /// - `{"op": "live_edits"}` -> `{"cells": [{"pattern", "row", "channel",
+    ///   "note", "period", "instrument", "volume", "effect", "param"}]}` for the
+    ///   last edit if it only changed cells (what a playing song can take as
+    ///   cell edits), else `{"cells": null}` (open the edited module as a new
+    ///   song); see [`live_edits`](Self::live_edits)
     /// - `{"op": "rows", "pattern", "row0", "count", "flat"}`
     /// - `{"op": "copy_range", "pattern", "row0", "row1", "channel0", "channel1"}`
     ///   -> the clip (`rows`, `channels`, `cells`)
@@ -550,6 +656,9 @@ impl ModuleDoc {
             "samples" => Ok(self.samples()),
             "instruments" => Ok(self.instruments()),
             "validate" => Ok(json!({"problems": self.validate()})),
+            "live_edits" => Ok(json!({
+                "cells": self.live_edits().map(|v| v.iter().map(CellEdit::to_json).collect::<Vec<_>>()),
+            })),
             "rows" => self.rows(
                 req_usize(op, "pattern")?,
                 opt_usize(op, "row0")?.unwrap_or(0),
