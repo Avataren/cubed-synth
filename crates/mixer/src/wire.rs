@@ -15,6 +15,7 @@ use crate::command::{
 };
 use crate::engine::{EngineControls, EngineSound, MAX_CYLINDERS};
 use crate::sfx::{Sfx, SfxWave};
+use crate::song::{SongControl, SongLoop};
 use crate::source::SourceEvent;
 use crate::spatial::{Listener, Rolloff, Spatial, SpatialMode};
 
@@ -48,6 +49,7 @@ mod tag {
     pub const PLAY_ENGINE: u8 = 27;
     pub const SET_ENGINE: u8 = 28;
     pub const SOURCE_PARAM: u8 = 29;
+    pub const SONG_CONTROL: u8 = 30;
 
     pub const ENDED: u8 = 1;
     pub const STOLEN: u8 = 2;
@@ -237,6 +239,21 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             w.u16(edit.param);
             w.f32(edit.value);
         }
+        Command::SourceEvent {
+            voice,
+            event: SourceEvent::Song(control),
+        } => {
+            // 24 bytes: tag, voice, kind, three u16s, an f32, a u32.
+            w.u8(tag::SONG_CONTROL);
+            w.u64(voice.0);
+            let (kind, a, b, c, value, frames) = song_fields(control);
+            w.u8(kind);
+            w.u16(a);
+            w.u16(b);
+            w.u16(c);
+            w.f32(value);
+            w.u32(frames);
+        }
         Command::SourceEvent { voice, event } => {
             w.u8(tag::SOURCE_EVENT);
             w.u64(voice.0);
@@ -263,8 +280,8 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
                     w.f32(0.0);
                     w.u32(0);
                 }
-                // Encoded above, with a tag of its own.
-                SourceEvent::Param(_) => unreachable!(),
+                // Encoded above, with a tag of their own.
+                SourceEvent::Param(_) | SourceEvent::Song(_) => unreachable!(),
             }
         }
         Command::FadeVoice {
@@ -331,6 +348,75 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
         | Command::SetTap(..) => return false,
     }
     true
+}
+
+/// A song control as the wire's fixed fields: kind, three `u16`s, a float and
+/// a `u32`.
+fn song_fields(control: &SongControl) -> (u8, u16, u16, u16, f32, u32) {
+    match *control {
+        SongControl::Play => (0, 0, 0, 0, 0.0, 0),
+        SongControl::Stop => (1, 0, 0, 0, 0.0, 0),
+        SongControl::Seek { order, row } => (2, order, row, 0, 0.0, 0),
+        SongControl::Loop(SongLoop::None) => (3, 0, 0, 0, 0.0, 0),
+        SongControl::Loop(SongLoop::Pattern { order }) => (4, order, 0, 0, 0.0, 0),
+        SongControl::Loop(SongLoop::Range { order, row0, row1 }) => (5, order, row0, row1, 0.0, 0),
+        SongControl::Mute { channel, on } => (6, channel as u16, on as u16, 0, 0.0, 0),
+        SongControl::Solo { channel, on } => (7, channel as u16, on as u16, 0, 0.0, 0),
+        SongControl::MuteMask(mask) => (8, 0, 0, 0, 0.0, mask),
+        SongControl::SoloMask(mask) => (9, 0, 0, 0, 0.0, mask),
+        SongControl::PreviewOn {
+            instrument,
+            note,
+            velocity,
+            duration,
+        } => (10, instrument as u16, note as u16, 0, velocity, duration),
+        SongControl::PreviewOff => (11, 0, 0, 0, 0.0, 0),
+        SongControl::Looped(on) => (12, 0, on as u16, 0, 0.0, 0),
+        SongControl::Scopes(on) => (13, 0, on as u16, 0, 0.0, 0),
+    }
+}
+
+fn song_control(
+    kind: u8,
+    a: u16,
+    b: u16,
+    c: u16,
+    value: f32,
+    frames: u32,
+) -> Result<SongControl, WireError> {
+    Ok(match kind {
+        0 => SongControl::Play,
+        1 => SongControl::Stop,
+        2 => SongControl::Seek { order: a, row: b },
+        3 => SongControl::Loop(SongLoop::None),
+        4 => SongControl::Loop(SongLoop::Pattern { order: a }),
+        5 => SongControl::Loop(SongLoop::Range {
+            order: a,
+            row0: b,
+            row1: c,
+        }),
+        6 => SongControl::Mute {
+            channel: a.min(255) as u8,
+            on: b != 0,
+        },
+        7 => SongControl::Solo {
+            channel: a.min(255) as u8,
+            on: b != 0,
+        },
+        8 => SongControl::MuteMask(frames),
+        9 => SongControl::SoloMask(frames),
+        10 => SongControl::PreviewOn {
+            instrument: a.min(255) as u8,
+            note: b.min(255) as u8,
+            velocity: value,
+            duration: frames,
+        },
+        11 => SongControl::PreviewOff,
+        12 => SongControl::Looped(b != 0),
+        13 => SongControl::Scopes(b != 0),
+        // The tag is known; the kind is from a newer sender.
+        _ => return Err(WireError::UnknownTag(tag::SONG_CONTROL)),
+    })
 }
 
 /// Decodes the commands in `bytes`, in order. Stops at the first message it
@@ -760,6 +846,16 @@ impl Reader<'_> {
                     value: self.f32()?,
                 }),
             },
+            tag::SONG_CONTROL => {
+                let voice = self.voice()?;
+                let kind = self.u8()?;
+                let (a, b, c) = (self.u16()?, self.u16()?, self.u16()?);
+                let (value, frames) = (self.f32()?, self.u32()?);
+                Command::SourceEvent {
+                    voice,
+                    event: SourceEvent::Song(song_control(kind, a, b, c, value, frames)?),
+                }
+            }
             tag::FADE_VOICE => Command::FadeVoice {
                 voice: self.voice()?,
                 gain: self.f32()?,
@@ -1022,6 +1118,78 @@ mod tests {
         ] {
             round_trip(command);
         }
+    }
+
+    #[test]
+    fn every_song_control_round_trips_in_24_bytes() {
+        let voice = VoiceId(0xfeed_0042);
+        let controls = [
+            SongControl::Play,
+            SongControl::Stop,
+            SongControl::Seek {
+                order: 255,
+                row: 63,
+            },
+            SongControl::Loop(SongLoop::None),
+            SongControl::Loop(SongLoop::Pattern { order: 12 }),
+            SongControl::Loop(SongLoop::Range {
+                order: 3,
+                row0: 8,
+                row1: 15,
+            }),
+            SongControl::Mute {
+                channel: 31,
+                on: true,
+            },
+            SongControl::Mute {
+                channel: 0,
+                on: false,
+            },
+            SongControl::Solo {
+                channel: 5,
+                on: true,
+            },
+            SongControl::MuteMask(0xa5a5_0001),
+            SongControl::SoloMask(0x8000_0000),
+            SongControl::PreviewOn {
+                instrument: 31,
+                note: 60,
+                velocity: 0.625,
+                duration: 24_000,
+            },
+            SongControl::PreviewOff,
+            SongControl::Looped(true),
+            SongControl::Scopes(true),
+            SongControl::Scopes(false),
+        ];
+        for control in controls {
+            let command = Command::SourceEvent {
+                voice,
+                event: SourceEvent::Song(control),
+            };
+            let mut bytes = Vec::new();
+            assert!(encode(&command, &mut bytes));
+            assert_eq!(bytes.len(), 24, "{control:?}");
+            assert_eq!(bytes[0], 30);
+            round_trip(command);
+        }
+        // A kind from a newer sender stops the batch at the unknown message, not
+        // before the ones ahead of it.
+        let mut bytes = Vec::new();
+        encode(
+            &Command::SourceEvent {
+                voice,
+                event: SourceEvent::Song(SongControl::Play),
+            },
+            &mut bytes,
+        );
+        let mut future = bytes.clone();
+        future[9] = 200;
+        bytes.extend_from_slice(&future);
+        let decoded: Vec<_> = decode(&bytes).collect();
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[0].is_ok());
+        assert!(matches!(decoded[1], Err(WireError::UnknownTag(30))));
     }
 
     #[test]

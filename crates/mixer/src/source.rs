@@ -1,12 +1,15 @@
 //! Voices whose sound is made as they play instead of read from a clip:
 //! chip-music players, streams, synths.
 
+use std::sync::Arc;
+
 use cubed_dsp::live::ParamEdit;
 
 use crate::clip::ClipVoice;
 use crate::engine::EngineVoice;
 use crate::sfx::SfxVoice;
 use crate::smooth::{balance, fade_step, start_fade, step_ramp, GainRamp, Smoothed};
+use crate::song::{SongControl, SongReader};
 use crate::spatial::{equal_power, Hearing, Spatial, SpatialVoice};
 
 /// Makes sound as it plays. It runs on the audio thread: `render` must not
@@ -22,6 +25,12 @@ pub trait Source: Send {
     /// as a note for a synth. Sources that play by themselves ignore them.
     fn event(&mut self, event: SourceEvent) {
         let _ = event;
+    }
+
+    /// What a host reads of a module song while it plays (see `song`): ask for it
+    /// before handing the source to the mixer. `None` for everything else.
+    fn song_reader(&self) -> Option<Arc<dyn SongReader>> {
+        None
     }
 }
 
@@ -43,6 +52,9 @@ pub enum SourceEvent {
     /// `cubed_dsp::live`): applied before its next block and smoothed, so it
     /// does not click. Other sources ignore it.
     Param(ParamEdit),
+    /// A change to a module song's transport: play, seek, loop, mute, preview
+    /// (see `SongControl`). Other sources ignore it.
+    Song(SongControl),
 }
 
 /// What makes a source voice's sound.

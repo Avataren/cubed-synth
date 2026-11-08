@@ -281,6 +281,8 @@ impl Source for SynthSource {
             SourceEvent::Param(edit) => {
                 let _ = self.engine.edit_param(edit);
             }
+            // A synth has no transport.
+            SourceEvent::Song(_) => {}
         }
     }
 }
