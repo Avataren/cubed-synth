@@ -164,6 +164,27 @@ impl Chip {
         }
     }
 
+    /// Puts the chip back in its power-on state, in place: `*self = Chip::new()`
+    /// without allocating (the waveform tables are constant and stay).
+    pub fn reset(&mut self) {
+        self.regs = [0; 0x200];
+        for op in self.ops.iter_mut() {
+            *op = Operator::default();
+        }
+        self.chans = [Channel::default(); CHANNELS];
+        self.op_map = operator_map(0);
+        self.env_counter = 0;
+        self.modified = true;
+        self.dirty_ops = ALL_OPS;
+        self.prepare_count = 0;
+        self.lfo_am_counter = 0;
+        self.lfo_pm_counter = 0;
+        self.lfo_am = 0;
+        self.noise_lfsr = 1;
+        self.channel_mask = (1 << CHANNELS) - 1;
+        self.taps = [0; CHANNELS];
+    }
+
     #[inline]
     fn newflag(&self) -> bool {
         self.regs[0x105] & 1 != 0

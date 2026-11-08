@@ -111,6 +111,15 @@ impl Resampler {
         }
     }
 
+    /// Forgets the filter's history and the read position, as a new resampler
+    /// is: in place, with no allocation.
+    pub fn reset(&mut self) {
+        self.pos = 0.0;
+        self.head = 0;
+        self.left.fill(0.0);
+        self.right.fill(0.0);
+    }
+
     fn push(&mut self, frame: [f32; 2]) {
         let (h, n) = (self.head, self.taps);
         self.left[h] = frame[0];

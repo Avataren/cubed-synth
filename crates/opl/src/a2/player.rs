@@ -17,6 +17,7 @@
 //! the class compiles and is tested natively.
 
 use super::engine::{A2Engine, RegisterSink};
+use super::live::LiveEdit;
 use super::model::{cp437, parse, A2mSong};
 use crate::chip::{Chip, CHANNELS, NATIVE_RATE};
 use crate::resample::Resampler;
@@ -36,6 +37,54 @@ const FULL_SCALE: f32 = 1.0 / 32768.0;
 /// Most ticks a seek replays before it gives up finding its row by playing
 /// and jumps there directly (about 40 minutes at 50 Hz).
 const SEEK_TICK_LIMIT: usize = 120_000;
+/// How fast a track's level falls once its sound is gone (24 dB a second, as
+/// the tracker `Probe`'s do).
+const LEVEL_FALL_DB_PER_SECOND: f64 = 24.0;
+
+/// What the transport repeats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum A2Loop {
+    /// Play on through the song.
+    #[default]
+    None,
+    /// Repeat the pattern at this order position.
+    Pattern(usize),
+    /// Repeat rows `row0` to `row1` (both played) of the pattern at `order`.
+    Range {
+        order: usize,
+        row0: usize,
+        row1: usize,
+    },
+}
+
+/// Where the song is, as `A2Player::status` reads it: what a position display
+/// and a follower need.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct A2Status {
+    pub playing: bool,
+    /// The order position, pattern and row playing now (or, before the first
+    /// row, the first to play).
+    pub order: u16,
+    pub pattern: u16,
+    pub row: u16,
+    /// The timer tick of the row, from 0.
+    pub tick: u16,
+    /// Timer ticks per row now.
+    pub speed: u8,
+    /// The tempo now; the timer runs at `refresh` Hz.
+    pub tempo: u8,
+    pub refresh: f32,
+    /// Rows started since the player was made (a seek adds one, a repeated row
+    /// counts): a follower that polls slower than the song can tell how many it
+    /// missed.
+    pub rows: u32,
+    /// Output frames rendered while playing.
+    pub frames: u64,
+    /// Times the song has come round (passed an order marker).
+    pub loops: u32,
+    /// The song has stopped (its order list ran out of patterns).
+    pub ended: bool,
+}
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct A2Player {
@@ -48,13 +97,21 @@ pub struct A2Player {
     gain: f32,
     /// Native samples until the next timer tick.
     until_tick: f64,
-    loop_order: Option<usize>,
+    loop_mode: A2Loop,
     end_reached: bool,
     mute: u32,
     solo: u32,
     taps_enabled: bool,
     taps: Vec<f32>,
     tap_frames: usize,
+    /// Per-channel peak levels (`set_levels_enabled`): what they are now, and
+    /// the loudest frame of the block being rendered.
+    levels_enabled: bool,
+    levels: [f32; CHANNELS],
+    block_peaks: [f32; CHANNELS],
+    /// Output frames rendered while playing, and the rows counter's offset.
+    frames: u64,
+    rows_base: u32,
     /// A tick's register writes reach the chip one per native sample (about
     /// 20 µs apart) instead of all at once. AT2 writes the ports one after
     /// another, so a key-off followed by a key-on in the same tick is seen by
@@ -93,13 +150,18 @@ impl A2Player {
             playing: false,
             gain: 1.0,
             until_tick: 0.0,
-            loop_order: None,
+            loop_mode: A2Loop::None,
             end_reached: false,
             mute: 0,
             solo: 0,
             taps_enabled: false,
             taps: Vec::new(),
             tap_frames: 0,
+            levels_enabled: false,
+            levels: [0.0; CHANNELS],
+            block_peaks: [0.0; CHANNELS],
+            frames: 0,
+            rows_base: 0,
             writes: Vec::new(),
             next_write: 0,
         })
@@ -127,6 +189,7 @@ impl A2Player {
     pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) -> usize {
         let n = left.len().min(right.len());
         let taps_on = self.taps_enabled && self.playing;
+        let levels_on = self.levels_enabled && self.playing;
         if self.taps_enabled {
             self.taps.clear();
             self.taps.resize(CHANNELS * n, 0.0);
@@ -135,14 +198,16 @@ impl A2Player {
         if !self.playing {
             left[..n].fill(0.0);
             right[..n].fill(0.0);
+            self.fall_levels(n);
             return n;
         }
+        self.frames += n as u64;
         for i in 0..n {
-            let (engine, chip, until_tick, loop_order, end, writes, next_write) = (
+            let (engine, chip, until_tick, loop_mode, end, writes, next_write) = (
                 &mut self.engine,
                 &mut self.chip,
                 &mut self.until_tick,
-                self.loop_order,
+                self.loop_mode,
                 &mut self.end_reached,
                 &mut self.writes,
                 &mut self.next_write,
@@ -156,7 +221,7 @@ impl A2Player {
                     }
                     writes.clear();
                     *next_write = 0;
-                    step(engine, writes, loop_order, end);
+                    step(engine, writes, loop_mode, end);
                     *until_tick += NATIVE_RATE / engine.refresh();
                 }
                 *until_tick -= 1.0;
@@ -174,19 +239,41 @@ impl A2Player {
                     self.taps[ch * n + i] = self.chip.channel_output(ch) as f32 * TAP_SCALE;
                 }
             }
+            if levels_on {
+                for ch in 0..CHANNELS {
+                    let v = (self.chip.channel_output(ch) as f32).abs() * TAP_SCALE;
+                    if v > self.block_peaks[ch] {
+                        self.block_peaks[ch] = v;
+                    }
+                }
+            }
         }
+        self.fall_levels(n);
         n
     }
 
     /// Moves to the start of `row` in order position `order`, keeping the
     /// play/pause state. The song is replayed silently from its top to get
     /// there; a row it never reaches is jumped to directly. Returns whether
-    /// the row was reached by playing.
+    /// the row was reached by playing. It allocates nothing (the chip, the
+    /// resampler and the engine are reset in place), so a host may call it on
+    /// the audio thread, though a far row costs up to a few thousand ticks of
+    /// register writes.
     pub fn seek(&mut self, order: usize, row: usize) -> bool {
-        self.chip = Chip::new();
+        let rows = self.rows_total();
+        let reached = self.seek_to(order, row);
+        // A seek counts as a row, so a follower sees the jump.
+        self.rows_base = rows
+            .wrapping_add(1)
+            .wrapping_sub(self.engine.rows_started());
+        reached
+    }
+
+    fn seek_to(&mut self, order: usize, row: usize) -> bool {
+        self.chip.reset();
         self.chip.set_channel_mask(self.channel_mask());
-        self.resampler = Resampler::new(NATIVE_RATE, self.out_rate);
-        self.engine = A2Engine::new(self.song.clone());
+        self.resampler.reset();
+        self.engine.restart();
         self.engine.reset(&mut self.chip);
         self.until_tick = 0.0;
         self.end_reached = false;
@@ -211,7 +298,7 @@ impl A2Player {
             }
         }
         if !reached {
-            self.engine = A2Engine::new(self.song.clone());
+            self.engine.restart();
             self.engine.reset(&mut self.chip);
             if !self.engine.redirect(order, row) {
                 return false;
@@ -236,7 +323,11 @@ impl A2Player {
     /// Keep playing order position `order` (its pattern) over and over:
     /// the tracker's "play pattern". `-1` plays the song on.
     pub fn set_loop_order(&mut self, order: i32) {
-        self.loop_order = (order >= 0).then_some(order as usize);
+        self.loop_mode = if order >= 0 {
+            A2Loop::Pattern(order as usize)
+        } else {
+            A2Loop::None
+        };
     }
 
     /// Whether the song has come round once (passed its order list's end
@@ -413,23 +504,206 @@ impl A2Player {
     pub fn set_adplug_quirks(&mut self, on: bool) {
         self.engine.adplug_quirks = on;
     }
+
+    // ---- transport, position, levels and live edits: what a tracker editor
+    // drives while the song plays. None of them allocates.
+
+    /// Rows started since the player was made (see [`A2Status::rows`]).
+    fn rows_total(&self) -> u32 {
+        self.rows_base.wrapping_add(self.engine.rows_started())
+    }
+
+    /// Where the song is: see [`A2Status`].
+    pub fn status(&self) -> A2Status {
+        let (order, pattern, row) = self.engine.position();
+        A2Status {
+            playing: self.playing,
+            order: order as u16,
+            pattern: pattern as u16,
+            row: row as u16,
+            tick: self.engine.tick_in_row(),
+            speed: self.engine.speed(),
+            tempo: self.engine.tempo(),
+            refresh: self.engine.refresh() as f32,
+            rows: self.rows_total(),
+            frames: self.frames,
+            loops: self.engine.loops(),
+            ended: self.engine.ended(),
+        }
+    }
+
+    /// What the transport repeats (see [`A2Loop`]). It does not move the
+    /// playhead: seek first.
+    pub fn set_loop(&mut self, mode: A2Loop) {
+        self.loop_mode = mode;
+    }
+
+    pub fn loop_mode(&self) -> A2Loop {
+        self.loop_mode
+    }
+
+    /// Mutes or unmutes one track.
+    pub fn set_mute(&mut self, track: usize, on: bool) {
+        if track < 32 {
+            let mask = self.mute & !(1 << track) | (on as u32) << track;
+            self.set_mute_solo(mask, self.solo);
+        }
+    }
+
+    /// Solos or unsolos one track (while any is soloed only soloed tracks are heard).
+    pub fn set_solo(&mut self, track: usize, on: bool) {
+        if track < 32 {
+            let mask = self.solo & !(1 << track) | (on as u32) << track;
+            self.set_mute_solo(self.mute, mask);
+        }
+    }
+
+    pub fn mute_mask(&self) -> u32 {
+        self.mute
+    }
+
+    pub fn solo_mask(&self) -> u32 {
+        self.solo
+    }
+
+    /// Starts or stops measuring each OPL channel's level (off by default; it
+    /// costs a read of the chip's channel outputs per frame).
+    pub fn set_levels_enabled(&mut self, on: bool) {
+        self.levels_enabled = on;
+        if !on {
+            self.levels = [0.0; CHANNELS];
+            self.block_peaks = [0.0; CHANNELS];
+        }
+    }
+
+    /// OPL channel `ch`'s level (linear, ±1 is one operator's full swing): the
+    /// loudest frame of the latest block, falling 24 dB a second after it.
+    /// A muted track's channel reads 0. Zeros while levels are off.
+    pub fn channel_level(&self, ch: usize) -> f32 {
+        if ch >= CHANNELS || self.channel_mask() & (1 << ch) == 0 {
+            return 0.0;
+        }
+        self.levels[ch]
+    }
+
+    /// Each track's level (see [`channel_level`](Self::channel_level)) in `out`,
+    /// in track order; returns how many it wrote (`track_count()` at most). The
+    /// two tracks of a 4-op pair read the same, as they sound on one channel.
+    pub fn track_levels(&self, out: &mut [f32]) -> usize {
+        let n = out.len().min(self.track_count());
+        let mask = self.channel_mask();
+        for (t, o) in out[..n].iter_mut().enumerate() {
+            let ch = self.track_channel(t);
+            *o = if mask & (1 << ch) != 0 {
+                self.levels[ch]
+            } else {
+                0.0
+            };
+        }
+        n
+    }
+
+    fn fall_levels(&mut self, frames: usize) {
+        if !self.levels_enabled {
+            return;
+        }
+        let fall =
+            10f64.powf(-LEVEL_FALL_DB_PER_SECOND / 20.0 * frames as f64 / self.out_rate) as f32;
+        for ch in 0..CHANNELS {
+            self.levels[ch] = (self.levels[ch] * fall).max(self.block_peaks[ch]);
+            self.block_peaks[ch] = 0.0;
+        }
+    }
+
+    /// Lands a live edit in the song that is playing (see [`LiveEdit`]; the
+    /// document's `live_edits` makes them). False for one outside the song (a
+    /// pattern or instrument it does not have): nothing changed.
+    pub fn apply_edit(&mut self, edit: &LiveEdit) -> bool {
+        match edit {
+            LiveEdit::Cell {
+                pattern,
+                row,
+                track,
+                cell,
+            } => {
+                let (p, r, t) = (*pattern as usize, *row as usize, *track as usize);
+                let landed = self.engine.set_cell(p, r, t, *cell);
+                // The raw copy, for the readers that show the song as the file has it.
+                let own = self.song.patterns.len();
+                let raw = if p < own {
+                    self.song.patterns.get_mut(p)
+                } else {
+                    self.song.spare_patterns.get_mut(p - own)
+                };
+                if let Some(pat) = raw {
+                    if landed {
+                        pat.cells[r * pat.channels + t] = *cell;
+                    }
+                }
+                landed
+            }
+            LiveEdit::Instrument {
+                number,
+                fm,
+                panning,
+                finetune,
+                voice_type,
+            } => {
+                let landed = self.engine.set_instrument_data(
+                    *number as usize,
+                    *fm,
+                    *panning,
+                    *finetune,
+                    *voice_type,
+                );
+                if let Some(i) = (*number as usize)
+                    .checked_sub(1)
+                    .and_then(|n| self.song.instruments.get_mut(n))
+                {
+                    (i.fm, i.panning, i.finetune, i.voice_type) =
+                        (*fm, *panning, *finetune, *voice_type);
+                }
+                landed
+            }
+            LiveEdit::FmMacro { number, table } => {
+                self.engine.set_fm_macro(*number as usize, table)
+            }
+            LiveEdit::ArpeggioMacro { number, table } => {
+                self.engine.set_arpeggio_macro(*number as usize, table)
+            }
+            LiveEdit::VibratoMacro { number, table } => {
+                self.engine.set_vibrato_macro(*number as usize, table)
+            }
+            LiveEdit::Timing { tempo, speed } => {
+                self.engine.set_timing(*tempo, *speed);
+                (self.song.tempo, self.song.speed) = (*tempo, *speed);
+                true
+            }
+        }
+    }
 }
 
-/// One timer tick, then the order loop and the end check.
-fn step(
-    engine: &mut A2Engine,
-    out: &mut impl RegisterSink,
-    loop_order: Option<usize>,
-    end: &mut bool,
-) {
+/// One timer tick, then the loop and the end check.
+fn step(engine: &mut A2Engine, out: &mut impl RegisterSink, mode: A2Loop, end: &mut bool) {
     let loops = engine.loops();
     engine.update(out);
-    if let Some(o) = loop_order {
-        if engine.next_position().0 != o || engine.ended() {
-            engine.redirect(o, 0);
+    match mode {
+        A2Loop::Pattern(o) => {
+            if engine.next_position().0 != o || engine.ended() {
+                engine.redirect(o, 0);
+            }
         }
-    } else if engine.loops() != loops || engine.ended() {
-        *end = true;
+        A2Loop::Range { order, row0, row1 } => {
+            let (next_order, _, next_row) = engine.next_position();
+            if next_order != order || next_row > row1 || engine.ended() {
+                engine.redirect(order, row0);
+            }
+        }
+        A2Loop::None => {
+            if engine.loops() != loops || engine.ended() {
+                *end = true;
+            }
+        }
     }
 }
 
@@ -623,5 +897,170 @@ mod tests {
 
     fn p_channels(bytes: &[u8], t: usize) -> usize {
         A2Player::new(bytes, 48_000.0).unwrap().track_channel(t)
+    }
+
+    #[test]
+    fn status_follows_the_song_and_a_seek_counts_as_a_row() {
+        let mut p = A2Player::new(&corpus(COT), 48_000.0).unwrap();
+        let s0 = p.status();
+        assert!(!s0.playing && s0.rows == 0 && s0.frames == 0);
+        p.play();
+        render(&mut p, 48_000);
+        let s1 = p.status();
+        assert!(s1.playing && s1.rows > 3 && s1.frames == 48_000, "{s1:?}");
+        assert_eq!((s1.order as usize, s1.row as usize), (p.order(), p.row()));
+        assert!(s1.speed > 0 && s1.tempo > 0 && (s1.refresh - p.refresh() as f32).abs() < 1e-3);
+        assert!(s1.tick < s1.speed as u16 * 8, "{s1:?}");
+        assert!(p.seek(3, 16));
+        let s2 = p.status();
+        assert_eq!((s2.order, s2.row), (3, 16));
+        assert_eq!(s2.rows, s1.rows + 1, "a seek is one row to a follower");
+        render(&mut p, 24_000);
+        assert!(p.status().rows > s2.rows);
+        // Paused: the position and the clock stay.
+        p.pause();
+        let s3 = p.status();
+        render(&mut p, 4_800);
+        assert_eq!(p.status().row, s3.row);
+        assert_eq!(p.status().frames, s3.frames);
+        assert!(!p.status().playing);
+    }
+
+    #[test]
+    fn mute_and_solo_one_track_at_a_time() {
+        let mut p = A2Player::new(&corpus(COT), 48_000.0).unwrap();
+        p.set_mute(0, true);
+        p.set_mute(5, true);
+        assert_eq!(p.mute_mask(), 0b100001);
+        p.set_mute(0, false);
+        assert_eq!(p.mute_mask(), 0b100000);
+        p.set_solo(2, true);
+        assert_eq!((p.mute_mask(), p.solo_mask()), (0b100000, 0b100));
+        p.set_solo(2, false);
+        assert_eq!(p.solo_mask(), 0);
+        p.set_mute(40, true);
+        assert_eq!(p.mute_mask(), 0b100000, "tracks past 31 are ignored");
+    }
+
+    #[test]
+    fn levels_follow_the_tracks_and_fall_when_the_sound_stops() {
+        let mut p = A2Player::new(&corpus(COT), 48_000.0).unwrap();
+        let mut out = vec![0f32; 32];
+        p.play();
+        render(&mut p, 24_000);
+        assert_eq!(p.track_levels(&mut out), p.track_count());
+        assert!(out.iter().all(|&v| v == 0.0), "off until asked");
+        p.set_levels_enabled(true);
+        render(&mut p, 48_000);
+        let n = p.track_levels(&mut out);
+        assert_eq!(n, p.track_count());
+        let loud = out[..n].iter().cloned().fold(0.0, f32::max);
+        assert!(loud > 0.02, "a track is sounding: {loud}");
+        // Muting the loudest track silences its level.
+        let top = (0..n).max_by(|&a, &b| out[a].total_cmp(&out[b])).unwrap();
+        p.set_mute(top, true);
+        render(&mut p, 24_000);
+        p.track_levels(&mut out);
+        assert_eq!(out[top], 0.0, "a muted track reads 0");
+        // Pausing lets every level fall 24 dB a second.
+        p.set_mute(top, false);
+        render(&mut p, 24_000);
+        p.track_levels(&mut out);
+        let before = out[..n].iter().cloned().fold(0.0, f32::max);
+        p.pause();
+        render(&mut p, 48_000);
+        p.track_levels(&mut out);
+        let after = out[..n].iter().cloned().fold(0.0, f32::max);
+        let fall_db = 20.0 * (after / before).log10();
+        assert!(
+            (fall_db + 24.0).abs() < 1.0,
+            "fell {fall_db:.1} dB in a second"
+        );
+        p.set_levels_enabled(false);
+        p.track_levels(&mut out);
+        assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn a_range_loop_repeats_its_rows() {
+        let mut p = A2Player::new(&corpus(COT), 48_000.0).unwrap();
+        assert!(p.seek(2, 8));
+        p.set_loop(A2Loop::Range {
+            order: 2,
+            row0: 8,
+            row1: 11,
+        });
+        p.play();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..80 {
+            render(&mut p, 6_000);
+            let s = p.status();
+            assert_eq!(s.order, 2);
+            seen.insert(s.row);
+        }
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![8, 9, 10, 11]);
+        assert!(!p.song_end_reached());
+        p.set_loop(A2Loop::None);
+        assert_eq!(p.loop_mode(), A2Loop::None);
+    }
+
+    #[test]
+    fn seek_after_a_reset_is_the_same_as_a_fresh_player() {
+        // The in-place reset of the chip, the resampler and the engine leaves no
+        // trace: a player that has played and seeked renders what a new one does.
+        let mut a = A2Player::new(&corpus(COT), 48_000.0).unwrap();
+        a.play();
+        render(&mut a, 30_000);
+        a.seek(3, 16);
+        let mut b = A2Player::new(&corpus(COT), 48_000.0).unwrap();
+        b.seek(3, 16);
+        b.play();
+        assert_eq!(render(&mut a, 24_000), render(&mut b, 24_000));
+        // And back to the start.
+        a.seek(0, 0);
+        let mut c = A2Player::new(&corpus(COT), 48_000.0).unwrap();
+        c.play();
+        assert_eq!(render(&mut a, 12_000), render(&mut c, 12_000));
+    }
+
+    #[test]
+    fn live_edits_that_miss_the_song_are_refused() {
+        let mut p = A2Player::new(&corpus(COT), 48_000.0).unwrap();
+        let cell = super::super::model::Cell {
+            note: 49,
+            ..Default::default()
+        };
+        assert!(p.apply_edit(&LiveEdit::Cell {
+            pattern: 0,
+            row: 0,
+            track: 0,
+            cell
+        }));
+        assert!(!p.apply_edit(&LiveEdit::Cell {
+            pattern: 200,
+            row: 0,
+            track: 0,
+            cell
+        }));
+        assert!(!p.apply_edit(&LiveEdit::Cell {
+            pattern: 0,
+            row: 999,
+            track: 0,
+            cell
+        }));
+        assert!(!p.apply_edit(&LiveEdit::Instrument {
+            number: 0,
+            fm: [0; 11],
+            panning: 0,
+            finetune: 0,
+            voice_type: 0
+        }));
+        assert!(p.apply_edit(&LiveEdit::Timing {
+            tempo: 60,
+            speed: 3
+        }));
+        assert_eq!((p.status().tempo, p.status().speed), (60, 3));
+        // The edited cell is what the player shows.
+        assert_eq!(p.pattern_cells(0)[0], 49);
     }
 }

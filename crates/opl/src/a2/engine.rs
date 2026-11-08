@@ -350,6 +350,9 @@ pub struct A2Engine {
     next_pos: (usize, usize, usize),
     /// Times the song has passed an order marker.
     loops: u32,
+    /// Rows started since the engine was made or restarted (a repeated row
+    /// of a pattern delay counts).
+    rows_started: u32,
 }
 
 impl A2Engine {
@@ -393,20 +396,9 @@ impl A2Engine {
                 song.patterns.push(empty.clone());
             }
         }
-        // A "fixed" note (0x90 + note, v9+) plays as the note; the flag only
-        // stops the editor from transposing it (AT2 `play_line`).
+        let version = song.version;
         for cell in song.patterns.iter_mut().flat_map(|p| p.cells.iter_mut()) {
-            if (0x91..=0x90 + 97).contains(&cell.note) {
-                cell.note -= 0x90;
-            }
-        }
-        if song.version < 9 {
-            let version = song.version;
-            for cell in song.patterns.iter_mut().flat_map(|p| p.cells.iter_mut()) {
-                for e in cell.effects.iter_mut() {
-                    *e = convert_old_effect(version, *e);
-                }
-            }
+            *cell = playing_cell(version, *cell);
         }
         let mut e = A2Engine {
             adplug_quirks: false,
@@ -431,20 +423,48 @@ impl A2Engine {
             next_pos: (0, 0, 0),
             last_fm_instrument: 0,
             loops: 0,
+            rows_started: 0,
         };
+        e.setup();
+        e
+    }
+
+    /// Puts everything but the song (and `adplug_quirks`) back to the state a
+    /// new engine starts in. Allocates nothing.
+    fn setup(&mut self) {
+        self.speed = self.song.speed;
+        self.tempo = self.song.tempo;
+        self.tracks = [Track::default(); 20];
+        self.order_pos = 0;
+        self.pattern = 0;
+        self.row = 0;
+        self.tick = 0;
+        self.macro_tick = 0;
+        self.global_volume = 63;
+        self.jump = None;
+        self.ended = false;
+        self.bd = 0;
+        self.row_ticks = 0;
+        self.row_len = 0;
+        self.row_tick = 0;
+        self.frame_delay = 0;
+        self.row_delay = 0;
+        self.next_pos = (0, 0, 0);
+        self.loops = 0;
+        self.rows_started = 0;
         // MEASURED: each track's lock byte gives its volume slide type
         // (bits 2-3) always, its panning (bits 0-1) under song flag bit 5,
         // its volume lock (bit 4) under bit 1 and its peak lock (bit 5)
         // under bit 2.
-        e.last_fm_instrument = e
+        self.last_fm_instrument = self
             .song
             .instruments
             .iter()
             .rposition(|i| i.fm != [0; 11])
             .map_or(0, |i| i + 1);
-        let flags = e.song.flags;
-        for (t, tr) in e.tracks.iter_mut().enumerate() {
-            let lock = e.song.lock_flags.get(t).copied().unwrap_or(0);
+        let flags = self.song.flags;
+        for (t, tr) in self.tracks.iter_mut().enumerate() {
+            let lock = self.song.lock_flags.get(t).copied().unwrap_or(0);
             tr.vslide_mode = (lock >> 2) & 3;
             if flags & 0x20 != 0 {
                 tr.pan_lock = true;
@@ -456,11 +476,163 @@ impl A2Engine {
         }
         // MEASURED: before any instrument a track's levels are 0 (full),
         // though under volume scaling they apply to instrument t+1's.
-        match e.resolve_order(0) {
-            Some((order, pattern, _)) => e.next_pos = (order, pattern, 0),
-            None => e.ended = true,
+        match self.resolve_order(0) {
+            Some((order, pattern, _)) => self.next_pos = (order, pattern, 0),
+            None => self.ended = true,
         }
-        e
+    }
+
+    /// Starts the song over from its first row, with the song as it is now
+    /// (live edits included). Allocates nothing; the chip is the caller's
+    /// (`reset` writes its starting registers).
+    pub fn restart(&mut self) {
+        self.setup();
+    }
+
+    /// Rows started since the engine was made or restarted.
+    pub fn rows_started(&self) -> u32 {
+        self.rows_started
+    }
+
+    /// Ticks per row now (effects change it).
+    pub fn speed(&self) -> u8 {
+        self.speed
+    }
+
+    /// The tempo now (effects change it).
+    pub fn tempo(&self) -> u8 {
+        self.tempo
+    }
+
+    /// The timer tick of the row playing, from 0.
+    pub fn tick_in_row(&self) -> u16 {
+        if self.row_len == 0 {
+            self.tick as u16
+        } else {
+            self.row_tick
+        }
+    }
+
+    // ---- live edits: what a song that is playing can take without being
+    // rebuilt. None of them allocates; each says whether it landed.
+
+    /// Puts a cell, as the file holds it, into pattern `pattern` (a number the
+    /// order list can name, spare patterns included) for the song to play the
+    /// next time it reaches it. False for a cell outside the song.
+    pub fn set_cell(&mut self, pattern: usize, row: usize, track: usize, cell: Cell) -> bool {
+        let version = self.song.version;
+        let Some(p) = self.song.patterns.get_mut(pattern) else {
+            return false;
+        };
+        if row >= p.rows || track >= p.channels {
+            return false;
+        }
+        p.cells[row * p.channels + track] = playing_cell(version, cell);
+        true
+    }
+
+    /// Replaces the data of instrument `number` (from 1; not its name). Tracks
+    /// that hold it load it again at their next instrument cell; a note
+    /// sounding now goes on with what it loaded.
+    pub fn set_instrument_data(
+        &mut self,
+        number: usize,
+        fm: [u8; 11],
+        panning: u8,
+        finetune: i8,
+        voice_type: u8,
+    ) -> bool {
+        let Some(i) = number
+            .checked_sub(1)
+            .and_then(|n| self.song.instruments.get_mut(n))
+        else {
+            return false;
+        };
+        (i.fm, i.panning, i.finetune, i.voice_type) = (fm, panning, finetune, voice_type);
+        for tr in self.tracks.iter_mut() {
+            if tr.instrument as usize == number {
+                tr.forced_reload = true;
+            }
+        }
+        self.last_fm_instrument = self
+            .song
+            .instruments
+            .iter()
+            .rposition(|i| i.fm != [0; 11])
+            .map_or(0, |i| i + 1);
+        true
+    }
+
+    /// Replaces FM macro `number` (from 1), in place.
+    pub fn set_fm_macro(&mut self, number: usize, table: &super::model::FmMacro) -> bool {
+        let Some(m) = number
+            .checked_sub(1)
+            .and_then(|n| self.song.fm_macros.get_mut(n))
+        else {
+            return false;
+        };
+        if m.steps.len() != table.steps.len() {
+            return false;
+        }
+        (m.length, m.loop_begin, m.loop_length, m.keyoff_pos) = (
+            table.length,
+            table.loop_begin,
+            table.loop_length,
+            table.keyoff_pos,
+        );
+        (m.arpeggio_table, m.vibrato_table) = (table.arpeggio_table, table.vibrato_table);
+        m.steps.copy_from_slice(&table.steps);
+        true
+    }
+
+    /// Replaces arpeggio macro `number` (from 1), in place.
+    pub fn set_arpeggio_macro(
+        &mut self,
+        number: usize,
+        table: &super::model::ArpeggioMacro,
+    ) -> bool {
+        let Some(m) = number
+            .checked_sub(1)
+            .and_then(|n| self.song.arpeggio_macros.get_mut(n))
+        else {
+            return false;
+        };
+        if m.data.len() != table.data.len() {
+            return false;
+        }
+        (m.length, m.speed, m.loop_begin, m.loop_length, m.keyoff_pos) = (
+            table.length,
+            table.speed,
+            table.loop_begin,
+            table.loop_length,
+            table.keyoff_pos,
+        );
+        m.data.copy_from_slice(&table.data);
+        true
+    }
+
+    /// Replaces vibrato macro `number` (from 1), in place.
+    pub fn set_vibrato_macro(&mut self, number: usize, table: &super::model::VibratoMacro) -> bool {
+        let Some(m) = number
+            .checked_sub(1)
+            .and_then(|n| self.song.vibrato_macros.get_mut(n))
+        else {
+            return false;
+        };
+        if m.data.len() != table.data.len() {
+            return false;
+        }
+        (m.length, m.speed, m.delay) = (table.length, table.speed, table.delay);
+        (m.loop_begin, m.loop_length, m.keyoff_pos) =
+            (table.loop_begin, table.loop_length, table.keyoff_pos);
+        m.data.copy_from_slice(&table.data);
+        true
+    }
+
+    /// Sets the tempo and speed now, and the song's own (a restart starts with them).
+    pub fn set_timing(&mut self, tempo: u8, speed: u8) {
+        (self.tempo, self.speed) = (tempo, speed);
+        (self.song.tempo, self.song.speed) = (tempo, speed);
     }
 
     pub fn song(&self) -> &A2mSong {
@@ -742,6 +914,7 @@ impl A2Engine {
         self.frame_delay = 0;
         self.row_delay = 0;
         (self.order_pos, self.pattern, self.row) = self.next_pos;
+        self.rows_started = self.rows_started.wrapping_add(1);
         self.play_row(out);
         // MEASURED: a speed change counts from the row that carries it.
         let speed = self.speed.max(1) as u16;
@@ -1427,13 +1600,7 @@ impl A2Engine {
     /// AT2 `nFreq(note - 1) + finetune`: the finetune is added to block and
     /// F-number as one number, and notes from 97 up play block 7's top.
     fn note_freq(&self, t: usize, note: u8) -> u16 {
-        let n = (note & 0x7f) as usize - 1;
-        let base = if n >= 96 {
-            FREQ_MAX
-        } else {
-            FNUM[n % 12] | ((n / 12) as u16) << 10
-        };
-        (base as i32 + self.tracks[t].finetune as i32) as u16
+        note_frequency(note, self.tracks[t].finetune)
     }
 
     fn is_porta(fx: u8) -> bool {
@@ -2747,6 +2914,35 @@ impl A2Engine {
 }
 
 /// An instrument with nothing in it, finetune included.
+/// The block and F-number (block in bits 10-12) Adlib Tracker II plays AT2
+/// note `note` at (1 is C-0 ... 96 is B-7; the fixed-note flag is ignored), with
+/// the instrument's fine-tune added to the two as one number. Also what the
+/// instrument audition plays (`crate::audition`).
+pub fn note_frequency(note: u8, finetune: i8) -> u16 {
+    let n = ((note & 0x7f) as usize).max(1) - 1;
+    let base = if n >= 96 {
+        FREQ_MAX
+    } else {
+        FNUM[n % 12] | ((n / 12) as u16) << 10
+    };
+    (base as i32 + finetune as i32) as u16
+}
+
+/// A cell as the engine plays it: a fixed note (0x90 + note, version 9 and up)
+/// plays as the note (the flag only stops the editor from transposing it, AT2
+/// `play_line`); the effects of versions 1-8 become the effects they play as.
+pub(crate) fn playing_cell(version: u8, mut cell: Cell) -> Cell {
+    if (0x91..=0x90 + 97).contains(&cell.note) {
+        cell.note -= 0x90;
+    }
+    if version < 9 {
+        for e in cell.effects.iter_mut() {
+            *e = convert_old_effect(version, *e);
+        }
+    }
+    cell
+}
+
 fn is_empty(d: &super::model::Instrument) -> bool {
     d.fm == [0; 11] && d.panning == 0 && d.finetune == 0 && d.voice_type == 0
 }
