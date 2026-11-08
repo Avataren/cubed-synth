@@ -7,6 +7,8 @@
 //! host sends their data its own way (the worklet takes clip PCM and song
 //! files through its own exports). Decoding never allocates.
 
+use cubed_dsp::live::ParamEdit;
+
 use crate::command::{
     BusId, BusSettings, ClipId, Command, Duck, Event, Play, PlayEngine, PlaySfx, PlaySource,
     SendSettings, SourceId, Start, VoiceId,
@@ -45,6 +47,7 @@ mod tag {
     pub const VOICE_OCCLUSION: u8 = 26;
     pub const PLAY_ENGINE: u8 = 27;
     pub const SET_ENGINE: u8 = 28;
+    pub const SOURCE_PARAM: u8 = 29;
 
     pub const ENDED: u8 = 1;
     pub const STOLEN: u8 = 2;
@@ -223,6 +226,17 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
             w.u64(voice.0);
             w.controls(controls);
         }
+        Command::SourceEvent {
+            voice,
+            event: SourceEvent::Param(edit),
+        } => {
+            // A tag of its own, so `SOURCE_EVENT` keeps its shape.
+            w.u8(tag::SOURCE_PARAM);
+            w.u64(voice.0);
+            w.u128(edit.node);
+            w.u16(edit.param);
+            w.f32(edit.value);
+        }
         Command::SourceEvent { voice, event } => {
             w.u8(tag::SOURCE_EVENT);
             w.u64(voice.0);
@@ -249,6 +263,8 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
                     w.f32(0.0);
                     w.u32(0);
                 }
+                // Encoded above, with a tag of its own.
+                SourceEvent::Param(_) => unreachable!(),
             }
         }
         Command::FadeVoice {
@@ -377,6 +393,9 @@ impl Writer<'_> {
     fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
+    fn u128(&mut self, v: u128) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
     fn f32(&mut self, v: f32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
@@ -464,6 +483,9 @@ impl Reader<'_> {
     }
     fn u64(&mut self) -> Result<u64, WireError> {
         Ok(u64::from_le_bytes(self.take()?))
+    }
+    fn u128(&mut self) -> Result<u128, WireError> {
+        Ok(u128::from_le_bytes(self.take()?))
     }
     fn f32(&mut self) -> Result<f32, WireError> {
         Ok(f32::from_le_bytes(self.take()?))
@@ -729,6 +751,14 @@ impl Reader<'_> {
                     },
                 }
             }
+            tag::SOURCE_PARAM => Command::SourceEvent {
+                voice: self.voice()?,
+                event: SourceEvent::Param(ParamEdit {
+                    node: self.u128()?,
+                    param: self.u16()?,
+                    value: self.f32()?,
+                }),
+            },
             tag::FADE_VOICE => Command::FadeVoice {
                 voice: self.voice()?,
                 gain: self.f32()?,
@@ -837,6 +867,18 @@ mod tests {
             Command::SourceEvent {
                 voice,
                 event: SourceEvent::AllNotesOff,
+            },
+            Command::SourceEvent {
+                voice,
+                event: SourceEvent::Param(ParamEdit::new(
+                    0x1234_5678_9abc_def0_0fed_cba9_8765_4321,
+                    7,
+                    -0.625,
+                )),
+            },
+            Command::SourceEvent {
+                voice,
+                event: SourceEvent::Param(ParamEdit::gain(1.5)),
             },
             Command::PlaySfx(PlaySfx {
                 gain: 0.7,

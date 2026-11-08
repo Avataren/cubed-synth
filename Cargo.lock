@@ -175,6 +175,7 @@ dependencies = [
  "cubed-sid",
  "cubed-tracker",
  "rtrb",
+ "serde_json",
 ]
 
 [[package]]
@@ -197,6 +198,7 @@ dependencies = [
  "cubed-opl",
  "cubed-sid",
  "cubed-tracker",
+ "serde_json",
 ]
 
 [[package]]

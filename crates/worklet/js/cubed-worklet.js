@@ -14,9 +14,14 @@
 //    PlaySource command; separation (0-1) is a module's stereo width
 //   {type: 'effect', bus, slot, kind (EffectKind index; -1 empties the slot),
 //    params: Float32Array}
-//   {type: 'synth', source, bytes: ArrayBuffer (the patch JSON, UTF-8), oneShot}
+//   {type: 'synth', source, bytes: ArrayBuffer (the patch JSON, UTF-8), oneShot,
+//    held?: [[note, velocity], ...], warmBlocks?}
 //    prepares source slot `source` with a synth patch, played by
-//    SourceEvent commands
+//    SourceEvent commands. To swap a rebuilt synth in for a playing one, give
+//    the notes the old one holds as `held` and a few `warmBlocks` (each costs a
+//    block's render time, here on the audio thread: at most 32 are used), then
+//    send one 'commands' batch with PlaySource (gain 0), FadeVoice and Stop for
+//    the old voice. Parameter edits are SourceEvent commands too (wire tag 29).
 // To the page:
 //   {type: 'ready'}
 //   {type: 'song', source, ok, error?}  after each 'song' or 'synth' message
@@ -111,7 +116,24 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         const bytes = new Uint8Array(message.bytes);
         const at = x.cw_file_buffer(bytes.length);
         new Uint8Array(x.memory.buffer, at, bytes.length).set(bytes);
-        const ok = x.cw_prepare_synth(message.source >>> 0, message.oneShot ? 1 : 0) === 1;
+        let ok;
+        if ((message.held && message.held.length > 0) || message.warmBlocks > 0) {
+          const held = message.held ?? [];
+          const room = x.cw_held_buffer(held.length);
+          const view = new Float32Array(x.memory.buffer, room, held.length * 2);
+          held.forEach(([note, velocity], i) => {
+            view[i * 2] = note;
+            view[i * 2 + 1] = velocity;
+          });
+          ok = x.cw_prepare_synth_held(
+            message.source >>> 0,
+            message.oneShot ? 1 : 0,
+            Math.min(32, message.warmBlocks >>> 0),
+            held.length,
+          ) === 1;
+        } else {
+          ok = x.cw_prepare_synth(message.source >>> 0, message.oneShot ? 1 : 0) === 1;
+        }
         const reply = { type: 'song', source: message.source, ok };
         if (!ok) {
           const why = new Uint8Array(x.memory.buffer, x.cw_error(), x.cw_error_len());

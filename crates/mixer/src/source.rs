@@ -1,6 +1,8 @@
 //! Voices whose sound is made as they play instead of read from a clip:
 //! chip-music players, streams, synths.
 
+use cubed_dsp::live::ParamEdit;
+
 use crate::clip::ClipVoice;
 use crate::engine::EngineVoice;
 use crate::sfx::SfxVoice;
@@ -37,6 +39,10 @@ pub enum SourceEvent {
         note: u8,
     },
     AllNotesOff,
+    /// Sets a parameter of a synth's node, or of the patch (see
+    /// `cubed_dsp::live`): applied before its next block and smoothed, so it
+    /// does not click. Other sources ignore it.
+    Param(ParamEdit),
 }
 
 /// What makes a source voice's sound.

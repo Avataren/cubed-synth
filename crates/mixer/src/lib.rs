@@ -55,4 +55,4 @@ pub use sfx::{Sfx, SfxPreset, SfxWave};
 pub use smooth::MIN_DB;
 pub use source::{Source, SourceEvent};
 pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};
-pub use synth::SynthSource;
+pub use synth::{swap_commands, HeldNote, SynthBuild, SynthSource};

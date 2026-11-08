@@ -137,12 +137,80 @@ async function synth() {
   return { ok: replies.length === 1 && replies[0].ok && rms > 0.01, rms, replies };
 }
 
+function paramEvent(voice, nodeHi, nodeLo, param, value) {
+  const v = new DataView(new ArrayBuffer(31));
+  v.setUint8(0, 29); v.setBigUint64(1, BigInt(voice), true);
+  v.setBigUint64(9, nodeLo, true); v.setBigUint64(17, nodeHi, true);
+  v.setUint16(25, param, true); v.setFloat32(27, value, true);
+  return new Uint8Array(v.buffer);
+}
+function fadeVoice(voice, gain, frames) {
+  const v = new DataView(new ArrayBuffer(17));
+  v.setUint8(0, 22); v.setBigUint64(1, BigInt(voice), true);
+  v.setFloat32(9, gain, true); v.setUint32(13, frames, true);
+  return new Uint8Array(v.buffer);
+}
+function stop(voice, frames) {
+  const v = new DataView(new ArrayBuffer(13));
+  v.setUint8(0, 15); v.setBigUint64(1, BigInt(voice), true); v.setUint32(9, frames, true);
+  return new Uint8Array(v.buffer);
+}
+
+// A synth voice edited by a parameter event (the instrument gain closed), and
+// a rebuilt synth swapped in for it with its held note and a crossfade.
+async function synthEdit() {
+  const patchBytes = await (await fetch('../../dsp/tests/real_patch.json')).arrayBuffer();
+  const render = async (build) => {
+    const context = new OfflineAudioContext(2, RATE, RATE);
+    const replies = [];
+    const telemetry = [];
+    const { node, ready } = await mixerNode(context, (m) => {
+      if (m.type === 'song') replies.push(m);
+      else if (m.type === 'telemetry') telemetry.push(m);
+    });
+    build(node);
+    await ready;
+    const left = (await context.startRendering()).getChannelData(0);
+    const rms = Math.sqrt(left.reduce((sum, s) => sum + s * s, 0) / left.length);
+    return { rms, replies, telemetry, left };
+  };
+  const send = (node, ...parts) => {
+    const bytes = new Uint8Array(parts.flatMap((p) => [...p]));
+    node.port.postMessage({ type: 'commands', bytes: bytes.buffer }, [bytes.buffer]);
+  };
+  const start = (node) => {
+    node.port.postMessage({ type: 'synth', source: 0, bytes: patchBytes.slice(0), oneShot: false });
+    send(node, setBus(2, 0), playSource(1, 0, 2), sourceEvent(1, 0, 60, 1, 0));
+  };
+  const plain = await render(start);
+  // PATCH (node 0), parameter 0: the instrument gain, to nothing.
+  const quiet = await render((node) => { start(node); send(node, paramEvent(1, 0n, 0n, 0, 0)); });
+  // The swap: a second synth with the held note and 4 warm-up blocks, crossfaded in.
+  const swapped = await render((node) => {
+    start(node);
+    node.port.postMessage({ type: 'synth', source: 1, bytes: patchBytes.slice(0), oneShot: false, held: [[60, 1]], warmBlocks: 4 });
+    const gain0 = playSource(2, 1, 2);
+    new DataView(gain0.buffer).setFloat32(15, 0, true);
+    send(node, gain0, fadeVoice(2, 1, 2400), stop(1, 2400));
+  });
+  const last = swapped.telemetry[swapped.telemetry.length - 1] ?? {};
+  const ended = swapped.telemetry.some((t) => [...new Uint8Array(t.events)].includes(1));
+  const ok = plain.replies[0]?.ok && plain.rms > 0.01 && quiet.rms < 0.05 * plain.rms
+    && swapped.replies.length === 2 && swapped.replies.every((r) => r.ok)
+    && swapped.rms > 0.5 * plain.rms && last.voices === 1 && ended;
+  return { ok, plain: plain.rms, quiet: quiet.rms, swapped: swapped.rms, voices: last.voices, ended, replies: swapped.replies };
+}
+
 async function run() {
   const clips = await clip();
   const songs = await song();
   const modules = await module();
   const synths = await synth();
-  return { ok: clips.ok && songs.ok && modules.ok && synths.ok, clips, songs, modules, synths };
+  const synthEdits = await synthEdit();
+  return {
+    ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok,
+    clips, songs, modules, synths, synthEdits,
+  };
 }
 
 run().then((r) => { window.result = r; }, (e) => { window.result = { ok: false, error: String(e) }; });

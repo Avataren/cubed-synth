@@ -12,7 +12,10 @@
 //!    (and `cw_clip_right()` for stereo), then `cw_add_clip`. Songs arrive
 //!    as files: write one at `cw_file_buffer(len)`, then `cw_prepare_song`
 //!    makes it a prepared source for a `PlaySource` command; a synth patch
-//!    (the DAW's JSON) the same way with `cw_prepare_synth`. Effects arrive
+//!    (the DAW's JSON) the same way with `cw_prepare_synth`, or, to swap a
+//!    rebuilt synth in for a playing one, `cw_prepare_synth_held` with the notes
+//!    the old one holds. A synth is edited while it plays by `SourceEvent`
+//!    commands (notes, and parameter edits as wire tag 29). Effects arrive
 //!    as a kind and parameters: write them at `cw_effect_params()`, then
 //!    `cw_set_effect`.
 //! 4. Each render quantum, `cw_process(frames)` renders into `cw_left()` and
@@ -28,8 +31,8 @@ use std::sync::Arc;
 
 use cubed_mixer::effects::MAX_PARAMS;
 use cubed_mixer::{
-    wire, BusId, Clip, ClipId, Command, Effect, EffectKind, Mixer, MixerConfig, Returned,
-    SynthSource,
+    wire, BusId, Clip, ClipId, Command, Effect, EffectKind, HeldNote, Mixer, MixerConfig, Returned,
+    SynthBuild, SynthSource,
 };
 
 /// The Web Audio render quantum.
@@ -48,6 +51,9 @@ struct State {
     clip_right: Vec<f32>,
     /// A song file on its way to `cw_prepare_song`.
     file: Vec<u8>,
+    /// Held notes on their way to `cw_prepare_synth_held`: a note number and a
+    /// velocity each.
+    held: Vec<f32>,
     effect_params: [f32; MAX_PARAMS],
     /// Why the last `cw_prepare_song` failed, as ASCII.
     error: Vec<u8>,
@@ -105,6 +111,7 @@ pub extern "C" fn cw_init(
         clip_left: Vec::new(),
         clip_right: Vec::new(),
         file: Vec::new(),
+        held: Vec::new(),
         effect_params: [0.0; MAX_PARAMS],
         error: Vec::new(),
         events: Vec::with_capacity(MAX_EVENTS * wire::EVENT_SIZE),
@@ -321,19 +328,60 @@ fn prepare_song(_: &mut State, _: u32, _: u32, _: SongOptions) -> Result<(), Str
 /// at `cw_error`.
 #[no_mangle]
 pub extern "C" fn cw_prepare_synth(source: u32, one_shot: u32) -> u32 {
+    prepare_synth(source, one_shot, 0, 0)
+}
+
+/// Room for `count` held notes (two floats each: the MIDI note number, then the
+/// velocity 0-1); write them there, then call `cw_prepare_synth_held`.
+#[no_mangle]
+pub extern "C" fn cw_held_buffer(count: u32) -> *mut f32 {
+    let held = &mut state().held;
+    held.resize(count as usize * 2, 0.0);
+    held.as_mut_ptr()
+}
+
+/// `cw_prepare_synth` for a rebuilt synth that takes over from a playing one:
+/// the first `held_count` notes of `cw_held_buffer` are started and `warm_blocks`
+/// blocks of 128 frames are rendered and thrown away, so the new synth sounds
+/// like the old from its first block. The build runs in the message handler, on
+/// the audio thread: every warm-up block costs a block's render time, so keep
+/// it small there (a few). Then send `PlaySource` with gain 0, `FadeVoice` and
+/// `Stop` for the old voice in one batch (`cubed_mixer::swap_commands`).
+#[no_mangle]
+pub extern "C" fn cw_prepare_synth_held(
+    source: u32,
+    one_shot: u32,
+    warm_blocks: u32,
+    held_count: u32,
+) -> u32 {
+    prepare_synth(source, one_shot, warm_blocks, held_count)
+}
+
+fn prepare_synth(source: u32, one_shot: u32, warm_blocks: u32, held_count: u32) -> u32 {
     let s = state();
     s.released.clear();
     s.error.clear();
+    let held: Vec<HeldNote> = s
+        .held
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .take(held_count as usize)
+        .map(|pair| HeldNote {
+            note: pair[0].clamp(0.0, 127.0) as u8,
+            velocity: pair[1].clamp(0.0, 1.0),
+        })
+        .collect();
+    let build = SynthBuild {
+        one_shot: one_shot != 0,
+        held,
+        warm_blocks,
+    };
     let result = std::str::from_utf8(&s.file)
         .map_err(|e| format!("the patch is not UTF-8: {e}"))
-        .and_then(|json| SynthSource::from_patch(json, s.mixer.config().sample_rate));
+        .and_then(|json| SynthSource::from_patch_with(json, s.mixer.config().sample_rate, &build));
     match result {
         Ok(synth) => {
-            let synth = if one_shot != 0 {
-                synth.one_shot()
-            } else {
-                synth
-            };
             s.mixer.apply(Command::PrepareSource(
                 cubed_mixer::SourceId(source),
                 Box::new(synth),
@@ -512,6 +560,87 @@ mod tests {
     }
 
     /// A song file through the exports, on a bus with a built effect.
+    /// A synth patch through the exports: prepared, played, edited by a
+    /// parameter event, and a rebuilt one swapped in with its held note.
+    #[test]
+    fn the_exports_swap_in_a_rebuilt_synth() {
+        use cubed_dsp::live::ParamEdit;
+        use cubed_mixer::{PlaySource, SourceEvent, SourceId, VoiceId};
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 5, 6);
+        send(Command::SetBus(BusId(1), BusSettings::default()));
+        let patch = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dsp/tests/real_patch.json"
+        ))
+        .unwrap();
+        let put_patch = || {
+            let at = cw_file_buffer(patch.len() as u32);
+            // SAFETY: cw_file_buffer made room for the file.
+            unsafe { std::ptr::copy_nonoverlapping(patch.as_ptr(), at, patch.len()) };
+        };
+        put_patch();
+        assert_eq!(cw_prepare_synth(0, 0), 1);
+        send(Command::PlaySource(PlaySource::new(
+            VoiceId(1),
+            SourceId(0),
+            BusId(1),
+        )));
+        send(Command::SourceEvent {
+            voice: VoiceId(1),
+            event: SourceEvent::NoteOn {
+                note: 60,
+                velocity: 1.0,
+                duration: 0,
+            },
+        });
+        let render = |blocks: usize| {
+            let mut energy = 0.0;
+            for _ in 0..blocks {
+                cw_process(128);
+                let left = unsafe { std::slice::from_raw_parts(cw_left(), BLOCK) };
+                energy += left.iter().map(|s| s * s).sum::<f32>();
+            }
+            energy / (blocks * BLOCK) as f32
+        };
+        let playing = render(60);
+        assert!(playing > 1e-5, "the note is heard: {playing}");
+        // A parameter edit for a node that is not there is accepted and does nothing.
+        send(Command::SourceEvent {
+            voice: VoiceId(1),
+            event: SourceEvent::Param(ParamEdit::new(1, 0, 0.5)),
+        });
+        assert_eq!(cw_bad_batches(), 0);
+
+        // The held note goes in the held buffer, two floats a note.
+        let room = cw_held_buffer(1);
+        // SAFETY: cw_held_buffer made room for two floats.
+        unsafe { std::slice::from_raw_parts_mut(room, 2) }.copy_from_slice(&[60.0, 1.0]);
+        put_patch();
+        assert_eq!(cw_prepare_synth_held(1, 0, 8, 1), 1);
+        for command in cubed_mixer::swap_commands(
+            VoiceId(1),
+            PlaySource::new(VoiceId(2), SourceId(1), BusId(1)),
+            1_200,
+        ) {
+            send(command);
+        }
+        let during = render(20);
+        assert!(
+            during > 0.25 * playing,
+            "no gap in the crossfade: {during} vs {playing}"
+        );
+        assert_eq!(cw_voices(), 1, "the old voice ended");
+        // A garbage patch is an error with a reason.
+        let bad = b"not json";
+        let at = cw_file_buffer(bad.len() as u32);
+        // SAFETY: cw_file_buffer made room for the bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bad.as_ptr(), at, bad.len()) };
+        assert_eq!(cw_prepare_synth_held(2, 0, 0, 0), 0);
+        assert!(cw_error_len() > 0);
+        assert_eq!(cw_rejected(), 0);
+    }
+
     #[cfg(feature = "songs")]
     #[test]
     fn the_exports_play_a_song_through_an_effect() {

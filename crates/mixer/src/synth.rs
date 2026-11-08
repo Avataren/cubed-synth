@@ -1,9 +1,20 @@
 //! A synth patch as a source: cubed-dsp's `AudioEngine` playing a patch saved
-//! by the DAW, driven by note events while it plays.
+//! by the DAW, driven by note events while it plays and edited while it plays.
+//!
+//! Two kinds of edit reach a playing synth, as `cubed_dsp::patch_edit` makes
+//! them from a patch document:
+//!
+//! - a parameter change is a `SourceEvent::Param`, applied before the next block
+//!   and smoothed (`AudioEngine::edit_param`); it allocates nothing;
+//! - a structural change (a node or a connection added or removed, an effect
+//!   moved) builds a new synth from the edited document where it is allowed to
+//!   allocate ([`SynthSource::from_patch_with`], with the notes that are held),
+//!   and swaps it in with a crossfade ([`swap_commands`]).
 
 use cubed_dsp::audio_engine::native::AudioEngine;
 use cubed_dsp::AutomationFrame;
 
+use crate::command::{Command, PlaySource, VoiceId};
 use crate::source::{Source, SourceEvent};
 
 /// The engine renders blocks of this many frames.
@@ -25,6 +36,27 @@ struct VoiceState {
     started: u64,
     /// Frames until a note with a duration is released.
     release_in: Option<u64>,
+}
+
+/// A note that is held, to carry over to a rebuilt synth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeldNote {
+    pub note: u8,
+    pub velocity: f32,
+}
+
+/// How to build a synth from a patch (see [`SynthSource::from_patch_with`]).
+#[derive(Clone, Debug, Default)]
+pub struct SynthBuild {
+    /// End the voice once its notes have died away (a sound effect).
+    pub one_shot: bool,
+    /// Notes to start before the first block: the notes the synth it replaces
+    /// is holding.
+    pub held: Vec<HeldNote>,
+    /// Blocks (128 frames) to render and throw away after starting the held
+    /// notes, so their envelopes are past the attack when the synth is swapped
+    /// in. A note held for a second wants 100 or so; 0 starts them cold.
+    pub warm_blocks: u32,
 }
 
 /// A patch played by note events (`SourceEvent::NoteOn` / `NoteOff`). A free
@@ -52,6 +84,29 @@ impl SynthSource {
         let mut engine = AudioEngine::new_with_block_size(sample_rate, 8, ENGINE_BLOCK);
         let voices = engine.init_with_patch(json)?;
         Ok(SynthSource::new(engine, voices, sample_rate))
+    }
+
+    /// A patch built for swapping in for a playing synth: with its held notes
+    /// started and warmed up (see [`SynthBuild`]). Build it off the audio thread.
+    pub fn from_patch_with(
+        json: &str,
+        sample_rate: f32,
+        build: &SynthBuild,
+    ) -> Result<SynthSource, String> {
+        let mut engine = AudioEngine::new_with_block_size(sample_rate, 8, ENGINE_BLOCK);
+        let voices = engine.init_with_patch(json)?;
+        let mut source = SynthSource::idle(engine, voices, sample_rate);
+        source.one_shot = build.one_shot;
+        for held in &build.held {
+            source.note_on(held.note, held.velocity, 0);
+        }
+        // The first block sizes the engine's buffers and plans its graphs; the
+        // warm-up blocks go on from there.
+        for _ in 0..build.warm_blocks.max(1) {
+            source.render_block();
+        }
+        source.read = ENGINE_BLOCK;
+        Ok(source)
     }
 
     /// An engine already set up (by code, or from a patch). Build it off the
@@ -143,8 +198,10 @@ impl SynthSource {
             self.frame
                 .set_voice_values(i, gate, frequency, voice.velocity, 1.0);
         }
+        // The patch's macros (glided when they move) and its instrument gain.
+        self.engine.fill_macro_values(&mut self.frame);
         self.engine
-            .process_with_frame(&self.frame, 1.0, &mut self.left, &mut self.right);
+            .process_with_frame_instrument(&self.frame, &mut self.left, &mut self.right);
         self.read = 0;
     }
 
@@ -199,6 +256,30 @@ impl Source for SynthSource {
                     voice.release_in = None;
                 }
             }
+            // A node the patch does not have is nothing to report here.
+            SourceEvent::Param(edit) => {
+                let _ = self.engine.edit_param(edit);
+            }
         }
     }
+}
+
+/// The commands that replace the synth playing as voice `old` with the one
+/// prepared in `new.source` (the host sends `PrepareSource` first, with a
+/// [`SynthSource`] built by [`SynthSource::from_patch_with`]): the new voice
+/// starts silent and rises to `new.gain` over `fade_frames` while the old one
+/// falls away and ends. Send them in one batch, so they take effect at the
+/// same block. About 1,500 to 2,500 frames (30 to 50 ms) hides the change.
+/// The crossfade is linear: two voices playing the same note with different
+/// phases thin out for a moment.
+pub fn swap_commands(old: VoiceId, new: PlaySource, fade_frames: u32) -> [Command; 3] {
+    [
+        Command::PlaySource(PlaySource { gain: 0.0, ..new }),
+        Command::FadeVoice {
+            voice: new.voice,
+            gain: new.gain,
+            frames: fade_frames,
+        },
+        Command::Stop(old, fade_frames),
+    ]
 }

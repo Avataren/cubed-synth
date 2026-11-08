@@ -738,7 +738,7 @@ fn synth_live_edits() {
     let mut block = 0usize;
     let mut render = |engine: &mut Native, frame: &mut AutomationFrame| {
         for voice in 0..voices {
-            let gate = if (block / 53 + voice) % 2 == 0 {
+            let gate = if (block / 53 + voice).is_multiple_of(2) {
                 1.0
             } else {
                 0.0

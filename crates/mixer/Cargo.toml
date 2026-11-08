@@ -26,6 +26,9 @@ cubed-tracker = { path = "../tracker", optional = true }
 cpal = { version = "0.18", optional = true }
 rtrb = { version = "0.3", optional = true }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true
 
