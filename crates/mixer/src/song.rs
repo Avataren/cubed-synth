@@ -88,6 +88,33 @@ pub enum SongControl {
     /// Switches the per-channel scope rings on or off. They cost the audio
     /// thread nothing while off.
     Scopes(bool),
+    /// Puts a cell in the module's pattern, for the song to play the next time it
+    /// reaches it: a live edit of what is written, that allocates nothing. Wire
+    /// tag 31, 21 bytes. Anything that changes the module's shape (a pattern's
+    /// rows, the order list, a sample) is a new song: open the edited module,
+    /// seek it to where the old one is and swap them (`swap_commands`).
+    SetCell(SongCell),
+}
+
+/// A pattern cell as `SongControl::SetCell` carries it: the same numbers a
+/// module file and the editor's cells hold (see `cubed_tracker::Cell`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SongCell {
+    /// The pattern's number (not its position in the order list).
+    pub pattern: u16,
+    pub row: u16,
+    pub channel: u8,
+    /// 0 none, 255 key off, otherwise a MIDI note number (60 is middle C).
+    pub note: u8,
+    /// MOD: the Amiga period of the note; 0 elsewhere.
+    pub period: u16,
+    /// The instrument (MOD, S3M: sample) number, 1-based; 0 for none.
+    pub instrument: u8,
+    /// The volume column as the file holds it, 0 for none.
+    pub volume: u8,
+    /// The format's own effect byte and its parameter.
+    pub effect: u8,
+    pub param: u8,
 }
 
 /// Where a module song's transport is, as the player last published it.

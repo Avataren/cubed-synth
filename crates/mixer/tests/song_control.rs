@@ -356,3 +356,41 @@ fn the_scope_frame_count_is_the_trackers() {
     assert_eq!(SONG_SCOPE_FRAMES, cubed_tracker::SCOPE_FRAMES);
     assert_eq!(SONG_LEVEL_SLOTS, cubed_tracker::LEVEL_SLOTS);
 }
+
+#[test]
+fn live_cell_edits_arrive_by_wire_and_are_played() {
+    use cubed_mixer::SongCell;
+    let mut rig = rig("demo.mod", SongFormat::Mod, SongOptions::default(), true);
+    // Rows 0 to 3 of pattern 0 emptied, one cell at a time (21 bytes each).
+    for row in 0..4 {
+        for channel in 0..4 {
+            rig.control_by_wire(SongControl::SetCell(SongCell {
+                pattern: 0,
+                row,
+                channel,
+                ..Default::default()
+            }));
+        }
+    }
+    rig.control(SongControl::Seek { order: 0, row: 0 });
+    rig.control(SongControl::Play);
+    assert_eq!(peak(&rig.run(0.3)), 0.0);
+    // C-2 on sample 1 in row 1 of channel 1.
+    rig.control_by_wire(SongControl::SetCell(SongCell {
+        pattern: 0,
+        row: 1,
+        channel: 1,
+        note: 36,
+        period: 428,
+        instrument: 1,
+        ..Default::default()
+    }));
+    rig.control(SongControl::Seek { order: 0, row: 0 });
+    assert!(energy(&rig.run(0.3)) > 0.01);
+    // A cell that is not there changes nothing and breaks nothing.
+    rig.control_by_wire(SongControl::SetCell(SongCell {
+        pattern: 77,
+        ..Default::default()
+    }));
+    assert!(rig.mixer.is_playing(VOICE));
+}

@@ -15,7 +15,7 @@ use crate::command::{
 };
 use crate::engine::{EngineControls, EngineSound, MAX_CYLINDERS};
 use crate::sfx::{Sfx, SfxWave};
-use crate::song::{SongControl, SongLoop};
+use crate::song::{SongCell, SongControl, SongLoop};
 use crate::source::SourceEvent;
 use crate::spatial::{Listener, Rolloff, Spatial, SpatialMode};
 
@@ -50,6 +50,7 @@ mod tag {
     pub const SET_ENGINE: u8 = 28;
     pub const SOURCE_PARAM: u8 = 29;
     pub const SONG_CONTROL: u8 = 30;
+    pub const SONG_CELL: u8 = 31;
 
     pub const ENDED: u8 = 1;
     pub const STOLEN: u8 = 2;
@@ -241,6 +242,23 @@ pub fn encode(command: &Command, out: &mut Vec<u8>) -> bool {
         }
         Command::SourceEvent {
             voice,
+            event: SourceEvent::Song(SongControl::SetCell(cell)),
+        } => {
+            // 21 bytes, a layout of its own.
+            w.u8(tag::SONG_CELL);
+            w.u64(voice.0);
+            w.u16(cell.pattern);
+            w.u16(cell.row);
+            w.u8(cell.channel);
+            w.u8(cell.note);
+            w.u16(cell.period);
+            w.u8(cell.instrument);
+            w.u8(cell.volume);
+            w.u8(cell.effect);
+            w.u8(cell.param);
+        }
+        Command::SourceEvent {
+            voice,
             event: SourceEvent::Song(control),
         } => {
             // 24 bytes: tag, voice, kind, three u16s, an f32, a u32.
@@ -373,6 +391,8 @@ fn song_fields(control: &SongControl) -> (u8, u16, u16, u16, f32, u32) {
         SongControl::PreviewOff => (11, 0, 0, 0, 0.0, 0),
         SongControl::Looped(on) => (12, 0, on as u16, 0, 0.0, 0),
         SongControl::Scopes(on) => (13, 0, on as u16, 0, 0.0, 0),
+        // Encoded with a tag of its own.
+        SongControl::SetCell(_) => unreachable!(),
     }
 }
 
@@ -856,6 +876,20 @@ impl Reader<'_> {
                     event: SourceEvent::Song(song_control(kind, a, b, c, value, frames)?),
                 }
             }
+            tag::SONG_CELL => Command::SourceEvent {
+                voice: self.voice()?,
+                event: SourceEvent::Song(SongControl::SetCell(SongCell {
+                    pattern: self.u16()?,
+                    row: self.u16()?,
+                    channel: self.u8()?,
+                    note: self.u8()?,
+                    period: self.u16()?,
+                    instrument: self.u8()?,
+                    volume: self.u8()?,
+                    effect: self.u8()?,
+                    param: self.u8()?,
+                })),
+            },
             tag::FADE_VOICE => Command::FadeVoice {
                 voice: self.voice()?,
                 gain: self.f32()?,
@@ -1162,6 +1196,25 @@ mod tests {
             SongControl::Scopes(true),
             SongControl::Scopes(false),
         ];
+        let cell = SongCell {
+            pattern: 300,
+            row: 63,
+            channel: 31,
+            note: 255,
+            period: 428,
+            instrument: 31,
+            volume: 0x50,
+            effect: 0x0c,
+            param: 0xfe,
+        };
+        let mut bytes = Vec::new();
+        let command = Command::SourceEvent {
+            voice,
+            event: SourceEvent::Song(SongControl::SetCell(cell)),
+        };
+        assert!(encode(&command, &mut bytes));
+        assert_eq!((bytes.len(), bytes[0]), (21, 31));
+        round_trip(command);
         for control in controls {
             let command = Command::SourceEvent {
                 voice,

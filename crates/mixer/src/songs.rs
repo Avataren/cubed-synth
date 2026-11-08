@@ -316,6 +316,25 @@ impl ModuleSong {
             SongControl::PreviewOff => player.preview_off(),
             SongControl::Looped(on) => player.set_looped(on),
             SongControl::Scopes(on) => self.probe.set_scopes(on),
+            SongControl::SetCell(cell) => {
+                player.set_cell(
+                    cell.pattern as usize,
+                    cell.row as usize,
+                    cell.channel as usize,
+                    cubed_tracker::Cell {
+                        note: match cell.note {
+                            0 => cubed_tracker::Note::None,
+                            255 => cubed_tracker::Note::Off,
+                            midi => cubed_tracker::Note::On(midi),
+                        },
+                        period: cell.period,
+                        instrument: cell.instrument,
+                        volume: cell.volume,
+                        effect: cell.effect,
+                        param: cell.param,
+                    },
+                );
+            }
         }
     }
 }

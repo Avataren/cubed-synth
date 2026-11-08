@@ -58,8 +58,8 @@ pub use mixer::{BusMeter, Mixer, MixerConfig, Stats, MAX_INSERTS, MAX_SENDS};
 pub use sfx::{Sfx, SfxPreset, SfxWave};
 pub use smooth::MIN_DB;
 pub use song::{
-    SongControl, SongLoop, SongReader, SongStatus, WebSong, SONG_LEVEL_SLOTS, SONG_MAX_CHANNELS,
-    SONG_SCOPE_FRAMES, SONG_STATUS_WORDS,
+    SongCell, SongControl, SongLoop, SongReader, SongStatus, WebSong, SONG_LEVEL_SLOTS,
+    SONG_MAX_CHANNELS, SONG_SCOPE_FRAMES, SONG_STATUS_WORDS,
 };
 pub use source::{Source, SourceEvent};
 pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};
