@@ -181,10 +181,10 @@ impl WavetableOscillator {
             frequency: initial_frequency,
 
             unison_voices: 1,
-            voice_phases: vec![0.0; 1],
-            voice_last_outputs: vec![0.0; 1],
-            voice_weights: Vec::with_capacity(16),
-            voice_offsets: Vec::with_capacity(16),
+            voice_phases: super::analog_oscillator::unison_vec(1, 0.0),
+            voice_last_outputs: super::analog_oscillator::unison_vec(1, 0.0),
+            voice_weights: super::analog_oscillator::unison_vec(0, 1.0),
+            voice_offsets: super::analog_oscillator::unison_vec(0, 0.0),
 
             collection_name: "default".to_string(),
             wavetable_bank: bank,

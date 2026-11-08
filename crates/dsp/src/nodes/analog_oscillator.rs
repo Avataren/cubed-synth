@@ -45,6 +45,18 @@ use super::{Waveform, WavetableBank};
 // Public state‑update struct
 // ------------------------------------------------------------------------------------------------------------------
 
+/// The most unison voices an oscillator keeps room for: changing the count
+/// while it plays stays within it, so it never allocates.
+pub const MAX_UNISON_VOICES: usize = 16;
+
+/// A per-unison-voice vector of `len` copies of `fill` with room for
+/// [`MAX_UNISON_VOICES`].
+pub(crate) fn unison_vec(len: usize, fill: f32) -> Vec<f32> {
+    let mut v = Vec::with_capacity(MAX_UNISON_VOICES.max(len));
+    v.resize(len, fill);
+    v
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct AnalogOscillatorStateUpdate {
@@ -260,10 +272,10 @@ impl AnalogOscillator {
             waveform,
 
             unison_voices: init_voice_count,
-            voice_phases: vec![0.0; init_voice_count],
-            voice_last_out: vec![0.0; init_voice_count],
-            voice_offsets: vec![0.0; init_voice_count],
-            voice_weights: vec![1.0; init_voice_count],
+            voice_phases: unison_vec(init_voice_count, 0.0),
+            voice_last_out: unison_vec(init_voice_count, 0.0),
+            voice_offsets: unison_vec(init_voice_count, 0.0),
+            voice_weights: unison_vec(init_voice_count, 1.0),
 
             // scratch
             mod_add: vec![0.0; buf_cap],

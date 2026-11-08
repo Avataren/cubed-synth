@@ -2,20 +2,8 @@ use crate::traits::{Inputs, Outputs};
 use cubed_simd::Simd;
 use std::any::Any;
 
-use rustc_hash::FxHashMap;
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-use web_sys::console;
-
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-fn log_console(message: &str) {
-    console::log_1(&message.into());
-}
-
-#[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
-fn log_console(_message: &str) {}
-
-use crate::graph::ModulationSource;
 use crate::{AudioNode, PortId};
+use rustc_hash::FxHashMap;
 
 /// A single step in the arpeggiator pattern.
 #[derive(Clone, Copy)]
@@ -231,26 +219,6 @@ impl ArpeggiatorGenerator {
         }
     }
 
-    /// Process modulation from a gate input.
-    /// If no gate input is provided, returns a vector filled with the default value.
-    fn process_modulations(
-        &self,
-        buffer_size: usize,
-        maybe_sources: Option<&[ModulationSource]>,
-        default: f32,
-    ) -> Vec<f32> {
-        if let Some(sources) = maybe_sources {
-            let buf = &sources[0].buffer;
-            if buf.len() >= buffer_size {
-                buf[..buffer_size].to_vec()
-            } else {
-                vec![default; buffer_size]
-            }
-        } else {
-            vec![default; buffer_size]
-        }
-    }
-
     /// Process the arpeggiator in modes that use SIMD block processing.
     fn process_simd(&mut self, outputs: &mut Outputs<'_>, buffer_size: usize) {
         let output = outputs
@@ -324,14 +292,15 @@ impl ArpeggiatorGenerator {
         let output = outputs
             .get_mut(&PortId::AudioOutput0)
             .expect("Expected AudioOutput0 output port");
-        let gate_mod = self.process_modulations(buffer_size, inputs.get(&PortId::GlobalGate), 0.0);
+        // The gate input's first source, read in place (a missing or short one is closed).
+        let gate = inputs
+            .get(&PortId::GlobalGate)
+            .and_then(|sources| sources.first())
+            .map(|source| source.buffer)
+            .filter(|buffer| buffer.len() >= buffer_size);
         for j in 0..buffer_size {
-            let current_gate = gate_mod[j] > 0.5;
+            let current_gate = gate.map_or(0.0, |buffer| buffer[j]) > 0.5;
             if !self.prev_gate_active && current_gate {
-                log_console(&format!(
-                    "Arpeggiator Trigger Debug: Rising edge detected at sample {}",
-                    self.sample_counter + j
-                ));
                 self.sample_counter = 0;
                 self.prev_step = 0;
             }

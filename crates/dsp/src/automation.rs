@@ -143,6 +143,24 @@ impl AutomationFrame {
         }
     }
 
+    /// Fills a macro's lane so it glides from `from` (the last block's end) to
+    /// `to` over the block, one step per sample: a macro moved during playback
+    /// is heard without a step in the sound.
+    pub fn set_macro_ramp(&mut self, voice_index: usize, macro_index: usize, from: f32, to: f32) {
+        if voice_index >= self.num_voices || macro_index >= self.macro_count {
+            return;
+        }
+        let start = self.macro_offset(voice_index, macro_index);
+        let len = self.macro_buffer_len;
+        let step = (to - from) / len as f32;
+        for (i, slot) in self.macro_buffers[start..start + len]
+            .iter_mut()
+            .enumerate()
+        {
+            *slot = from + step * (i + 1) as f32;
+        }
+    }
+
     pub fn macro_slice(&self, voice_index: usize, macro_index: usize) -> &[f32] {
         let start = self.macro_offset(voice_index, macro_index);
         let end = start + self.macro_buffer_len;

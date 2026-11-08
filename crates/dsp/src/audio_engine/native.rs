@@ -1,6 +1,7 @@
 use crate::audio_engine::patch::{
-    AudioAsset, GlideState, LfoState, PatchFile, PatchNode, SynthState,
-    VoiceLayout as PatchVoiceLayout,
+    AudioAsset, BitcrusherState, ChorusState, CompressorState, DelayState, FilterState, GlideState,
+    LfoState, NoiseState, PatchFile, PatchNode, ReverbState, SamplerState, SaturationState,
+    SynthState, VoiceLayout as PatchVoiceLayout,
 };
 use crate::audio_engine::patch_loader::{
     effect_chain, for_each_node_in_creation_order, is_effect_id,
@@ -31,6 +32,9 @@ use base64::Engine as _;
 use rustc_hash::FxHashMap;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 use uuid::Uuid;
+
+mod live;
+pub use live::EditError;
 
 const DEFAULT_NUM_VOICES: usize = 8;
 
@@ -75,6 +79,8 @@ pub struct AudioEngine {
     macro_values: [f32; MACRO_COUNT],
     /// The patch's output gain, which the host applies as the master gain.
     instrument_gain: f32,
+    /// Edits in flight and the typed state they act on (see `live`).
+    live: live::Live,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +188,7 @@ impl AudioEngine {
             sampler_data: FxHashMap::default(),
             macro_values: [0.0; MACRO_COUNT],
             instrument_gain: 1.0,
+            live: live::Live::new(),
         };
         engine.init(sample_rate, initial_voice_count);
         engine
@@ -198,6 +205,7 @@ impl AudioEngine {
         self.num_voices = voice_count;
         self.macro_values = [0.0; MACRO_COUNT];
         self.instrument_gain = 1.0;
+        self.live = live::Live::new();
         self.voices = (0..voice_count)
             .map(|id| Voice::new(id, self.block_size))
             .collect();
@@ -282,6 +290,7 @@ impl AudioEngine {
         self.apply_patch_states(&patch, canonical_voice)?;
         self.import_audio_assets(&patch.audio_assets)?;
         self.apply_patch_macros(&patch.synth_state);
+        self.build_live(patch);
 
         Ok(voice_count)
     }
@@ -382,16 +391,6 @@ impl AudioEngine {
     /// plays the engine through it as the master gain.
     pub fn instrument_gain(&self) -> f32 {
         self.instrument_gain
-    }
-
-    /// Writes the macros' values into every voice's lanes of `frame`, which is
-    /// how the engine hears them.
-    pub fn fill_macro_values(&self, frame: &mut AutomationFrame) {
-        for voice in 0..frame.num_voices() {
-            for (index, value) in self.macro_values.iter().enumerate() {
-                frame.set_macro_value(voice, index, *value);
-            }
-        }
     }
 
     /// The patch's embedded samples and impulse responses (base64 WAVs keyed
@@ -1019,7 +1018,7 @@ impl AudioEngine {
     fn apply_patch_states(
         &mut self,
         patch: &PatchFile,
-        _canonical_voice: &PatchVoiceLayout,
+        canonical_voice: &PatchVoiceLayout,
     ) -> Result<(), String> {
         for (id, params) in &patch.synth_state.oscillators {
             let node_id = parse_node_id(id)?;
@@ -1031,86 +1030,25 @@ impl AudioEngine {
         }
         for (id, config) in &patch.synth_state.envelopes {
             let node_id = parse_node_id(id)?;
-            self.update_envelope(
-                node_id,
-                config.attack,
-                config.decay,
-                config.sustain,
-                config.release,
-                config.attack_curve,
-                config.decay_curve,
-                config.release_curve,
-                config.active,
-            )?;
+            self.apply_envelope_state(node_id, config)?;
         }
         for state in patch.synth_state.lfos.values() {
             self.update_lfo(parse_node_id(&state.lfo_id)?, state);
         }
         for filter in patch.synth_state.filters.values() {
-            self.update_filters(
-                parse_node_id(&filter.id)?,
-                filter.cutoff,
-                filter.resonance,
-                filter.gain,
-                filter.key_tracking,
-                filter.comb_frequency,
-                filter.comb_dampening,
-                filter.oversampling,
-                filter_type_from_i32(filter.filter_type)?,
-                filter.filter_slope,
-            )?;
+            self.apply_filter_state(filter)?;
         }
         for sampler in patch.synth_state.samplers.values() {
-            self.update_sampler(
-                parse_node_id(&sampler.id)?,
-                sampler.frequency,
-                sampler.gain,
-                sampler.loop_mode,
-                sampler.loop_start,
-                sampler.loop_end,
-                sampler.root_note,
-                sampler.trigger_mode,
-                sampler.active,
-            )?;
+            self.apply_sampler_state(sampler)?;
         }
         for chorus in patch.synth_state.choruses.values() {
-            if let Ok(node_id) = chorus.id.parse::<usize>() {
-                self.update_chorus(
-                    node_id,
-                    chorus.active,
-                    chorus.base_delay_ms,
-                    chorus.depth_ms,
-                    chorus.lfo_rate_hz,
-                    chorus.feedback,
-                    chorus.feedback_filter,
-                    chorus.mix,
-                    chorus.stereo_phase_offset_deg,
-                );
-            }
+            self.apply_chorus_state(chorus);
         }
         for delay in patch.synth_state.delays.values() {
-            if let Ok(node_id) = delay.id.parse::<usize>() {
-                self.update_delay(
-                    node_id,
-                    delay.delay_ms,
-                    delay.feedback,
-                    delay.wet_mix,
-                    delay.active,
-                );
-            }
+            self.apply_delay_state(delay);
         }
         for reverb in patch.synth_state.reverbs.values() {
-            if let Ok(node_id) = reverb.id.parse::<usize>() {
-                self.update_reverb(
-                    node_id,
-                    reverb.active,
-                    reverb.room_size,
-                    reverb.damp,
-                    reverb.wet,
-                    reverb.dry,
-                    reverb.width,
-                );
-            }
+            self.apply_reverb_state(reverb);
         }
         for convolver in patch.synth_state.convolvers.values() {
             if let Ok(node_id) = convolver.id.parse::<usize>() {
@@ -1118,23 +1056,12 @@ impl AudioEngine {
             }
         }
         if let Some(noise) = &patch.synth_state.noise {
-            if let Some(noise_id) = find_node_id(_canonical_voice, "noise") {
-                let noise_type = match noise.noise_type {
-                    1 => NoiseType::Pink,
-                    2 => NoiseType::Brownian,
-                    _ => NoiseType::White,
-                };
-                self.update_noise(
-                    parse_node_id(&noise_id)?,
-                    noise_type,
-                    noise.cutoff,
-                    noise.gain,
-                    noise.is_enabled,
-                )?;
+            if let Some(noise_id) = find_node_id(canonical_voice, "noise") {
+                self.apply_noise_state(parse_node_id(&noise_id)?, noise)?;
             }
         }
         if let Some(velocity) = &patch.synth_state.velocity {
-            if let Some(velocity_id) = find_node_id(_canonical_voice, "global_velocity") {
+            if let Some(velocity_id) = find_node_id(canonical_voice, "global_velocity") {
                 self.update_velocity(
                     parse_node_id(&velocity_id)?,
                     velocity.sensitivity,
@@ -1144,62 +1071,196 @@ impl AudioEngine {
         }
 
         for glide in patch.synth_state.glides.values() {
-            let glide_id = parse_node_id(&glide.glide_id)?;
-            for voice in &mut self.voices {
-                if let Some(node) = voice.graph.get_node_mut(glide_id) {
-                    if let Some(glide_node) = node.as_any_mut().downcast_mut::<Glide>() {
-                        glide_node.set_time(glide.resolved_time());
-                        glide_node.set_active(glide.active);
-                    }
-                }
-            }
+            self.apply_glide_state(glide)?;
         }
 
         for compressor in patch.synth_state.compressors.values() {
-            if let Ok(node_id) = compressor.id.parse::<usize>() {
-                if let Err(err) = self.update_compressor(
-                    node_id,
-                    compressor.active,
-                    compressor.threshold_db,
-                    compressor.ratio,
-                    compressor.attack_ms,
-                    compressor.release_ms,
-                    compressor.makeup_gain_db,
-                    compressor.mix,
-                ) {
-                    eprintln!("Failed to apply compressor state: {}", err);
-                }
+            if let Err(err) = self.apply_compressor_state(compressor) {
+                eprintln!("Failed to apply compressor state: {}", err);
             }
         }
 
         for saturation in patch.synth_state.saturations.values() {
-            if let Ok(node_id) = saturation.id.parse::<usize>() {
-                if let Err(err) = self.update_saturation(
-                    node_id,
-                    saturation.drive,
-                    saturation.mix,
-                    saturation.active,
-                ) {
-                    eprintln!("Failed to apply saturation state: {}", err);
-                }
+            if let Err(err) = self.apply_saturation_state(saturation) {
+                eprintln!("Failed to apply saturation state: {}", err);
             }
         }
 
         for bitcrusher in patch.synth_state.bitcrushers.values() {
-            if let Ok(node_id) = bitcrusher.id.parse::<usize>() {
-                if let Err(err) = self.update_bitcrusher(
-                    node_id,
-                    bitcrusher.bits,
-                    bitcrusher.downsample_factor,
-                    bitcrusher.mix,
-                    bitcrusher.active,
-                ) {
-                    eprintln!("Failed to apply bitcrusher state: {}", err);
+            if let Err(err) = self.apply_bitcrusher_state(bitcrusher) {
+                eprintln!("Failed to apply bitcrusher state: {}", err);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_envelope_state(
+        &mut self,
+        node_id: NodeId,
+        config: &EnvelopeConfig,
+    ) -> Result<(), String> {
+        self.update_envelope(
+            node_id,
+            config.attack,
+            config.decay,
+            config.sustain,
+            config.release,
+            config.attack_curve,
+            config.decay_curve,
+            config.release_curve,
+            config.active,
+        )
+    }
+
+    pub(crate) fn apply_filter_state(&mut self, filter: &FilterState) -> Result<(), String> {
+        self.update_filters(
+            parse_node_id(&filter.id)?,
+            filter.cutoff,
+            filter.resonance,
+            filter.gain,
+            filter.key_tracking,
+            filter.comb_frequency,
+            filter.comb_dampening,
+            filter.oversampling,
+            filter_type_from_i32(filter.filter_type)?,
+            filter.filter_slope,
+        )
+    }
+
+    pub(crate) fn apply_sampler_state(&mut self, sampler: &SamplerState) -> Result<(), String> {
+        self.update_sampler(
+            parse_node_id(&sampler.id)?,
+            sampler.frequency,
+            sampler.gain,
+            sampler.loop_mode,
+            sampler.loop_start,
+            sampler.loop_end,
+            sampler.root_note,
+            sampler.trigger_mode,
+            sampler.active,
+        )
+    }
+
+    pub(crate) fn apply_chorus_state(&mut self, chorus: &ChorusState) {
+        if let Ok(node_id) = chorus.id.parse::<usize>() {
+            self.update_chorus(
+                node_id,
+                chorus.active,
+                chorus.base_delay_ms,
+                chorus.depth_ms,
+                chorus.lfo_rate_hz,
+                chorus.feedback,
+                chorus.feedback_filter,
+                chorus.mix,
+                chorus.stereo_phase_offset_deg,
+            );
+        }
+    }
+
+    pub(crate) fn apply_delay_state(&mut self, delay: &DelayState) {
+        if let Ok(node_id) = delay.id.parse::<usize>() {
+            self.update_delay(
+                node_id,
+                delay.delay_ms,
+                delay.feedback,
+                delay.wet_mix,
+                delay.active,
+            );
+        }
+    }
+
+    pub(crate) fn apply_reverb_state(&mut self, reverb: &ReverbState) {
+        if let Ok(node_id) = reverb.id.parse::<usize>() {
+            self.update_reverb(
+                node_id,
+                reverb.active,
+                reverb.room_size,
+                reverb.damp,
+                reverb.wet,
+                reverb.dry,
+                reverb.width,
+            );
+        }
+    }
+
+    pub(crate) fn apply_noise_state(
+        &mut self,
+        noise_id: NodeId,
+        noise: &NoiseState,
+    ) -> Result<(), String> {
+        let noise_type = match noise.noise_type {
+            1 => NoiseType::Pink,
+            2 => NoiseType::Brownian,
+            _ => NoiseType::White,
+        };
+        self.update_noise(
+            noise_id,
+            noise_type,
+            noise.cutoff,
+            noise.gain,
+            noise.is_enabled,
+        )
+    }
+
+    pub(crate) fn apply_glide_state(&mut self, glide: &GlideState) -> Result<(), String> {
+        let glide_id = parse_node_id(&glide.glide_id)?;
+        for voice in &mut self.voices {
+            if let Some(node) = voice.graph.get_node_mut(glide_id) {
+                if let Some(glide_node) = node.as_any_mut().downcast_mut::<Glide>() {
+                    glide_node.set_time(glide.resolved_time());
+                    glide_node.set_active(glide.active);
                 }
             }
         }
-        // ... and so on for other state types (LFOs, filters, etc.)
         Ok(())
+    }
+
+    pub(crate) fn apply_compressor_state(
+        &mut self,
+        compressor: &CompressorState,
+    ) -> Result<(), String> {
+        let node_id = compressor
+            .id
+            .parse::<usize>()
+            .map_err(|_| "Invalid compressor node id".to_string())?;
+        self.update_compressor(
+            node_id,
+            compressor.active,
+            compressor.threshold_db,
+            compressor.ratio,
+            compressor.attack_ms,
+            compressor.release_ms,
+            compressor.makeup_gain_db,
+            compressor.mix,
+        )
+    }
+
+    pub(crate) fn apply_saturation_state(
+        &mut self,
+        saturation: &SaturationState,
+    ) -> Result<(), String> {
+        let node_id = saturation
+            .id
+            .parse::<usize>()
+            .map_err(|_| "Invalid saturation node id".to_string())?;
+        self.update_saturation(node_id, saturation.drive, saturation.mix, saturation.active)
+    }
+
+    pub(crate) fn apply_bitcrusher_state(
+        &mut self,
+        bitcrusher: &BitcrusherState,
+    ) -> Result<(), String> {
+        let node_id = bitcrusher
+            .id
+            .parse::<usize>()
+            .map_err(|_| "Invalid bitcrusher node id".to_string())?;
+        self.update_bitcrusher(
+            node_id,
+            bitcrusher.bits,
+            bitcrusher.downsample_factor,
+            bitcrusher.mix,
+            bitcrusher.active,
+        )
     }
 
     pub fn process_audio(
@@ -1226,6 +1287,7 @@ impl AudioEngine {
             macro_values,
             macro_buffer_len,
             master_gain,
+            false,
             output_left,
             output_right,
         );
@@ -1240,30 +1302,27 @@ impl AudioEngine {
         macro_values: &[f32],
         macro_buffer_len: usize,
         master_gain: f32,
+        instrument: bool,
         output_left: &mut [f32],
         output_right: &mut [f32],
     ) {
-        #[cfg(debug_assertions)]
-        {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            // Debug logging is expensive; keep it out of release builds.
-            static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
-            let call_count = CALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if call_count.is_multiple_of(1000) {
-                eprintln!("ENGINE process_audio_internal call {}:", call_count);
-                eprintln!(
-                    "  output_left.len()={}, output_right.len()={}",
-                    output_left.len(),
-                    output_right.len()
-                );
-                eprintln!("  self.block_size={}", self.block_size);
-            }
-        }
-
         // wasm32-unknown-unknown has no clock (`Instant::now` panics there,
         // e.g. in the mixer's AudioWorklet): the CPU meter stays at 0.
         #[cfg(not(target_arch = "wasm32"))]
         let start = std::time::Instant::now();
+
+        // Edits in flight: step the glides, and apply what waited for the output
+        // to duck. An engine with none skips this.
+        let dip = if self.live.is_idle() {
+            (1.0, 1.0)
+        } else {
+            self.begin_live_block()
+        };
+        let gain_ramp = if instrument {
+            self.instrument_gain_ramp()
+        } else {
+            (1.0, 1.0)
+        };
 
         // Reuse preallocated buffers sized to the engine's block size.
         let block_len = self.block_size.max(1);
@@ -1395,6 +1454,18 @@ impl AudioEngine {
             }
         }
 
+        // The instrument gain and the output's duck, a step per sample.
+        let (gain_from, gain_to) = (dip.0 * gain_ramp.0, dip.1 * gain_ramp.1);
+        if gain_from != 1.0 || gain_to != 1.0 {
+            let n = self.effect_left.len().min(self.effect_right.len());
+            let step = (gain_to - gain_from) / n as f32;
+            for i in 0..n {
+                let gain = gain_from + step * (i + 1) as f32;
+                self.effect_left[i] *= gain;
+                self.effect_right[i] *= gain;
+            }
+        }
+
         // CRITICAL: Only copy the requested number of samples to the output
         let copy_len = output_left.len().min(self.block_size);
         output_left[..copy_len].copy_from_slice(&self.effect_left[..copy_len]);
@@ -1441,6 +1512,31 @@ impl AudioEngine {
             frame.macro_buffers(),
             frame.macro_buffer_len(),
             master_gain,
+            false,
+            output_left,
+            output_right,
+        );
+    }
+
+    /// Like `process_with_frame`, for a host that plays the patch as an
+    /// instrument: the output goes through the patch's `instrumentGain`, which
+    /// glides per sample when it is changed (`ParamEdit::gain`), and the macros
+    /// glide if the host feeds them with `fill_macro_values`.
+    pub fn process_with_frame_instrument(
+        &mut self,
+        frame: &AutomationFrame,
+        output_left: &mut [f32],
+        output_right: &mut [f32],
+    ) {
+        self.process_audio_internal(
+            frame.gates(),
+            frame.frequencies(),
+            frame.gains(),
+            frame.velocities(),
+            frame.macro_buffers(),
+            frame.macro_buffer_len(),
+            1.0,
+            true,
             output_left,
             output_right,
         );

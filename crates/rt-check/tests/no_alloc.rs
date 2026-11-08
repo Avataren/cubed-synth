@@ -705,3 +705,106 @@ fn mixer_engine() {
         mixer.drain_events(|_| {});
     });
 }
+
+/// Parameter edits on a running synth: every parameter of every node type set
+/// to a few values while notes play, counted from the edit through the blocks
+/// that ramp or duck for it. A parameter that cannot be changed without
+/// allocating would show up here.
+#[test]
+fn synth_live_edits() {
+    use cubed_dsp::audio_engine::native::AudioEngine as Native;
+    use cubed_dsp::catalog::{self, ParamKind};
+    use cubed_dsp::live::ParamEdit;
+    use cubed_dsp::patch_edit::PatchDoc;
+    use serde_json::json;
+
+    let rate = RATE as f32;
+    let mut doc = PatchDoc::new("edits");
+    for spec in catalog::NODES.iter().filter(|n| n.deletable) {
+        if !doc.nodes().iter().any(|n| n.type_name == spec.type_name) {
+            doc.add_node(spec.type_name).unwrap();
+        }
+    }
+    doc.set_voice_count(4).unwrap();
+    for effect in doc.effects() {
+        let _ = doc.set_param(&effect.id, "active", &json!(true));
+    }
+    let mut engine = Native::new_with_block_size(rate, 4, BLOCK);
+    let voices = engine
+        .init_with_patch(&doc.to_json())
+        .expect("the patch loads");
+    let mut frame = AutomationFrame::with_dimensions(voices, 4, BLOCK);
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let mut block = 0usize;
+    let mut render = |engine: &mut Native, frame: &mut AutomationFrame| {
+        for voice in 0..voices {
+            let gate = if (block / 53 + voice) % 2 == 0 {
+                1.0
+            } else {
+                0.0
+            };
+            frame.set_voice_values(voice, gate, 110.0 * 2f32.powf(voice as f32 / 3.0), 1.0, 1.0);
+        }
+        block += 1;
+        engine.fill_macro_values(frame);
+        engine.process_with_frame_instrument(frame, &mut left, &mut right);
+    };
+    for _ in 0..WARMUP_BLOCKS {
+        render(&mut engine, &mut frame);
+    }
+
+    // Every edit made ahead (making them allocates; sending them must not).
+    let mut edits: Vec<(String, ParamEdit)> = Vec::new();
+    for node in doc.nodes() {
+        let Some(spec) = catalog::node_spec(&node.type_name) else {
+            continue;
+        };
+        for param in spec.params {
+            let values = match param.kind {
+                ParamKind::Bool => vec![json!(false), json!(true)],
+                ParamKind::Enum => (0..param.options.len()).map(|i| json!(i)).collect(),
+                ParamKind::Int => vec![json!(param.min), json!(param.max), json!(param.default)],
+                ParamKind::Float => {
+                    vec![json!(param.min), json!(param.max), json!(param.default)]
+                }
+            };
+            for value in values {
+                let edit = doc
+                    .set_param(&node.id, param.key, &value)
+                    .unwrap()
+                    .edit
+                    .unwrap();
+                edits.push((format!("{}.{} = {value}", node.type_name, param.key), edit));
+            }
+        }
+    }
+    edits.push(("instrument gain".to_string(), ParamEdit::gain(0.4)));
+    edits.push(("macro".to_string(), ParamEdit::macro_value(1, 0.7)));
+
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    let mut failures = Vec::new();
+    let only = std::env::var("CUBED_RT_ONLY").ok();
+    for (label, edit) in &edits {
+        if only
+            .as_ref()
+            .is_some_and(|only| !label.contains(only.as_str()))
+        {
+            continue;
+        }
+        let events = allocations_during(|| {
+            engine.edit_param(*edit).unwrap();
+            for _ in 0..14 {
+                render(&mut engine, &mut frame);
+            }
+        });
+        if events != 0 {
+            failures.push(format!("{label}: {events} allocations or frees"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "edits that allocate:\n{}",
+        failures.join("\n")
+    );
+    assert!(edits.len() > 150);
+}

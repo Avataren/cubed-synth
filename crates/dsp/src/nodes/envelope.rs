@@ -192,13 +192,21 @@ impl Envelope {
 
     /// Update the envelope's configuration.
     pub fn update_config(&mut self, config: EnvelopeConfig) {
+        let curves_changed = config.attack_curve != self.config.attack_curve
+            || config.decay_curve != self.config.decay_curve
+            || config.release_curve != self.config.release_curve
+            || self.attack_table.is_empty();
         self.config = EnvelopeConfig {
             attack: config.attack.max(0.001), // Enforce minimum attack time
             ..config
         };
         // Reset smoothing if config changes during attack? Or let it finish? Let it finish.
         // self.smoothing_counter = 0;
-        self.update_lookup_tables();
+        // The tables depend on the curves alone: a time or a level that changes
+        // (a knob being turned) leaves them as they are.
+        if curves_changed {
+            self.update_lookup_tables();
+        }
     }
 
     pub fn get_phase(&self) -> EnvelopePhase {
