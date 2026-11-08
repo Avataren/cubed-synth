@@ -17,6 +17,8 @@
 
 #[cfg(feature = "adlib")]
 mod adlib;
+#[cfg(feature = "edit")]
+pub mod edit;
 mod effects;
 mod filter;
 mod module;

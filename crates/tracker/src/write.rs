@@ -77,7 +77,7 @@ fn put_u32(out: &mut Vec<u8>, v: usize) {
 }
 
 fn pad_to(out: &mut Vec<u8>, align: usize) {
-    while out.len() % align != 0 {
+    while !out.len().is_multiple_of(align) {
         out.push(0);
     }
 }
@@ -388,7 +388,30 @@ pub fn write_mod(m: &Module) -> Res<Vec<u8>> {
     for s in m.samples.iter().take(sample_slots) {
         out.extend(s.data.iter().map(|&v| quantize(v, 128.0) as i8 as u8));
     }
+    // The 15-sample layouts have no signature: Soundtracker and Ultimate
+    // Soundtracker (whose loops and commands differ) are told apart by
+    // looking at the data, and an edit can make the file look like the other.
+    if !layout31 {
+        let back = crate::protracker::parse(&out)
+            .map_err(|e| format!("the Soundtracker file would not load back: {e}"))?;
+        if back.mod_flavor != m.mod_flavor {
+            return Err(format!(
+                "this {} module would load back as {}: the 15-sample layout cannot tell them apart once the loops or effects change; convert it to ProTracker first (set_mod_flavor)",
+                flavor_name(flavor),
+                flavor_name(back.mod_flavor.unwrap_or(ModFlavor::ProTracker))
+            ));
+        }
+    }
     Ok(out)
+}
+
+fn flavor_name(f: ModFlavor) -> &'static str {
+    match f {
+        ModFlavor::ProTracker => "ProTracker",
+        ModFlavor::NoiseTracker => "NoiseTracker",
+        ModFlavor::Soundtracker => "Soundtracker",
+        ModFlavor::UltimateSoundtracker => "Ultimate Soundtracker",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +648,30 @@ pub fn write_s3m(m: &Module) -> Res<Vec<u8>> {
         }
         if m.muted[c] {
             settings[c] |= 0x80;
+        }
+    }
+
+    // ST3 plays channels that share a hardware channel as one: their cells
+    // merge when the file is loaded. A channel that was merged away on load
+    // is empty and harmless; one with notes would be silently combined.
+    if version >> 12 == 1 {
+        for c in 0..m.channels {
+            if settings[c] >= 0x80 || settings[c] == 0xff {
+                continue;
+            }
+            if let Some(first) = (0..c).find(|&e| settings[e] == settings[c]) {
+                let used = m
+                    .patterns
+                    .iter()
+                    .any(|p| (0..p.rows()).any(|r| !p.cell(r, c).is_empty()));
+                if used {
+                    return Err(format!(
+                        "channel {} shares a hardware channel with channel {} (ST3 plays them as one, so their notes would merge): an ST3 module has 8 left and 8 right PCM channels",
+                        c + 1,
+                        first + 1
+                    ));
+                }
+            }
         }
     }
 

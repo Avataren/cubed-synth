@@ -9,12 +9,15 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-default = ["adlib"]
+default = ["adlib", "edit"]
 # S3M AdLib instruments, on a cubed-opl OPL2.
 adlib = ["dep:cubed-opl"]
+# The edit layer (`ModuleDoc`: operations as JSON, undo and redo).
+edit = ["dep:serde_json"]
 
 [dependencies]
 cubed-opl = { path = "../opl", optional = true }
+serde_json = { workspace = true, optional = true }
 
 [lints]
 workspace = true

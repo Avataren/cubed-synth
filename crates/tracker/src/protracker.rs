@@ -377,7 +377,7 @@ fn period_to_midi(period: u16) -> Option<u8> {
 
 /// Paula wires its voices hard left, right, right, left; more than four
 /// channels means a PC tracker, whose channels start centred.
-fn channel_pan(channel: usize, count: usize) -> f32 {
+pub(crate) fn channel_pan(channel: usize, count: usize) -> f32 {
     match count {
         0 | 1 => 0.5,
         2 => [0.0, 1.0][channel],
