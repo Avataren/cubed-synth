@@ -124,7 +124,9 @@ fn run(file: &PsidFile, mode: &str, max_seconds: Option<f64>) -> Value {
     if mode == "gt" {
         return match cubed_sid::psid::import::gt_unpack::unpack_gt_sid(file) {
             Err(reason) => json!({"ok": false, "reason": reason}),
-            Ok(u) => json!({"ok": true, "notes": u.notes, "asid": base64(&u.song.to_bytes())}),
+            Ok(u) => {
+                json!({"ok": true, "exact": u.exact, "notes": u.notes, "asid": base64(&u.song.to_bytes())})
+            }
         };
     }
     if mode == "capture" {

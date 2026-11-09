@@ -16,15 +16,14 @@
 //! and table rows nothing used, the instrument written again on a note that
 //! already had it. None of it is heard.
 //!
-//! One difference from the DAW's: the DAW then packs the song again and calls
-//! the unpack `exact` when that gives the file's bytes. That packer (and the
-//! 6502 assembler it needs) is not ported; the caller (`import`) accepts the
-//! unpacked song when it plays like the file (fidelity of 0.98 or more) instead,
-//! which the DAW does for the unpacks it cannot reproduce byte for byte.
+//!
+//! The unpack is checked by packing the song again ([`export`](super::export)): `exact` when that
+//! gives the file's bytes.
 
 pub mod asm;
 pub mod player_match;
 
+use super::export::{export_sid, GtPackOptions, GT_PACK_DEFAULTS, SID_EXPORT_DEFAULTS};
 use super::flat::gt_table_duplicate_rows;
 use crate::goattracker::{self, GtSongHints};
 use crate::gt_note_freq_reg;
@@ -47,6 +46,8 @@ const PAL_FRAME_CIA: i64 = 0x4cc7;
 #[derive(Clone, Debug)]
 pub struct GtUnpack {
     pub song: SidSong,
+    /// Packing `song` again gives the file's C64 bytes, byte for byte.
+    pub exact: bool,
     /// Things the user should know.
     pub notes: Vec<String>,
 }
@@ -128,7 +129,7 @@ pub fn unpack_gt_sid(file: &PsidFile) -> Result<GtUnpack, String> {
     let Some(matched) = match_player(tree()?, &mem, &known, Some("mt_freqtbllo")) else {
         return Err("its code is not GoatTracker 2's player (V2.73)".to_string());
     };
-    unpack(file, &matched, &mem, mult)
+    unpack(file, &matched, &mem, base, mult)
 }
 
 struct Table {
@@ -140,6 +141,7 @@ fn unpack(
     file: &PsidFile,
     m: &PlayerMatch,
     mem: &dyn Fn(i64) -> Option<u8>,
+    base: i64,
     mult: u8,
 ) -> Result<GtUnpack, String> {
     let sym = &m.symbols;
@@ -723,10 +725,41 @@ fn unpack(
     };
     let imported = goattracker::import(&sng, hints)
         .map_err(|e| format!("its data does not make a GoatTracker song ({e})"))?;
-    Ok(GtUnpack {
-        song: imported.song,
-        notes,
-    })
+    // The check: the song packed again, as the file was.
+    let song = imported.song;
+    let zero_page = sym
+        .get("zpbase")
+        .copied()
+        .unwrap_or(GT_PACK_DEFAULTS.zero_page);
+    let exact = [GT_PACK_DEFAULTS, SID_EXPORT_DEFAULTS].iter().any(|o| {
+        same_payload(
+            &song,
+            &GtPackOptions {
+                player_address: base,
+                zero_page,
+                optimize: o.optimize,
+            },
+            file.load_address as i64,
+            &file.data,
+        )
+    });
+    Ok(GtUnpack { song, exact, notes })
+}
+
+/// Whether `song` packs with `options` to `payload` loaded at `load` (the PSID's C64 bytes).
+fn same_payload(song: &SidSong, options: &GtPackOptions, load: i64, payload: &[u8]) -> bool {
+    if options.player_address % 256 != 0 {
+        return false;
+    }
+    let Ok(bytes) = export_sid(song, options) else {
+        return false;
+    };
+    // The exported file: header, load address, then its bytes from `load`.
+    let Some(out) = bytes.get(0x7c + 2..) else {
+        return false;
+    };
+    let out_load = bytes[0x7c] as i64 | ((bytes[0x7d] as i64) << 8);
+    out_load == load && out == payload
 }
 
 /// A GoatTracker 2 song file (GTS5, readme §6.1) of the parts.

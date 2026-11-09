@@ -1,6 +1,7 @@
-//! The statement tree of GoatTracker's player source (`player.s`), for
-//! matching it against a `.sid`'s bytes. A port of the parser half of
-//! another_synth's `sid-export/asm6502.ts` (`parseAsmTree`): the dialect is the
+//! A small 6502 assembler for the dialect of GoatTracker's playroutine
+//! (`player.s`) and the statement tree of that source, for matching it against a
+//! `.sid`'s bytes. A port of another_synth's `sid-export/asm6502.ts`
+//! (`assemble6502` and `parseAsmTree`): the dialect is the
 //! assembler Magnus Lind wrote for Exomizer, which GoatTracker's relocator
 //! bundles.
 //!
@@ -15,6 +16,9 @@
 //!    `expr` is always absolute, `#expr` immediate, `(expr),y` / `(expr,x)`
 //!    indirect, `(expr)` indirect for `jmp`, no operand is implied or accumulator;
 //!  - `ldy expr,y` assembles as LDY abs,X (`$BC`), as that assembler does.
+//!
+//! `.IF` must be decidable where it stands: its expression may use only symbols defined above it, and
+//! `.DEFINED(sym)` asks whether `sym` has been defined above it, in the code that is assembled.
 
 /// The 6502's addressing modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -714,4 +718,358 @@ pub fn parse_asm_tree(source: &str) -> Result<Vec<Stmt>, AsmFail> {
         return fail(line, ".IF without .ENDIF");
     }
     Ok(root)
+}
+
+// ---------------------------------------------------------------------------
+// The assembler
+// ---------------------------------------------------------------------------
+
+/// What assembling made.
+#[derive(Debug)]
+pub struct AsmResult {
+    /// The address of the first byte (the first `.ORG`).
+    pub origin: i64,
+    pub bytes: Vec<u8>,
+    /// Every label and `=` symbol of the assembled code, by name.
+    pub symbols: std::collections::HashMap<String, i64>,
+}
+
+/// What pass 1 laid out, for pass 2 to encode.
+enum Item {
+    Op {
+        line: usize,
+        pc: i64,
+        code: u8,
+        mode: Mode,
+        arg: Option<Expr>,
+    },
+    Bytes {
+        line: usize,
+        pc: i64,
+        args: Vec<Expr>,
+    },
+}
+
+struct Symbols {
+    labels: std::collections::HashMap<String, i64>,
+    assigns: std::collections::HashMap<String, (Expr, usize)>,
+    resolving: Vec<String>,
+}
+
+impl Symbols {
+    fn defined(&self, name: &str) -> bool {
+        self.labels.contains_key(name) || self.assigns.contains_key(name)
+    }
+
+    fn lookup(&mut self, name: &str) -> Result<Option<i64>, AsmFail> {
+        if let Some(&l) = self.labels.get(name) {
+            return Ok(Some(l));
+        }
+        let Some((expr, line)) = self.assigns.get(name).cloned() else {
+            return Ok(None);
+        };
+        if self.resolving.iter().any(|r| r == name) {
+            return fail(line, format!("symbol \"{name}\" is defined by itself"));
+        }
+        self.resolving.push(name.to_string());
+        let v = self.eval(&expr, line);
+        self.resolving.pop();
+        v.map(Some)
+    }
+
+    fn eval(&mut self, e: &Expr, line: usize) -> Result<i64, AsmFail> {
+        match e {
+            Expr::Num(v) => Ok(*v),
+            Expr::Sym(name) => match self.lookup(name)? {
+                Some(v) => Ok(v),
+                None => fail(line, format!("symbol \"{name}\" is not defined")),
+            },
+            Expr::Defined(name) => Ok(self.defined(name) as i64),
+            Expr::Un(op, a) => {
+                let a = self.eval(a, line)?;
+                Ok(if *op == UnOp::Neg {
+                    -a
+                } else {
+                    (a == 0) as i64
+                })
+            }
+            Expr::Bin(op, a, b) => {
+                let a = self.eval(a, line)?;
+                if *op == BinOp::And {
+                    return Ok((a != 0 && self.eval(b, line)? != 0) as i64);
+                }
+                if *op == BinOp::Or {
+                    return Ok((a != 0 || self.eval(b, line)? != 0) as i64);
+                }
+                let b = self.eval(b, line)?;
+                Ok(match op {
+                    BinOp::Eq => (a == b) as i64,
+                    BinOp::Ne => (a != b) as i64,
+                    BinOp::Lt => (a < b) as i64,
+                    BinOp::Gt => (a > b) as i64,
+                    BinOp::Add => a + b,
+                    BinOp::Sub => a - b,
+                    BinOp::Mul => a * b,
+                    BinOp::Div | BinOp::Mod => {
+                        if b == 0 {
+                            return fail(line, "division by zero");
+                        }
+                        if *op == BinOp::Div {
+                            a / b
+                        } else {
+                            a % b
+                        }
+                    }
+                    BinOp::And | BinOp::Or => unreachable!(),
+                })
+            }
+        }
+    }
+}
+
+/// Assemble `source`: `player.s` with the relocator's defines above it and the song data below, as
+/// GoatTracker's relocator hands its assembler. An error names its line and a reason.
+pub fn assemble6502(source: &str) -> Result<AsmResult, AsmFail> {
+    let lines: Vec<&str> = source.split('\n').collect();
+    let mut syms = Symbols {
+        labels: Default::default(),
+        assigns: Default::default(),
+        resolving: Vec::new(),
+    };
+    let mut items: Vec<Item> = Vec::new();
+    let mut pc: Option<i64> = None;
+    let mut origin: Option<i64> = None;
+    // Each open .IF: is this branch assembled, was the enclosing code, has an .ELSE come.
+    struct Cond {
+        active: bool,
+        parent: bool,
+        saw_else: bool,
+    }
+    let mut conds: Vec<Cond> = Vec::new();
+
+    for (index, text) in lines.iter().enumerate() {
+        let line = index + 1;
+        let mut p = Parser {
+            toks: tokenize(text, line)?,
+            pos: 0,
+            line,
+        };
+        while let Some(t) = p.peek().cloned() {
+            let active = conds.last().is_none_or(|c| c.active);
+            if let Token::Dir(d) = &t {
+                if matches!(d.as_str(), "IF" | "ELSE" | "ENDIF") {
+                    p.pos += 1;
+                    match d.as_str() {
+                        "IF" => {
+                            let e = p.expr(0)?;
+                            let parent = active;
+                            let on = parent && syms.eval(&e, line)? != 0;
+                            conds.push(Cond {
+                                active: on,
+                                parent,
+                                saw_else: false,
+                            });
+                        }
+                        "ELSE" => match conds.last_mut() {
+                            Some(c) if !c.saw_else => {
+                                c.saw_else = true;
+                                c.active = c.parent && !c.active;
+                            }
+                            _ => return fail(line, ".ELSE without .IF"),
+                        },
+                        _ => {
+                            if conds.pop().is_none() {
+                                return fail(line, ".ENDIF without .IF");
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            if !active {
+                // Skip to the next directive on the line (it may close this branch).
+                p.pos += 1;
+                while p.peek().is_some_and(|t| !matches!(t, Token::Dir(_))) {
+                    p.pos += 1;
+                }
+                continue;
+            }
+            let need_pc = |pc: Option<i64>| -> Result<i64, AsmFail> {
+                pc.ok_or(AsmFail {
+                    line,
+                    reason: "code before the first .ORG".to_string(),
+                })
+            };
+            if let Token::Sym(name) = &t {
+                match p.toks.get(p.pos + 1) {
+                    Some(Token::Op(":")) => {
+                        if syms.defined(name) {
+                            return fail(line, format!("symbol \"{name}\" is defined twice"));
+                        }
+                        syms.labels.insert(name.clone(), need_pc(pc)?);
+                        p.pos += 2;
+                        continue;
+                    }
+                    Some(Token::Op("=")) => {
+                        if syms.defined(name) {
+                            return fail(line, format!("symbol \"{name}\" is defined twice"));
+                        }
+                        p.pos += 2;
+                        let e = p.expr(0)?;
+                        syms.assigns.insert(name.clone(), (e, line));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if let Token::Dir(d) = &t {
+                if d == "ORG" {
+                    p.pos += 1;
+                    let e = p.expr(0)?;
+                    let at = syms.eval(&e, line)?;
+                    if !(0..=0xffff).contains(&at) {
+                        return fail(line, format!(".ORG {at} is outside 0..65535"));
+                    }
+                    if origin.is_none() {
+                        origin = Some(at);
+                    } else if Some(at) != pc {
+                        return fail(line, ".ORG may only continue at the current address");
+                    }
+                    pc = Some(at);
+                    continue;
+                }
+                if d == "BYTE" {
+                    p.pos += 1;
+                    p.expect_op("(")?;
+                    let mut args = vec![p.expr(0)?];
+                    while p.is_op(",") {
+                        p.pos += 1;
+                        args.push(p.expr(0)?);
+                    }
+                    p.expect_op(")")?;
+                    let at = need_pc(pc)?;
+                    pc = Some(at + args.len() as i64);
+                    items.push(Item::Bytes { line, pc: at, args });
+                    continue;
+                }
+            }
+            if let Token::Sym(name) = &t {
+                let mnemonic = name.to_lowercase();
+                if let Some(modes) = modes_of(&mnemonic) {
+                    p.pos += 1;
+                    let (mode, arg) = p.operand(&mnemonic)?;
+                    let Some(code) = opcode(modes, mode) else {
+                        return fail(line, format!("{mnemonic} has no {mode:?} addressing mode"));
+                    };
+                    let at = need_pc(pc)?;
+                    pc = Some(at + mode.size());
+                    items.push(Item::Op {
+                        line,
+                        pc: at,
+                        code,
+                        mode,
+                        arg,
+                    });
+                    continue;
+                }
+            }
+            let shown = match &t {
+                Token::Op(o) => o.to_string(),
+                Token::Sym(s) => s.clone(),
+                Token::Dir(d) => d.clone(),
+                Token::Num(n) => n.to_string(),
+            };
+            return fail(line, format!("can't read \"{shown}\" here"));
+        }
+        if pc.is_some_and(|pc| pc > 0x10000) {
+            return fail(line, "the code runs past $FFFF");
+        }
+    }
+    if !conds.is_empty() {
+        return fail(lines.len(), ".IF without .ENDIF");
+    }
+    let (Some(origin), Some(pc)) = (origin, pc) else {
+        return fail(0, "nothing to assemble (no .ORG)");
+    };
+
+    // Pass 2: encode.
+    let mut bytes = vec![0u8; (pc - origin) as usize];
+    let mut put = |at: i64, v: i64| {
+        bytes[(at - origin) as usize] = (v & 0xff) as u8;
+    };
+    for it in &items {
+        match it {
+            Item::Bytes { line, pc, args } => {
+                for (i, a) in args.iter().enumerate() {
+                    let v = syms.eval(a, *line)?;
+                    if !(-128..=255).contains(&v) {
+                        return fail(*line, format!(".BYTE value {v} does not fit a byte"));
+                    }
+                    put(pc + i as i64, v);
+                }
+            }
+            Item::Op {
+                line,
+                pc,
+                code,
+                mode,
+                arg,
+            } => {
+                put(*pc, *code as i64);
+                let Some(arg) = arg else { continue };
+                let v = syms.eval(arg, *line)?;
+                match mode.size() {
+                    2 => {
+                        if *mode == Mode::Rel {
+                            let d = v - (pc + 2);
+                            if !(-128..=127).contains(&d) {
+                                return fail(
+                                    *line,
+                                    format!("branch target is {d} bytes away (-128..127)"),
+                                );
+                            }
+                            put(pc + 1, d);
+                        } else if *mode == Mode::Imm {
+                            if !(-128..=255).contains(&v) {
+                                return fail(
+                                    *line,
+                                    format!("immediate value {v} does not fit a byte"),
+                                );
+                            }
+                            put(pc + 1, v);
+                        } else {
+                            if !(0..=255).contains(&v) {
+                                return fail(
+                                    *line,
+                                    format!("zero-page address {v} is outside 0..255"),
+                                );
+                            }
+                            put(pc + 1, v);
+                        }
+                    }
+                    3 => {
+                        if !(0..=0xffff).contains(&v) {
+                            return fail(*line, format!("address {v} is outside 0..65535"));
+                        }
+                        put(pc + 1, v);
+                        put(pc + 2, v >> 8);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut symbols: std::collections::HashMap<String, i64> = syms.labels.clone();
+    let names: Vec<String> = syms.assigns.keys().cloned().collect();
+    for name in names {
+        // A symbol nothing uses may name one only a skipped branch defines.
+        if let Ok(Some(v)) = syms.lookup(&name) {
+            symbols.insert(name, v);
+        }
+    }
+    Ok(AsmResult {
+        origin,
+        bytes,
+        symbols,
+    })
 }

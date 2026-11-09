@@ -78,17 +78,7 @@ pub fn trace_decimation(trace: &SidTrace) -> (usize, usize) {
 
 /// `trace` as frames: decimated where the player writes on every n-th call only.
 pub fn trace_frames(trace: &SidTrace) -> TraceFrames {
-    trace_frames_with(trace, true)
-}
-
-/// [`trace_frames`], with the decimation optional: a trace of a song played by this crate's own
-/// player (`fidelity`) has a frame per tick by construction.
-pub fn trace_frames_with(trace: &SidTrace, decimate: bool) -> TraceFrames {
-    let (step, phase) = if decimate {
-        trace_decimation(trace)
-    } else {
-        (1, 0)
-    };
+    let (step, phase) = trace_decimation(trace);
     let mut picks: Vec<usize> = Vec::new();
     let mut t = if step == 1 { 0 } else { phase };
     while t < trace.ticks {

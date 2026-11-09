@@ -14,6 +14,7 @@
 //! cargo test --release -p cubed-sid --test psid_import -- --nocapture
 
 use cubed_sid::edit::SidDoc;
+use cubed_sid::psid::import::export::{export_sid, SID_EXPORT_DEFAULTS};
 use cubed_sid::psid::import::{import, ImportOptions};
 use cubed_sid::song::{NOTE_FIRST, NOTE_LAST};
 use serde_json::Value;
@@ -153,7 +154,9 @@ fn a_tune_the_gt_unpack_reads_is_unpacked_unless_told_not() {
     assert!(r.report.used_gt_unpack);
     assert!(r.report.subsongs.is_empty());
     r.song.validate().unwrap();
-    assert!(r.report.fidelity.unwrap().score >= 0.98);
+    // Packing it again gives the file's bytes: nothing to measure.
+    assert_eq!(r.report.exact, Some(true));
+    assert!(r.report.fidelity.is_none());
     let t = import(
         GT_DRUM,
         &ImportOptions {
@@ -165,6 +168,31 @@ fn a_tune_the_gt_unpack_reads_is_unpacked_unless_told_not() {
     .unwrap();
     assert!(!t.report.used_gt_unpack);
     assert!(!t.report.subsongs.is_empty());
+}
+
+#[test]
+fn an_unpacked_song_packs_to_the_file_it_came_from() {
+    // The fixtures are what the DAW's exporter writes; unpacking and exporting again gives the same file.
+    for (name, bytes) in [("gt_drum.sid", GT_DRUM), ("gt_chain.sid", GT_CHAIN)] {
+        let r = import(bytes, &ImportOptions::default()).unwrap();
+        assert!(r.report.used_gt_unpack, "{name}");
+        assert_eq!(r.report.exact, Some(true), "{name}");
+        let again = export_sid(&r.song, &SID_EXPORT_DEFAULTS).unwrap();
+        assert_eq!(again, bytes, "{name}");
+    }
+}
+
+#[test]
+fn a_transcription_exports_as_a_playable_sid() {
+    let r = import(TUNE, &ImportOptions::default()).unwrap();
+    let bytes = export_sid(&r.song, &SID_EXPORT_DEFAULTS).unwrap();
+    let file = cubed_sid::psid::PsidFile::parse(&bytes).unwrap();
+    assert_eq!((file.songs, file.start_song), (1, 1));
+    let mut player =
+        cubed_sid::psid::PsidPlayer::new(&bytes, 44_100.0, Default::default()).unwrap();
+    let mut out = vec![0f32; 44_100];
+    player.render(&mut out);
+    assert!(out.iter().any(|&s| s.abs() > 0.01), "silent");
 }
 
 #[test]
@@ -192,10 +220,6 @@ fn what_cannot_be_imported_is_refused_with_the_reason() {
 fn the_song_is_the_one_the_daws_importer_makes() {
     let expected: Value = serde_json::from_str(EXPECTED).unwrap();
     for (name, bytes) in FIXTURES {
-        if name == "gt_chain.sid" {
-            // The DAW unpacks it (its song packs again to the file's bytes); this crate decides by how it plays.
-            continue;
-        }
         let want = &expected[name];
         let got = import(bytes, &ImportOptions::default());
         if want["ok"] == false {

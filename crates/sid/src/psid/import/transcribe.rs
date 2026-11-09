@@ -8,7 +8,8 @@
 //! `transcribe/index.ts`.
 
 use super::capture::{capture_sid, CaptureOptions, SidTrace, SID_EVENT_GATE_ON};
-use super::flat::{compile_flat_song, gt_packed_pattern_size, FlatSubsong};
+use super::export::gt_packed_pattern_size;
+use super::flat::{compile_flat_song, FlatSubsong};
 use super::fold::fold_instruments;
 use super::frames::{estimate_tuning, trace_frames, TraceFrames};
 use super::grid::{detect_grid, row_length, row_of_frame, tempo_changes, RowGrid};

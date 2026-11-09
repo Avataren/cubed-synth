@@ -1,5 +1,5 @@
 //! How close a transcription sounds to its original: the transcribed subsong
-//! is played and the two register traces are aligned on their note starts, and
+//! is played, the two register traces are aligned on their note starts, and
 //! per voice per frame compared:
 //!
 //!  - `gate`: the voice sounds in both or in neither (gate on, test bit off);
@@ -15,24 +15,15 @@
 //! `score` weighs them (pitch 0.3, gate 0.15, waveform 0.15, level 0.15,
 //! onsets 0.1, envelope 0.1, pulse 0.05), and when the original uses the
 //! filter, the filter (mode, routing, cutoff within 8 of 255) for 0.15 of the
-//! whole. A port of `psid/fidelity.ts`.
-//!
-//! One difference from the DAW's: the DAW exports the transcription as a
-//! `.sid` (GoatTracker's 6502 player) and runs it on the emulated C64; here
-//! the song is played by [`SidSongPlayer`](crate::player::SidSongPlayer), the
-//! port of the same playroutine that writes the chip's registers a frame at a
-//! time. The two write the same registers, frame for frame, wherever the
-//! player port is exact (see the README), so the scores agree to rounding.
+//! whole. A port of `psid/fidelity.ts`: the transcribed subsong is exported with
+//! [`export`](super::export) and run on the emulated C64 like the original.
 
-use super::capture::{
-    CaptureEnd, CaptureMode, SidTrace, SID_EVENT_CTRL_WRITTEN, SID_EVENT_GATE_LOW,
-    SID_EVENT_GATE_ON, SID_EVENT_TEST, SID_TRACE_REGS,
-};
+use super::capture::{capture_sid, CaptureOptions, SidTrace, SID_EVENT_GATE_LOW};
 use super::envelope::{envelope_levels, EnvelopeFrame};
-use super::frames::{pitch_of, trace_frames, trace_frames_with, TraceFrames, VoiceFrames};
+use super::export::{export_sid, SID_EXPORT_DEFAULTS};
+use super::frames::{pitch_of, trace_frames, TraceFrames, VoiceFrames};
 use super::util::js_round;
-use crate::player::{frame_cycles, SidSongPlayer};
-use crate::psid::c64::C64Clock;
+use crate::psid::file::PsidFile;
 use crate::song::SidSong;
 
 #[derive(Clone, Debug, Default)]
@@ -381,76 +372,40 @@ pub fn unrolled(f: &TraceFrames, n: usize) -> TraceFrames {
     }
 }
 
-/// `ticks` ticks of subsong `subsong` of `song`, as the player writes them to the SID, as a trace.
-fn play_trace(song: &SidSong, subsong: usize, ticks: usize) -> Result<SidTrace, String> {
-    let mut player = SidSongPlayer::with_model(song.clone(), song.model, 44_100.0, subsong)
-        .map_err(|e| e.to_string())?;
-    // GoatTracker's 6502 player reads the first row after counting its start tempo down, one tick
-    // later than this player (which reads it on its first frame): the song starts that many ticks
-    // late, and the ticks before are silent but for the volume its init sets. Start the same.
-    let lead = player.tempo() as usize + 1;
-    let mut regs: Vec<u8> = Vec::with_capacity((lead + ticks) * SID_TRACE_REGS);
-    let mut events: Vec<u8> = Vec::with_capacity((lead + ticks) * 3);
-    let mut ctrl = [0u8; 3];
-    for _ in 0..lead {
-        let mut idle = [0u8; SID_TRACE_REGS];
-        idle[0x18] = 0x0f;
-        regs.extend_from_slice(&idle);
-        events.extend_from_slice(&[SID_EVENT_CTRL_WRITTEN | SID_EVENT_GATE_LOW; 3]);
+/// `song` with subsong `gt_subsong` as its only one: what a player is handed to play that subsong.
+fn song_for_subsong(song: &SidSong, gt_subsong: usize) -> SidSong {
+    let s = gt_subsong.min(song.subsongs.len().saturating_sub(1));
+    if s == 0 && song.subsongs.len() == 1 {
+        return song.clone();
     }
-    for _ in 0..ticks {
-        player.frame();
-        for r in 0..SID_TRACE_REGS {
-            regs.push(player.chip().written(r as u8));
-        }
-        for v in 0..3 {
-            let c = player.chip().written((v * 7 + 4) as u8);
-            let mut e = SID_EVENT_CTRL_WRITTEN;
-            if c & 1 != 0 && ctrl[v] & 1 == 0 {
-                e |= SID_EVENT_GATE_ON;
-            }
-            if c & 1 == 0 {
-                e |= SID_EVENT_GATE_LOW;
-            }
-            if c & 8 != 0 {
-                e |= SID_EVENT_TEST;
-            }
-            ctrl[v] = c;
-            events.push(e);
-        }
-    }
-    let tick = frame_cycles(song.speed_multiplier) as u64;
-    let ticks = lead + ticks;
-    Ok(SidTrace {
-        clock: C64Clock::Pal,
-        mode: CaptureMode::Play,
-        clock_hz: 985_248.0,
-        frame_cycles: 312 * 63,
-        tick_cycles: tick,
-        ticks,
-        regs,
-        voice_events: events,
-        loop_tick: None,
-        writes_per_tick: 25.0,
-        digi: false,
-        extra_sid_writes: 0,
-        end: CaptureEnd::Ticks,
-    })
+    let mut one = song.clone();
+    one.subsongs = vec![song.subsongs[s].clone()];
+    one
 }
 
 /// The fidelity of `song`'s subsong `gt_subsong` against the original `trace`, or the reason it could not be measured.
+///
+/// As the DAW measures it: the subsong is exported as a `.sid` (GoatTracker's player with the song
+/// packed after it, `export`) and run on the same emulated C64 as the original.
 pub fn measure_fidelity(
     trace: &SidTrace,
     song: &SidSong,
     gt_subsong: usize,
     max_frames: usize,
 ) -> Result<Fidelity, String> {
+    let exported = export_sid(&song_for_subsong(song, gt_subsong), &SID_EXPORT_DEFAULTS)?;
+    let parsed = PsidFile::parse(&exported).map_err(|e| e.to_string())?;
     let a = unrolled(&trace_frames(trace), max_frames);
-    // The transcription, played: a frame per tick. (The DAW's trace of the exported player is cut
-    // into frames like any other, and may be decimated; the player here writes all it has every
-    // tick, and the registers of a silent voice that the real player moves and this one does not
-    // would only make that decimation differ.)
-    let b = trace_frames_with(&play_trace(song, gt_subsong, max_frames + 200)?, false);
+    let seconds = 600f64.min((max_frames + 200) as f64 / a.rate_hz.max(1.0) + 5.0);
+    let capture = capture_sid(
+        &parsed,
+        &CaptureOptions {
+            subsong: 0,
+            max_ticks: None,
+            max_seconds: Some(seconds),
+        },
+    )?;
+    let b = unrolled(&trace_frames(&capture), max_frames + 200);
     // Each voice's delay: where it scores best over a stretch of the song (a transcription's voices need
     // not start at the same frame, and a tune whose rows repeat every few frames has note starts that
     // line up at many delays, which the score tells apart). Delays that score alike keep the one nearest

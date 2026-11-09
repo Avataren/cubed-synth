@@ -1,12 +1,11 @@
 //! The flat SID song the transcriber builds and compiles: a sequence of
 //! song-wide patterns, one cell per voice, from which GoatTracker's per-voice
 //! structure (orderlists over a shared pool of patterns) is compiled. The
-//! compile half of the DAW's `sid-doc/flat.ts` (`compileSidFlatSong`) and the
-//! packed-pattern size of `sid-export/gt-pack.ts` that decides how long a
-//! pattern may be.
+//! compile half of the DAW's `sid-doc/flat.ts` (`compileSidFlatSong`) and GoatTracker's
+//! packer's table-duplicate search (`sid-export/gt-pack.ts`).
 
 use crate::goattracker::{
-    note_byte, orderlist_byte_length, GT_MAX_ORDERLIST_BYTES, GT_MAX_TRANSPOSE, GT_MIN_TRANSPOSE,
+    orderlist_byte_length, GT_MAX_ORDERLIST_BYTES, GT_MAX_TRANSPOSE, GT_MIN_TRANSPOSE,
 };
 use crate::song::{
     OrderEntry, Orderlist, Pattern, Row, SidSong, Subsong, MAX_PATTERNS, MAX_PATTERN_ROWS,
@@ -243,163 +242,7 @@ pub fn compile_flat_song(base: &SidSong, subsongs: &[FlatSubsong]) -> Result<Sid
 // GoatTracker's packer: what decides how long a pattern may be
 // ---------------------------------------------------------------------------
 
-const REST: u8 = 0xbd;
-const FX: u8 = 0x40;
-const FXONLY: u8 = 0x50;
-const FIRSTNOTE: u8 = 0x60;
 const MAX_TABLELEN: usize = 255;
-
-/// The bytes `rows` pack to in GoatTracker's player (`packPattern`, with every
-/// effect on, as the export dialog's build packs them), or more than 256 when
-/// the player cannot read the pattern. For a writer that must keep patterns
-/// exportable. Table parameters are renumbered by the identity here (the real
-/// packer renumbers them by what it leaves out, which only makes patterns
-/// smaller), so this is the size of the song before its tables are packed.
-pub fn gt_packed_pattern_size(rows: &[Row]) -> usize {
-    match pack_pattern(rows) {
-        Some(bytes) => bytes.len(),
-        None => 257,
-    }
-}
-
-/// GT's `packpattern`: `rows` as the player's pattern bytes, or `None` past 256. An instrument
-/// equal to the previous one is dropped; a tempo's parameter is one less (not funktempo); a
-/// command is written (FX + cmd before a note, FXONLY + cmd on an empty row) only when it
-/// changes; runs of 2-64 empty rows become one byte.
-fn pack_pattern(rows: &[Row]) -> Option<Vec<u8>> {
-    let n = rows.len();
-    let mut t: Vec<[i32; 4]> = rows
-        .iter()
-        .map(|r| {
-            [
-                note_byte(r.note) as i32,
-                r.instrument as i32,
-                r.command as i32,
-                r.param as i32,
-            ]
-        })
-        .collect();
-    let mut instr = 0;
-    for c in 0..n {
-        let ins = rows[c].instrument as i32;
-        if c != 0 && ins != 0 && ins == instr {
-            t[c][1] = 0;
-        } else if ins != 0 {
-            instr = ins;
-        }
-        let cmd = t[c][2];
-        match cmd {
-            0xd => {
-                // Without author info GT erases timing marks (a volume above $0F).
-                if t[c][3] > 0x0f {
-                    t[c][2] = 0;
-                    t[c][3] = 0;
-                }
-            }
-            0xf if (t[c][3] & 0x7f) >= 3 => t[c][3] -= 1,
-            _ => {}
-        }
-    }
-    let mut command: i32 = -1;
-    let mut databyte: i32 = -1;
-    let mut im: Vec<i32> = Vec::new();
-    for c in 0..n {
-        let note = t[c][0];
-        let ins = t[c][1];
-        let cmd = t[c][2];
-        let param = t[c][3];
-        if ins != 0 {
-            im.push(ins);
-        }
-        let changed = cmd != command || param != databyte;
-        if note == REST as i32 {
-            if changed {
-                command = cmd;
-                databyte = param;
-                im.push(FXONLY as i32 + command);
-                if command != 0 {
-                    im.push(databyte);
-                }
-            } else {
-                im.push(REST as i32);
-            }
-        } else {
-            if changed {
-                command = cmd;
-                databyte = param;
-                im.push(FX as i32 + command);
-                if command != 0 {
-                    im.push(databyte);
-                }
-            }
-            im.push(note);
-        }
-    }
-    // Runs of plain rests -> one packed-rest byte (never the first row).
-    let mut dest: Vec<i32> = Vec::new();
-    let mut c = 0usize;
-    while c < im.len() {
-        let mut packok = c != 0;
-        if im[c] < FX as i32 {
-            dest.push(im[c]);
-            c += 1;
-            packok = false;
-        }
-        if c < im.len() && im[c] >= FXONLY as i32 && im[c] < FIRSTNOTE as i32 {
-            let fx = im[c] - FXONLY as i32;
-            dest.push(im[c]);
-            c += 1;
-            if fx != 0 {
-                dest.push(im[c]);
-                c += 1;
-            }
-            continue;
-        }
-        if c < im.len() && im[c] < FXONLY as i32 {
-            let fx = im[c] - FX as i32;
-            dest.push(im[c]);
-            c += 1;
-            if fx != 0 {
-                dest.push(im[c]);
-                c += 1;
-            }
-            packok = false;
-        }
-        if im.get(c).copied() != Some(REST as i32) {
-            packok = false;
-        }
-        if !packok {
-            if c < im.len() {
-                dest.push(im[c]);
-            }
-            c += 1;
-        } else {
-            let mut d = c;
-            while d < im.len() && im[d] == REST as i32 {
-                d += 1;
-                if d - c == 64 {
-                    break;
-                }
-            }
-            let d = d - c;
-            if d > 1 {
-                dest.push((-(d as i32)) & 0xff);
-                c += d;
-            } else {
-                dest.push(im[c]);
-                c += 1;
-            }
-        }
-    }
-    if dest.len() > 256 {
-        return None;
-    }
-    let mut out: Vec<u8> = dest.iter().map(|&b| b as u8).collect();
-    if out.len() < 256 {
-        out.push(0);
-    }
-    Some(out)
-}
 
 /// GT's `gettablepartlen`: rows from `pos` (0-based) up to and including the next jump.
 fn table_part_length(ltable: &[i32], num: usize, pos: i64) -> i64 {
@@ -424,7 +267,13 @@ fn table_part_length(ltable: &[i32], num: usize, pos: i64) -> i64 {
 /// row equal to an earlier one, and a self-contained wave/pulse/filter part (used throughout, jumps
 /// only inside, nothing jumps into it) equal to an earlier one, are left out and mapped onto the
 /// first. `used` is 1-based (index 0 unused), `lt`/`rt` the table's columns (0-based).
-fn find_table_duplicates(num: usize, lt: &[i32], rt: &[i32], used: &mut [bool], map: &mut [i64]) {
+pub(crate) fn find_table_duplicates(
+    num: usize,
+    lt: &[i32],
+    rt: &[i32],
+    used: &mut [bool],
+    map: &mut [i64],
+) {
     let max = MAX_TABLELEN;
     if num == 3 {
         for c in 1..=max {

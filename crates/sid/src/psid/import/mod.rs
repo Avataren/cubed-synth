@@ -29,6 +29,7 @@
 
 pub mod capture;
 pub mod envelope;
+pub mod export;
 pub mod fidelity;
 pub mod flat;
 pub mod fold;
@@ -58,8 +59,6 @@ pub struct ImportOptions {
     pub max_seconds: Option<f64>,
     /// Measure the start song against the original (default true).
     pub measure: bool,
-    /// Frames the fidelity compares (default 3000: a minute).
-    pub fidelity_frames: usize,
     /// Recognise a tune GoatTracker made and unpack its song data (default true); false transcribes every tune.
     pub gt_unpack: bool,
 }
@@ -70,7 +69,6 @@ impl Default for ImportOptions {
             subsongs: None,
             max_seconds: None,
             measure: true,
-            fidelity_frames: 3000,
             gt_unpack: true,
         }
     }
@@ -87,7 +85,7 @@ pub struct ImportReport {
     pub warnings: Vec<String>,
     /// The song was unpacked from GoatTracker's own song data, not transcribed.
     pub used_gt_unpack: bool,
-    /// Unpacked, and packing the song again gives the file's bytes (`None`: transcribed, or not checked).
+    /// Unpacked, and packing the song again gives the file's bytes (`None`: transcribed).
     pub exact: Option<bool>,
     /// The PSID subsong (0-based) that became the song's first subsong.
     pub subsong: usize,
@@ -164,28 +162,32 @@ const UNPACKED_FIDELITY: f64 = 0.98;
 /// unpacks to something that does not play like it).
 fn unpacked(file: &PsidFile, opts: &ImportOptions) -> Option<ImportResult> {
     let u = gt_unpack::unpack_gt_sid(file).ok()?;
-    // Kept only when it plays like the file (the DAW also keeps one that packs again to the file's
-    // bytes; that packer is not ported, see `gt_unpack`).
-    let trace = capture::capture_sid(
-        file,
-        &capture::CaptureOptions {
-            subsong: 0,
-            max_ticks: None,
-            max_seconds: Some(120.0),
-        },
-    )
-    .ok()?;
-    let m = fidelity::measure_fidelity(&trace, &u.song, 0, opts.fidelity_frames).ok()?;
-    if m.score < UNPACKED_FIDELITY {
-        return None;
+    let mut fidelity = None;
+    if !u.exact {
+        // Not the file's bytes again (an option GoatTracker's packer has and ours does not): kept
+        // only when it plays like the file.
+        let trace = capture::capture_sid(
+            file,
+            &capture::CaptureOptions {
+                subsong: 0,
+                max_ticks: None,
+                max_seconds: Some(120.0),
+            },
+        )
+        .ok()?;
+        let m = fidelity::measure_fidelity(&trace, &u.song, 0, 3000).ok()?;
+        if m.score < UNPACKED_FIDELITY {
+            return None;
+        }
+        fidelity = if opts.measure { Some(m) } else { None };
     }
     Some(ImportResult {
         report: ImportReport {
-            fidelity: if opts.measure { Some(m) } else { None },
+            fidelity,
             notes: u.notes,
             warnings: Vec::new(),
             used_gt_unpack: true,
-            exact: None,
+            exact: Some(u.exact),
             subsong: 0,
             frames: 0,
             subsongs: Vec::new(),
@@ -238,7 +240,7 @@ pub fn import_file(file: &PsidFile, opts: &ImportOptions) -> Result<ImportResult
     let start = t.reports.iter().find(|r| r.gt_subsong == Some(0));
     if opts.measure {
         if let Some(trace) = start.and_then(|s| s.trace.as_ref()) {
-            match fidelity::measure_fidelity(trace, &t.song, 0, opts.fidelity_frames) {
+            match fidelity::measure_fidelity(trace, &t.song, 0, 3000) {
                 Ok(f) => fidelity = Some(f),
                 Err(e) => warnings.push(format!("the fidelity could not be measured: {e}")),
             }
