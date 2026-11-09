@@ -27,6 +27,7 @@ mod clip;
 mod command;
 pub mod effects;
 pub mod engine;
+pub mod eq;
 mod insert;
 mod mixer;
 pub mod probe;
