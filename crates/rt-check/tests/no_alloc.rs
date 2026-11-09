@@ -1513,6 +1513,92 @@ fn mixer_songs() {
     }
 }
 
+/// The equaliser on a bus, every block with a few of its 52 parameters moved by commands:
+/// gains, frequencies, Qs, types, the band switches, bypass and the graphic mode (whose fit is
+/// solved on the audio thread when a frequency, Q, type or switch changes).
+#[test]
+fn mixer_eq() {
+    let rate = RATE as f32;
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        ..MixerConfig::default()
+    });
+    let bus = BusId(1);
+    mixer.apply(Command::SetBus(bus, BusSettings::default()));
+    let eq = Effect::new(EffectKind::Eq);
+    mixer.apply(Command::SetInsert {
+        bus,
+        slot: 0,
+        insert: Some(eq.build(rate, BLOCK)),
+    });
+    let samples: Vec<f32> = (0..9_001)
+        .map(|i| ((i * 7919 % 2003) as f32 / 1001.5 - 1.0) * 0.3)
+        .collect();
+    mixer.apply(Command::AddClip(
+        ClipId(0),
+        std::sync::Arc::new(Clip::mono(rate, samples)),
+    ));
+    mixer.apply(Command::Play(Play {
+        looped: true,
+        ..Play::new(VoiceId(1), ClipId(0), bus)
+    }));
+    // The parameter numbers, looked up here: the lookups by name allocate.
+    let param = |name: &str| EffectKind::Eq.param(name).expect("a parameter") as u8;
+    let fields = ["gain_db", "freq_hz", "q", "enabled", "type"];
+    let band_params: Vec<[u8; 5]> = (1..=10)
+        .map(|band| fields.map(|what| param(&format!("band{band}_{what}"))))
+        .collect();
+    let (graphic, bypass) = (param("graphic"), param("bypass"));
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    assert_no_alloc("Mixer with Eq", 6, |block| {
+        let t = block as f32;
+        for (band, params) in band_params.iter().enumerate() {
+            let band = band + 1;
+            let mut set = |field: usize, value: f32| {
+                mixer.apply(Command::SetInsertParam {
+                    bus,
+                    slot: 0,
+                    param: params[field],
+                    value,
+                });
+            };
+            set(0, (t * 0.07 + band as f32).sin() * 14.0);
+            if block % 5 == 0 {
+                set(1, 40.0 * (1.0 + band as f32 * 1.7 + (t * 0.01).sin()));
+            }
+            if block % 7 == 0 {
+                set(2, 0.3 + (t * 0.03 + band as f32).cos().abs() * 4.0);
+            }
+            if block % 11 == 0 {
+                set(3, (block / 11 + band) as f32 % 2.0);
+            }
+            if block % 13 == 0 {
+                set(4, ((block / 13 + band) % 3) as f32);
+            }
+        }
+        for (param, every) in [(graphic, 17), (bypass, 19)] {
+            if block % every == 0 {
+                mixer.apply(Command::SetInsertParam {
+                    bus,
+                    slot: 0,
+                    param,
+                    value: (block / every % 2) as f32,
+                });
+            }
+        }
+        if block % 23 == 0 {
+            mixer.apply(Command::SetInsertBypass {
+                bus,
+                slot: 0,
+                bypass: block % 2 == 0,
+            });
+        }
+        mixer.process(&mut left, &mut right);
+        mixer.drain_events(|_| {});
+    });
+    assert!(left.iter().chain(&right).all(|s| s.is_finite()));
+}
+
 /// A stream through the mixer while another thread pushes frames into it.
 #[test]
 fn mixer_stream() {

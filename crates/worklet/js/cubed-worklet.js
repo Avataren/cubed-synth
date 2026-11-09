@@ -19,7 +19,9 @@
 //    (`cubed_mixer::SongControl`: play, stop, seek, loop, mute, solo, note preview, scopes);
 //    live edits are wire tags 31 (a cell) and 32 (an Adlib instrument).
 //   {type: 'effect', bus, slot, kind (EffectKind index; -1 empties the slot),
-//    params: Float32Array}
+//    params: Float32Array}  the effect's parameters in the order of
+//    `EffectKind::params()`, as many as cw_effect_param_count() (52 since the equaliser,
+//    kind 9; the other effects have at most 6); those left out are the effect's defaults
 //   {type: 'tap', bus, enable}  switches the analysis tap of a bus on or off
 //    (the bus must exist); answered by {type: 'tap', bus, enable, ok}
 //   {type: 'synth', source, bytes: ArrayBuffer (the patch JSON, UTF-8), oneShot,
@@ -255,11 +257,14 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         this.port.postMessage({ type: 'tap', bus: message.bus, enable: !!message.enable, ok });
       } else if (message.type === 'effect') {
         const params = message.params ?? new Float32Array(0);
-        const paramsAt = x.cw_effect_params();
-        const room = new Float32Array(x.memory.buffer, paramsAt, 6);
-        room.fill(0);
-        room.set(params.subarray(0, 6));
+        // 6 floats before the equaliser; a wasm built then has no count.
+        const count = x.cw_effect_param_count ? x.cw_effect_param_count() : 6;
         const kind = message.kind >= 0 ? message.kind >>> 0 : 0xffffffff;
+        // The defaults first (a wasm built before the equaliser has none: zeros).
+        const defaults = x.cw_effect_defaults ? x.cw_effect_defaults(kind) : 0;
+        const room = new Float32Array(x.memory.buffer, x.cw_effect_params(), count);
+        if (!defaults) room.fill(0);
+        room.set(params.subarray(0, count));
         x.cw_set_effect(message.bus >>> 0, message.slot >>> 0, kind);
       }
     } catch (error) {

@@ -909,11 +909,30 @@ pub extern "C" fn cw_error_len() -> u32 {
     state().error.len() as u32
 }
 
-/// Where `cw_set_effect` reads its parameters: `MAX_PARAMS` floats, in the
-/// order of the effect's parameter list.
+/// Where `cw_set_effect` reads its parameters: `cw_effect_param_count` floats,
+/// in the order of the effect's parameter list.
 #[no_mangle]
 pub extern "C" fn cw_effect_params() -> *mut f32 {
     state().effect_params.as_mut_ptr()
+}
+
+/// Fills `cw_effect_params` with the default parameters of built-in effect
+/// `kind` (`EffectKind::index`), so that a page that sends only some of them
+/// leaves the others at their defaults. Returns 1 if there is such an effect.
+#[no_mangle]
+pub extern "C" fn cw_effect_defaults(kind: u32) -> u32 {
+    let Some(kind) = u8::try_from(kind).ok().and_then(EffectKind::from_index) else {
+        return 0;
+    };
+    state().effect_params = Effect::new(kind).params;
+    1
+}
+
+/// How many floats `cw_effect_params` holds (`MAX_PARAMS`: 52 since the
+/// equaliser, 6 before it; a page built for the six reads only those).
+#[no_mangle]
+pub extern "C" fn cw_effect_param_count() -> u32 {
+    MAX_PARAMS as u32
 }
 
 /// Puts built-in effect `kind` (`EffectKind::index`) with the parameters at
@@ -1593,6 +1612,11 @@ mod tests {
         assert!(std::str::from_utf8(error).unwrap().contains("format"));
 
         // SAFETY: cw_effect_params holds MAX_PARAMS floats.
+        assert_eq!(cw_effect_param_count() as usize, MAX_PARAMS);
+        assert_eq!(cw_effect_defaults(EffectKind::Eq.index() as u32), 1);
+        assert_eq!(cw_effect_defaults(99), 0);
+        let defaults = unsafe { std::slice::from_raw_parts(cw_effect_params(), MAX_PARAMS) };
+        assert_eq!(defaults, Effect::new(EffectKind::Eq).params);
         let params = unsafe { std::slice::from_raw_parts_mut(cw_effect_params(), MAX_PARAMS) };
         params.copy_from_slice(&Effect::new(EffectKind::LowPass).params);
         assert_eq!(cw_set_effect(2, 0, EffectKind::LowPass.index() as u32), 1);
