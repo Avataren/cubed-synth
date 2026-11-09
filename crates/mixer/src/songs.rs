@@ -16,12 +16,14 @@ mod a2m;
 mod ahx;
 mod audition;
 mod player;
+mod psid;
 mod sid;
 
 pub use a2m::A2mPlayer;
 pub use ahx::AhxSongPlayer;
 pub use audition::OplAuditionSource;
 pub use player::{PlayerSong, SongPlayer, CHUNK as PLAYER_CHUNK};
+pub use psid::PsidSongPlayer;
 pub use sid::SidPlayer;
 
 /// The most frames a player is asked for at once; longer blocks are split,
@@ -145,13 +147,28 @@ pub fn open_module_song(
 /// `song_reader`; `stopped` opens it stopped and its voice never ends by itself.
 ///
 /// MOD, S3M and XM modules (see [`open_module_song`]), Adlib Tracker II songs ([`open_a2m`])
-/// AHX/HVL songs ([`open_ahx`]) and SID songs ([`open_sid`]; a `.asid`).
+/// AHX/HVL songs ([`open_ahx`]), SID songs ([`open_sid`]; a `.asid`) and PSID/RSID tunes ([`open_psid_at`]; a
+/// `.sid`, told by its magic).
 pub fn open_controlled_song(
     format: SongFormat,
     bytes: &[u8],
     sample_rate: f32,
     options: SongOptions,
     stopped: bool,
+) -> Result<Box<dyn Source>, String> {
+    open_controlled_song_at(format, bytes, sample_rate, options, stopped, 0.0)
+}
+
+/// [`open_controlled_song`] for a host that starts a PSID tune `start` seconds in (its code is run to there
+/// while it builds; a tune's seek is a rebuild). Every other format starts where it starts and ignores `start`.
+/// A `.sid` plays the subsong `options.subsong`, 0-based, as given.
+pub fn open_controlled_song_at(
+    format: SongFormat,
+    bytes: &[u8],
+    sample_rate: f32,
+    options: SongOptions,
+    stopped: bool,
+    start: f64,
 ) -> Result<Box<dyn Source>, String> {
     match format {
         SongFormat::Mod | SongFormat::S3m | SongFormat::Xm => {
@@ -165,6 +182,10 @@ pub fn open_controlled_song(
         SongFormat::Ahx => {
             let song = cubed_ahx::format::parse(bytes).map_err(|e| e.to_string())?;
             open_ahx(song, sample_rate, options, stopped)
+        }
+        // A `.sid` (PSID, RSID: a C64 program) or a `.asid` (cubed-synth's own SID songs).
+        SongFormat::Sid if cubed_sid::psid::looks_like_psid(bytes) => {
+            open_psid_at(bytes, sample_rate, Some(options.subsong), start, stopped)
         }
         SongFormat::Sid => {
             let song = SidSong::parse(bytes).map_err(|e| e.to_string())?;
@@ -227,6 +248,25 @@ pub fn open_sid(
         player.control(SongControl::Play);
     }
     Ok(Box::new(PlayerSong::new(player, stopped, options.looped)))
+}
+
+/// A PSID or RSID tune (a `.sid`: a C64 program) under live control, play-only: `Play`, `Stop`, mute and solo
+/// by voice, the position in seconds, levels and scopes (see `SongPlayer` for PSID in the README). `subsong` is
+/// 0-based (`None`: the file's start song) and `seconds` where in it the tune starts (the tune's code is run to
+/// there: a seek is a build, never a control). **Runs the tune's init routine and the seek: build it off the audio
+/// thread.** A BASIC RSID or a file the player cannot run is an error that says why.
+pub fn open_psid_at(
+    bytes: &[u8],
+    sample_rate: f32,
+    subsong: Option<usize>,
+    seconds: f64,
+    stopped: bool,
+) -> Result<Box<dyn Source>, String> {
+    let mut player = PsidSongPlayer::new(bytes, sample_rate, subsong, seconds)?;
+    if !stopped {
+        player.control(SongControl::Play);
+    }
+    Ok(Box::new(PlayerSong::new(player, stopped, true)))
 }
 
 /// An Adlib instrument to play by hand: a voice that takes `SourceEvent::NoteOn`, `NoteOff` and

@@ -10,7 +10,7 @@
 //   {type: 'commands', bytes: ArrayBuffer}  cubed_mixer::wire commands
 //   {type: 'clip', id, sampleRate, left: Float32Array, right?: Float32Array}
 //   {type: 'song', source, format (0 AHX/HVL, 1 A2M, 2 SID, 3 MOD, 4 S3M, 5 XM), bytes: ArrayBuffer,
-//    subsong, looped, separation?, stopped?, follow?}  prepares source slot `source` for a
+//    subsong, looped, separation?, stopped?, follow?, start?}  prepares source slot `source` for a
 //    PlaySource command; separation (0-1) is a module's stereo width. For a module
 //    (3, 4, 5), an Adlib song (1), a SID song (2) or an AHX/HVL song (0), `stopped` opens it under live control and stopped (silent until a
 //    SongControl 'Play' command, its voice never ends by itself) and `follow` (also
@@ -155,6 +155,8 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         const module = (message.format >= 3 && message.format <= 5) || message.format <= 2;
         let ok;
         if (module && (message.stopped || message.follow)) {
+          // Where a PSID tune starts, in seconds: its code is run to there while it builds.
+          x.cw_prepare_start(typeof message.start === 'number' ? message.start : 0);
           ok = x.cw_prepare_module(
             message.source >>> 0,
             message.format >>> 0,

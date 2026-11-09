@@ -65,6 +65,8 @@ struct State {
     clip_right: Vec<f32>,
     /// A song file on its way to `cw_prepare_song`.
     file: Vec<u8>,
+    /// Seconds into a PSID tune the next `cw_prepare_module` starts it (`cw_prepare_start`), then 0.
+    prepare_start: f64,
     /// Held notes on their way to `cw_prepare_synth_held`: a note number and a
     /// velocity each.
     held: Vec<f32>,
@@ -160,6 +162,7 @@ pub extern "C" fn cw_init(
         clip_left: Vec::new(),
         clip_right: Vec::new(),
         file: Vec::new(),
+        prepare_start: 0.0,
         held: Vec::new(),
         effect_params: [0.0; MAX_PARAMS],
         error: Vec::new(),
@@ -364,6 +367,17 @@ fn forget_song(s: &mut State, source: u32) {
     }
 }
 
+/// Where in the PSID tune the next `cw_prepare_module` starts it, in seconds (the tune's code is run to there
+/// while it builds; a seek is a rebuild). Used once, then 0. Other formats ignore it.
+#[no_mangle]
+pub extern "C" fn cw_prepare_start(seconds: f64) {
+    state().prepare_start = if seconds.is_finite() {
+        seconds.max(0.0)
+    } else {
+        0.0
+    };
+}
+
 /// Builds the song written at `cw_file_buffer` as prepared source `source`, under live
 /// control, and follows it: `format` 0 is an AHX or HVL song, 1 an Adlib Tracker II module, 2 a SID song, 3 MOD,
 /// 4 S3M, 5 XM (the formats `cubed_mixer::songs::open_controlled_song` puts under control;
@@ -410,7 +424,7 @@ fn prepare_module(
     options: SongOptions,
     stopped: bool,
 ) -> Result<(), String> {
-    use cubed_mixer::songs::{open_controlled_song, SongFormat};
+    use cubed_mixer::songs::{open_controlled_song_at, SongFormat};
     let format = match format {
         0 => SongFormat::Ahx,
         1 => SongFormat::A2m,
@@ -433,7 +447,9 @@ fn prepare_module(
         looped: options.looped,
         stereo_separation: options.stereo_separation,
     };
-    let song = open_controlled_song(format, &s.file, rate, options, stopped)?;
+    // A PSID tune is run to where it starts, here and not on the audio thread.
+    let start = std::mem::take(&mut s.prepare_start);
+    let song = open_controlled_song_at(format, &s.file, rate, options, stopped, start)?;
     let reader = song.song_reader().ok_or("the song has no reader")?;
     s.songs[source as usize] = Some(SongSlot {
         reader,

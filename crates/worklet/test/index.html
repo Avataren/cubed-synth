@@ -607,6 +607,64 @@ async function sidControlled() {
   return results;
 }
 
+// A PSID tune under live control: opened stopped at a start (seconds, run to while it builds), followed, played,
+// muted and stopped; its position is the seconds.
+async function psidControlled() {
+  const bytes = await (await fetch('../../sid/tests/fixtures/psid/arp.sid')).arrayBuffer();
+  const context = new AudioContext({ sampleRate: RATE });
+  const replies = [];
+  const positions = [];
+  const { node, ready } = await mixerNode(context, (m) => {
+    if (m.type === 'song') replies.push(m);
+    else if (m.type === 'songpos') for (let i = 0; i < m.sources.length; i++) positions.push({ at: performance.now(), ...decodeSong(m, i) });
+  });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const waitFor = async (predicate, ms = 3000, from = 0) => {
+    const start = performance.now();
+    while (performance.now() - start < ms) {
+      const found = positions.slice(from).find(predicate);
+      if (found) return found;
+      await sleep(15);
+    }
+    return null;
+  };
+  const send = (...parts) => {
+    const b = new Uint8Array(parts.flatMap((p) => [...p]));
+    node.port.postMessage({ type: 'commands', bytes: b.buffer }, [b.buffer]);
+  };
+  await ready;
+  node.port.postMessage({ type: 'song', source: 2, format: 2, bytes, subsong: 0, looped: true, stopped: true, start: 3 }, [bytes]);
+  node.port.postMessage({ type: 'song', source: 3, format: 2, bytes: new ArrayBuffer(8), stopped: true });
+  send(setBus(2, 0), playSource(5, 2, 2));
+  const first = await waitFor((p) => p.source === 2);
+  const openedOk = replies.length === 2 && replies[0].ok && !replies[1].ok;
+  const mark = positions.length;
+  send(songCommand(5, SONG.play), songCommand(5, SONG.scopes, 0, 1));
+  await sleep(900);
+  const during = positions.slice(mark);
+  const tracks = first ? first.channels : 0;
+  const loudest = Math.max(...during.map((p) => Math.max(...p.levels.subarray(0, tracks))));
+  const last = during[during.length - 1];
+  const seconds = last ? last.row + last.tick / 100 : 0;
+  send(songCommand(5, SONG.muteMask, 0, 0, 0, 0, 0b111));
+  await sleep(300);
+  const markStop = positions.length;
+  send(songCommand(5, SONG.stop));
+  const stopped = await waitFor((p) => !p.playing, 3000, markStop);
+  send(stop(5, 0));
+  await sleep(100);
+  send(setBus(3, 0));
+  const gone = await waitFor((p) => !p.alive);
+  await context.close();
+  const results = { first: first && { channels: first.channels, order: first.order, row: first.row }, loudest, seconds, tracks };
+  results.checks = {
+    openedOk, first: !!first && !first.playing && first.channels === 3 && first.alive && first.row >= 2 && first.row <= 3,
+    moved: seconds > 3.5 && seconds < 5, loud: loudest > 0.0001, stopped: !!stopped, gone: !!gone,
+  };
+  results.ok = Object.values(results.checks).every(Boolean);
+  return results;
+}
+
 async function run() {
   const clips = await clip();
   const songs = await song();
@@ -620,10 +678,11 @@ async function run() {
   const adlib = await adlibControlled();
   const ahx = await ahxControlled();
   const sid = await sidControlled();
+  const psid = await psidControlled();
   return {
     ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok && tapped.ok && swapped.ok
-      && bigSwapped.ok && controlled.ok && adlib.ok && ahx.ok && sid.ok,
-    clips, songs, modules, synths, synthEdits, tapped, swapped, bigSwapped, controlled, adlib, ahx, sid,
+      && bigSwapped.ok && controlled.ok && adlib.ok && ahx.ok && sid.ok && psid.ok,
+    clips, songs, modules, synths, synthEdits, tapped, swapped, bigSwapped, controlled, adlib, ahx, sid, psid,
   };
 }
 

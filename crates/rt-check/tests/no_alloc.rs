@@ -888,6 +888,94 @@ fn mixer_sid_song_control() {
     assert!(reader.alive() && mixer.is_playing(voice));
 }
 
+/// A PSID tune through the mixer, from its very first block (the player is built, its init run, off the audio
+/// thread): play, stop, mutes and solos as decoded wire bytes, the scopes on and off, and the readers read each
+/// block. The tune's code runs live inside `render`.
+#[test]
+fn mixer_psid_song_control() {
+    use cubed_mixer::songs::open_psid_at;
+    use cubed_mixer::{wire, SongControl, SONG_LEVEL_SLOTS, SONG_SCOPE_FRAMES};
+    let rate = RATE as f32;
+    let tune = fixture("sid/tests/fixtures/psid/arp.sid");
+    let mut mixer = Mixer::new(MixerConfig {
+        sample_rate: rate,
+        max_block: BLOCK,
+        ..MixerConfig::default()
+    });
+    let music = BusId(1);
+    mixer.apply(Command::SetBus(music, BusSettings::default()));
+    let source = open_psid_at(&tune, rate, Some(0), 1.5, true).unwrap();
+    let reader = source.song_reader().unwrap();
+    let voice = VoiceId(5);
+    mixer.apply(Command::PrepareSource(SourceId(0), source));
+    mixer.apply(Command::PlaySource(PlaySource::new(
+        voice,
+        SourceId(0),
+        music,
+    )));
+    let controls = [
+        SongControl::Scopes(true),
+        SongControl::Play,
+        SongControl::Mute {
+            channel: 1,
+            on: true,
+        },
+        SongControl::SoloMask(0b101),
+        // What a tune cannot take on the audio thread is ignored, allocating nothing.
+        SongControl::Seek { order: 0, row: 3 },
+        SongControl::PreviewOn {
+            instrument: 1,
+            note: 60,
+            velocity: 1.0,
+            duration: 0,
+        },
+        SongControl::Stop,
+        SongControl::SoloMask(0),
+        SongControl::MuteMask(0),
+        SongControl::Play,
+        SongControl::Looped(false),
+        SongControl::Scopes(false),
+        SongControl::Scopes(true),
+    ];
+    let encoded: Vec<Vec<u8>> = controls
+        .iter()
+        .map(|&control| {
+            let mut bytes = Vec::new();
+            wire::encode(
+                &Command::SourceEvent {
+                    voice,
+                    event: SourceEvent::Song(control),
+                },
+                &mut bytes,
+            );
+            bytes
+        })
+        .collect();
+    trace_allocations(std::env::var_os("CUBED_RT_TRACE").is_some());
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let (mut levels, mut ring) = ([0f32; SONG_LEVEL_SLOTS], [0f32; SONG_SCOPE_FRAMES]);
+    let per_control = BLOCKS_PER_SECOND / 2;
+    let mut sounded = 0.0f32;
+    let events = allocations_during(|| {
+        for (i, bytes) in encoded.iter().enumerate() {
+            for command in wire::decode(bytes) {
+                mixer.apply(command.unwrap());
+            }
+            for _ in 0..per_control {
+                mixer.process(&mut left, &mut right);
+                mixer.drain_events(|_| {});
+                let _ = reader.status();
+                reader.levels(&mut levels);
+                reader.scope(i % 3, &mut ring);
+                sounded = sounded.max(levels.iter().cloned().fold(0.0, f32::max));
+            }
+        }
+    });
+    assert_eq!(events, 0, "{events} allocations or frees");
+    assert!(sounded > 0.0, "the tune sounded");
+    assert!(reader.alive() && mixer.is_playing(voice));
+}
+
 /// The DAW's synth engine: 8 voices of an FM-into-subtractive patch (two
 /// oscillators, 4-voice unison, a 24 dB low-pass, two envelopes; the
 /// `patch_render` bench's) through chorus, delay and reverb, with notes

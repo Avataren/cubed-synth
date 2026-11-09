@@ -300,6 +300,7 @@ holds the song as bytes needs nothing per format:
 | Adlib Tracker II (`.a2m`) | `open_a2m(song, ..)` (an `A2mSong` the host holds), `open_controlled_song(SongFormat::A2m, bytes, ..)` | everything above; see below |
 | AHX, HVL (`.ahx`, `.hvl`) | `open_ahx(song, ..)` (a `cubed_ahx::format::Song` the host holds), `open_controlled_song(SongFormat::Ahx, bytes, ..)` | everything above except scopes; see below |
 | SID (`.asid`) | `open_sid(song, ..)` (a `cubed_sid::song::SidSong` the host holds), `open_controlled_song(SongFormat::Sid, bytes, ..)` | everything above; see below |
+| PSID, RSID (`.sid`) | `open_psid_at(bytes, rate, subsong, seconds, stopped)`; `open_controlled_song(SongFormat::Sid, bytes, ..)` and `open_controlled_song_at(.., start)` tell a `.sid` from a `.asid` by its magic | play-only: play, stop, mute and solo by voice, position in seconds, levels, scopes; see below |
 
 **Adlib.** The channels are the song's tracks. `Play`/`Stop`, `Seek` (the song replays silently to the row: a far row costs
 a few thousand ticks of register writes on the audio thread, no allocation), `Loop`, `Mute`/`Solo` and their masks map
@@ -344,6 +345,18 @@ wave, pulse, filter and speed pointers) and `SetTableRow`; a pattern's length, t
 length, the start tempo, the speed multiplier and the chip model are a new song. The chip's output carries a constant offset
 while its volume register is up, silence included.
 
+**PSID and RSID.** A tune is a program (`cubed_sid::psid::PsidPlayer` runs its 6510 code in step with the audio), so it plays
+and stops and that is all: `Play`, `Stop` (silent, the CPU does not run, the position stays), `Mute`/`Solo` by voice (bit `i`
+silences voice `i` of every chip), the position, levels and scopes (the voices of the first SID; up to three SIDs play, mixed as
+their average). **`Seek`, `Loop`, the previews and the live edits are ignored on the audio thread**: a start runs the tune's init
+routine (up to 60 million cycles) and a seek runs its code from the start up to the target (a seek back starts it again), neither
+of which belongs on an audio thread. A host that wants a tune at a place **builds it there**: `open_psid_at(bytes, rate, Some(subsong),
+seconds, stopped)` (or `open_controlled_song_at(.., start)`) off the audio thread; the worklet's `'song'` message takes `start`
+(seconds) with the subsong and runs it in its message handler (`cw_prepare_start`), so a big tune can glitch the sound once. The
+position: `status().order` is the subsong (0-based), `row` the whole seconds, `tick` the hundredths after them (`rows` the whole
+seconds, `frames` the samples), `speed` 1 and `tempo` 50; a tune whose code stops the CPU reads stopped and `pattern` is 1 (0
+otherwise). A BASIC RSID, and a file the player cannot run, is an error that says why.
+
 **Adding a song format** (the next one is one more of these):
 
 1. Make the format's player a `songs::SongPlayer` (a small struct in `crates/mixer/src/songs/<format>.rs`, so the format crate
@@ -362,7 +375,7 @@ while its volume register is up, silence included.
    bigger or that changes the song's shape is a new song swapped in (`swap_commands`), which the editor does for every format.
 4. The worklet needs nothing for a format that is in `open_controlled_song`: its page already sends `{type: 'song', format,
    stopped: true}` and reads `'songpos'`/`'songscope'` (add the format number to the JS's list of controllable formats, `module`
-   in `cubed-worklet.js`). Tests: a rig like `tests/a2m_song.rs`, `tests/ahx_song.rs` or `tests/sid_song.rs`, an allocation test in `rt-check` (`mixer_a2m_song_control`, `mixer_ahx_song_control`, `mixer_sid_song_control`), and the
+   in `cubed-worklet.js`). Tests: a rig like `tests/a2m_song.rs`, `tests/ahx_song.rs`, `tests/sid_song.rs` or `tests/psid_song.rs`, an allocation test in `rt-check` (`mixer_a2m_song_control`, `mixer_ahx_song_control`, `mixer_sid_song_control`), and the
    worklet page's (`crates/worklet/test/index.html`, `adlibControlled`, `ahxControlled`, `sidControlled`).
 
 ## Editing and writing tracker modules (a pattern editor's data layer)
