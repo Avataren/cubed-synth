@@ -1144,6 +1144,99 @@ VIC's bad lines and sprite DMA (a write is where the instruction count puts it, 
 the CPU would), CIA TOD, serial and ports, the keyboard and joysticks. The unstable opcodes use their common
 behaviour. A tune has no stored length (HVSC's Songlengths database is not read): it loops until stopped.
 
+## Importing PSID tunes as editable songs
+
+A `.sid` is a program, not a score, but the DAW can turn one into a GoatTracker-style song the tracker edits, plays
+and exports like any other, and `cubed_sid::psid::import` does the same here: a port of another_synth's
+`src/audio/tracker/psid/` importer (`plan-psid-import.md`). The result is a `SidSong`, the crate's document, so
+`SidDoc` edits it and writes it as `.sng` or `.asid`.
+
+```rust
+use cubed_sid::psid::import::{import, ImportOptions};
+use cubed_sid::edit::SidDoc;
+
+// Off the audio thread (and the UI's): it runs the tune.
+let r = import(&bytes, &ImportOptions::default())?;       // Err(String): the true reason it cannot be one
+r.song;                       // a SidSong
+r.report.fidelity;            // how close the start song sounds to the original (None: not measured, or unpacked exactly)
+r.report.notes;               // for the user: the speed, cut songs, subsongs left out, a second SID...
+r.report.used_gt_unpack;      // GoatTracker's own song data read back, not transcribed
+let (doc, report) = SidDoc::from_psid(&bytes, &ImportOptions::default())?;   // the same as a document
+```
+
+`ImportOptions { subsongs, max_seconds, measure, gt_unpack, kernal, cancel }`: the subsongs to import (0-based, default the start song
+first, then the rest, up to GoatTracker's 32), the capture cap per subsong (default 600 s of emulated time, as the
+DAW), whether to measure the fidelity (default yes), whether to recognise GoatTracker's tunes (default yes), the stand-in KERNAL
+(below) and a cancel flag.
+`ImportReport { fidelity, notes, warnings, used_gt_unpack, exact, subsong, frames, subsongs }`: `subsongs` has one
+`SubsongReport` per PSID subsong (where it went, why it was left out, its rows, loop, grid, capture).
+
+**Two ways.** A tune GoatTracker made (its code is `player.s`, V2.73, as `gt2reloc` relocates it) is **unpacked**
+(`gt_unpack`): the player's source is matched against the file's bytes statement by statement, as an assembler would
+lay it out with the defines unknown (a backtracking search over its `.IF`s, the bytes deciding nearly all at once),
+which recovers the build the relocator chose and the address of every table; the song data is then read back through
+each of the packer's steps (repeats, packed rests, renumbered instruments and tables) into the song it was packed from,
+and checked by packing it again (`export`: `report.exact` when that gives the file's bytes; otherwise it is kept only if
+it plays like the file, fidelity 0.98 or more). Any other tune is **transcribed**: every subsong is run on the emulated
+C64 (`capture`, the runner's machine with the DAW's Zobrist state hash, so a capture ends where the music repeats), its
+register trace is cut into frames, a row grid, notes (with their glides, ties, bends and vibrato as pattern commands),
+instruments grouped by timbre with wave, pulse and filter tables fitted to GoatTracker's 255 rows, folded where one
+instrument plus a command plays as another, and compiled into patterns and orderlists within GoatTracker's limits
+(63 instruments, 208 patterns, 254-byte orderlists; a subsong that does not fit is cut, then left out, with a note).
+The fidelity (`fidelity`) is the DAW's measure: the transcription is exported (`export`: GoatTracker's packer, a 6502
+assembler for `player.s` and the PSID wrapper, so `export::export_sid(&song, &SID_EXPORT_DEFAULTS)` writes any
+`SidSong` as a `.sid`) and the exported player is run on the same C64 as the original; the two register traces are
+aligned per voice and compared (pitch, gate, waveform, envelope level, onsets, pulse, filter).
+
+**Limits and safety.** It runs the tune: at most 600 emulated seconds per subsong (ticks and cycles capped as the DAW's
+capture is, an init that runs 60 M cycles is refused), at most 32 subsongs, memory in proportion (25 bytes a tick,
+about 1 MB for ten minutes at 50 Hz). A median tune takes 100 ms, the slowest percent a few seconds (a 5 s worst case
+of 400, with eight imports running at once on a 5950X): call it from a loading thread. A tune the machine cannot run
+is refused with a message, never a panic; `wasm32` builds it (it uses no threads, clocks or files).
+
+**What is checked.**
+
+- Against the DAW, tune by tune: `tests/fixtures/psid/import_oracle.ts` runs the DAW's own `importPsid` over a list and
+  writes the song as the DAW's `.asid` file (which `SidSong::to_bytes` writes byte for byte), the notes, the fidelity
+  and a report per subsong; `examples/psid_import.rs` writes the same JSON from this crate, and `CUBED_PSID_IMPORT_ORACLE`
+  makes `tests/psid_import.rs` compare. HVSC 85, `gt` mode (only the unpack) over all 61 157 files: **3 123 are
+  GoatTracker's, and every one unpacks to the DAW's song byte for byte with the same `exact` (608 pack again to the
+  file's bytes)**; the same files are refused for the same reasons. The whole import (all subsongs, the DAW's options) on 1 000 tunes chosen at random and
+  on 180 of GoatTracker's:
+
+  | HVSC 85 sample | tunes | same song, notes, reports and fidelity (the fidelity bit for bit) | both refuse | the DAW refuses, this imports |
+  |---|---|---|---|---|
+  | 1 000 at random | 1 000 | 968 (925 transcribed, 43 GoatTracker's unpacked) | 27 (20 for the same reason, 7 BASIC programs worded differently) | 5 (the KERNAL, below) |
+  | 180 GoatTracker's (70 exact, 110 not) | 180 | 180 (169 unpacked, 11 where the unpack plays too unlike the file and is transcribed) | 0 | 0 |
+
+  Speed on the 400 of them: median 103 ms a tune against the DAW's 217, 99th percentile 2.9 s (5.5 s), longest 5.8 s (12.8 s).
+- `tests/psid_import.rs`, on synthetic tunes (`make_fixtures.py`'s `tune.sid`, and two GoatTracker-packed songs made by
+  the DAW's exporter from the repository's own `.asid` fixtures; **no real tune is ever committed**): the notes of a
+  tune come out, the song is a document that writes as `.sng` and `.asid`, the unpack packs to the file it came from, the
+  DAW's song for each fixture (`expected_import.json`) is reproduced byte for byte with its fidelity to the last bit.
+
+```sh
+cargo test -p cubed-sid --test psid_import
+DAW=~/src/rust/another_synth; cd crates/sid/tests/fixtures/psid
+node build_import_oracle.mjs $DAW $SCRATCH/psid-import-oracle.mjs          # bundles import_oracle.ts with the DAW's esbuild
+find ~/hvsc -iname '*.sid' | sort > list.txt
+node $SCRATCH/psid-import-oracle.mjs oracle.json list.txt [import|start|capture|gt] [max_seconds]
+CUBED_PSID_IMPORT_ORACLE=oracle.json cargo test --release -p cubed-sid --test psid_import oracle -- --nocapture
+CUBED_PSID=~/hvsc CUBED_PSID_IMPORT_STRIDE=200 cargo test --release -p cubed-sid --test psid_import corpus_smoke -- --nocapture
+cargo run --release -p cubed-sid --example psid_import -- list.txt out.json [import|start|capture|gt]   # the same JSON from this crate
+```
+
+**Where it differs from the DAW.** In what a tune becomes: nowhere seen, on 1 180 tunes. In what runs: `Kernal::Extended`, the
+default, also runs the RSID tunes whose interrupt handler ends in the middle of the real KERNAL's (`$EA34`, `$EA7B`),
+which the DAW's stand-in leaves as `RTS`s and refuses ("the tune set up no interrupt that plays music..."): 5 of the 1 000.
+With `ImportOptions { kernal: Kernal::Daw, .. }` they are refused with the DAW's words and everything else is the same.
+The two messages that name the program (a BASIC RSID) say "player" where the DAW says "importer". The DAW's
+`Math.log2`/`pow` and Rust's `log2`/`powf` can differ in the last bit of a result; no case of it showed in the song or
+the fidelity. **Known gaps**, the DAW's too: the song is GoatTracker's model, so what it cannot say is left out (samples
+played through the volume register, more than one SID, a player's own tuning, a subsong at another speed than the start
+song's), each said in `report.notes`; a transcription approximates the original and can sound noticeably different (the
+fidelity compares registers frame by frame, not what the ear hears); `ImportOptions::cancel` (an `Arc<AtomicBool>`) stops an import from another thread, but there is no progress callback.
+
 ## Building, testing, benchmarks
 
 ```sh
@@ -1154,6 +1247,7 @@ cargo test -p cubed-sid --test edit_soak            # CUBED_GT_SONGS=<dir> soaks
 cargo test -p cubed-sid --test sng_write            # CUBED_SNG_WRITE_ORACLE=<json>, CUBED_GT_SONGS=<dir>
 cargo test -p cubed-rt-check --test sid_controls    # the controls allocate nothing
 cargo test -p cubed-sid --test psid                 # PSID/RSID: CUBED_PSID=<dir>, CUBED_PSID_ORACLE=<json>
+cargo test -p cubed-sid --test psid_import          # .sid -> song: CUBED_PSID=<dir>, CUBED_PSID_IMPORT_ORACLE=<json>
 cargo test -p cubed-rt-check --test psid_alloc      # the PSID player allocates nothing
 cargo test -p cubed-mixer --test eq                 # the equaliser against the DAW's numbers
 node crates/mixer/tests/eq/daw_reference.mjs <another_synth checkout> > crates/mixer/tests/eq/reference.rs

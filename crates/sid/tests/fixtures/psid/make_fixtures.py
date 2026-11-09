@@ -28,6 +28,7 @@ OPS = {
     'eor': {'imm': 0x49, 'zp': 0x45},
     'cmp': {'imm': 0xC9, 'zp': 0xC5, 'abs': 0xCD},
     'cpx': {'imm': 0xE0, 'zp': 0xE4},
+    'cpy': {'imm': 0xC0, 'zp': 0xC4, 'abs': 0xCC},
     'inc': {'zp': 0xE6, 'abs': 0xEE},
     'dec': {'zp': 0xC6, 'abs': 0xCE},
     'inx': {'imp': 0xE8}, 'iny': {'imp': 0xC8}, 'dex': {'imp': 0xCA}, 'dey': {'imp': 0x88},
@@ -325,6 +326,41 @@ play:   inc $f0
         rts
 """)
     out['cia2x.sid'] = psid(code, 0x1000, lab['init'], lab['play'], speed=1, name='CIA 2x (test)')
+
+    # 6. tune.sid: a small two-voice tune for the importer (`psid::import`): a sequencer that
+    # reads a note list per voice (frequency, length in frames, waveform), starts each note with
+    # the gate on and takes the gate off two frames before the next. Voice 1 is a pulse lead with
+    # a sweeping pulse width (16 notes of 6 frames), voice 2 a sawtooth bass (8 notes of 12), both
+    # 96 frames long, so the music repeats and the capture finds the loop.
+    def hz_reg(n):
+        return round(440 * 2 ** ((n - 57) / 12) * 16777216 / 985248)
+
+    lead = [48, 51, 53, 55, 58, 55, 53, 51, 48, 51, 55, 58, 60, 58, 55, 51]
+    bass = [24, 24, 27, 24, 29, 24, 27, 22]
+    voices = [(lead, 6, 0x41), (bass, 12, 0x21)]
+    src = ['init:   lda #1', '        sta $f0', '        sta $f4', '        lda #0', '        sta $f1',
+           '        sta $f5', '        sta $f8', '        lda #$0f', '        sta $d418', '        lda #$08',
+           '        sta $d405', '        lda #$a5', '        sta $d406', '        lda #$09', '        sta $d40c',
+           '        lda #$f0', '        sta $d40d', '        lda #$08', '        sta $d403', '        rts',
+           'play:   inc $f8', '        lda $f8', '        sta $d402']
+    data = []
+    for v, (notes, length, wave) in enumerate(voices):
+        cnt, pos, cur = 0xF0 + 4 * v, 0xF1 + 4 * v, 0xF2 + 4 * v
+        reg = 0xD400 + 7 * v
+        src += [f'        dec ${cnt:02x}', f'        bne nn{v}', f'        ldy ${pos:02x}', f'        lda len{v},y',
+                f'        sta ${cnt:02x}', f'        lda lo{v},y', f'        sta ${reg:04x}', f'        lda hi{v},y',
+                f'        sta ${reg + 1:04x}', f'        lda wav{v},y', f'        sta ${cur:02x}',
+                f'        sta ${reg + 4:04x}', '        iny', f'        cpy #{len(notes)}', f'        bne ok{v}',
+                '        ldy #0', f'ok{v}:    sty ${pos:02x}', f'        jmp dn{v}', f'nn{v}:    lda ${cnt:02x}',
+                '        cmp #2', f'        bne dn{v}', f'        lda ${cur:02x}', '        and #$fe',
+                f'        sta ${reg + 4:04x}', f'dn{v}:']
+        data += [f'len{v}:   .byte ' + ', '.join([str(length)] * len(notes)),
+                 f'lo{v}:    .byte ' + ', '.join(str(hz_reg(n) & 255) for n in notes),
+                 f'hi{v}:    .byte ' + ', '.join(str(hz_reg(n) >> 8) for n in notes),
+                 f'wav{v}:   .byte ' + ', '.join([str(wave)] * len(notes))]
+    src.append('        rts')
+    code, lab = build(0x1000, '\n'.join(src + data))
+    out['tune.sid'] = psid(code, 0x1000, lab['init'], lab['play'], name='Tune (test)')
     return out
 
 

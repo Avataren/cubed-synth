@@ -22,7 +22,10 @@
 //! flag) are set as the KERNAL leaves them.
 //!
 //! The DAW's Zobrist state hash (it finds the loop of a tune to end a capture)
-//! is not ported: a player runs for ever.
+//! is optional here: a player that runs for ever never asks for it, a capture
+//! (`import::capture`) turns it on with [`C64::enable_state_hash`], and the
+//! machine then keeps a 64-bit hash of its RAM and of the I/O registers
+//! written ([`C64::state_hash`]), the same one the DAW's `stateHash()` has.
 
 use super::cpu::{Cpu6510, CpuBus, I};
 
@@ -672,6 +675,69 @@ impl WriteQueue {
     }
 }
 
+/// The DAW's Zobrist key half: a 32-bit mix of `k`.
+fn zobrist(k: u32, seed: u32) -> u32 {
+    let mut x = (k ^ seed).wrapping_mul(0x9e37_79b1);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x85eb_ca6b);
+    x ^= x >> 13;
+    x = x.wrapping_mul(0xc2b2_ae35);
+    x ^= x >> 16;
+    x
+}
+
+const SEED_A: u32 = 0x2545_f491;
+const SEED_B: u32 = 0x6c8e_9cf5;
+/// I/O keys live above RAM's in the key space.
+const IO_KEY: u32 = 0x1_0000;
+
+/// A 64-bit Zobrist hash of everything a player can change: RAM and the I/O
+/// registers written, updated on every write (`C64::enable_state_hash`).
+#[derive(Clone)]
+struct StateHash {
+    /// RAM as the hash has it.
+    ram: Box<[u8; 0x10000]>,
+    /// The I/O registers as written, by `addr & $FFF`.
+    io: Box<[u8; 0x1000]>,
+    a: u32,
+    b: u32,
+    /// While set, writes leave the hash alone (an NMI handler's sample playback is not the music's state).
+    paused: bool,
+}
+
+impl StateHash {
+    #[inline]
+    fn ram_write(&mut self, addr: usize, v: u8) {
+        if self.paused {
+            return;
+        }
+        let old = self.ram[addr];
+        if old == v {
+            return;
+        }
+        let k = (addr as u32) << 8;
+        self.a ^= zobrist(k | old as u32, SEED_A) ^ zobrist(k | v as u32, SEED_A);
+        self.b ^= zobrist(k | old as u32, SEED_B) ^ zobrist(k | v as u32, SEED_B);
+        self.ram[addr] = v;
+    }
+
+    #[inline]
+    fn io_write(&mut self, addr: u16, v: u8) {
+        if self.paused {
+            return;
+        }
+        let i = (addr & 0xfff) as usize;
+        let old = self.io[i];
+        if old == v {
+            return;
+        }
+        let k = (IO_KEY | addr as u32) << 8;
+        self.a ^= zobrist(k | old as u32, SEED_A) ^ zobrist(k | v as u32, SEED_A);
+        self.b ^= zobrist(k | old as u32, SEED_B) ^ zobrist(k | v as u32, SEED_B);
+        self.io[i] = v;
+    }
+}
+
 /// Everything on the C64's bus but the CPU.
 pub struct System {
     ram: Box<[u8; 0x10000]>,
@@ -700,6 +766,8 @@ pub struct System {
     /// Cycle of the next timer/raster event to look at.
     next_event: u64,
     kernal: &'static [u8; 0x2000],
+    /// The Zobrist state hash, when a capture asked for it.
+    hash: Option<Box<StateHash>>,
 }
 
 /// What an interrupt check took.
@@ -755,6 +823,7 @@ impl C64 {
             voice3: Voice3::new(),
             next_event: NEVER,
             kernal: kernal.rom(),
+            hash: None,
         };
         let ram = &mut sys.ram;
         ram[0x00] = 0x2f;
@@ -795,16 +864,49 @@ impl C64 {
         self.sys.sid_count
     }
 
+    /// Start keeping the state hash ([`C64::state_hash`]). Call it on a fresh
+    /// machine, before the tune is loaded, as the DAW's machine always hashes:
+    /// the hash then covers every write from the start.
+    pub fn enable_state_hash(&mut self) {
+        let sys = &mut self.sys;
+        sys.hash = Some(Box::new(StateHash {
+            ram: sys.ram.clone(),
+            io: Box::new([0; 0x1000]),
+            a: 0,
+            b: 0,
+            paused: false,
+        }));
+    }
+
+    /// The 64-bit hash of the RAM and the I/O registers written (0 before
+    /// [`C64::enable_state_hash`]): two equal hashes at two moments mean the
+    /// machine's state, as far as a player can change it, is the same.
+    pub fn state_hash(&self) -> u64 {
+        match self.sys.hash.as_deref() {
+            Some(h) => ((h.a as u64) << 32) | h.b as u64,
+            None => 0,
+        }
+    }
+
+    /// While paused, writes leave the state hash alone (a capture pauses it
+    /// while an NMI handler runs: a sample pointer that never repeats would
+    /// hide the song's loop).
+    pub fn set_hash_paused(&mut self, paused: bool) {
+        if let Some(h) = self.sys.hash.as_deref_mut() {
+            h.paused = paused;
+        }
+    }
+
     /// Load `data` at `address` (RAM, whatever the banking).
     pub fn load(&mut self, address: u16, data: &[u8]) {
         for (i, &b) in data.iter().enumerate() {
-            self.sys.ram[(address as usize + i) & 0xffff] = b;
+            self.sys.ram_set((address as usize + i) & 0xffff, b);
         }
     }
 
     /// Set the `$01` banking (as a write to `$01`).
     pub fn set_banks(&mut self, value: u8) {
-        self.sys.ram[1] = value;
+        self.sys.ram_set(1, value);
         self.sys.update_banks();
     }
 
@@ -889,6 +991,14 @@ impl C64 {
 }
 
 impl System {
+    #[inline]
+    fn ram_set(&mut self, addr: usize, v: u8) {
+        self.ram[addr] = v;
+        if let Some(h) = self.hash.as_deref_mut() {
+            h.ram_write(addr, v);
+        }
+    }
+
     fn update_banks(&mut self) {
         let bits = (self.ram[1] | !self.ram[0]) & 7;
         let lo = bits & 1 != 0;
@@ -955,6 +1065,9 @@ impl System {
     }
 
     fn write_io(&mut self, addr: u16, v: u8, now: u64) {
+        if let Some(h) = self.hash.as_deref_mut() {
+            h.io_write(addr, v);
+        }
         if addr < 0xd400 {
             self.write_vic((addr & 0x3f) as u8, v, now);
             return;
@@ -977,7 +1090,7 @@ impl System {
             return;
         }
         if addr < 0xdc00 {
-            self.ram[addr as usize] = v & 0x0f;
+            self.ram_set(addr as usize, v & 0x0f);
             return;
         }
         if addr < 0xdd00 {
@@ -1146,7 +1259,7 @@ impl CpuBus for System {
             self.write_io(addr, v, cycle);
             return;
         }
-        self.ram[addr as usize] = v;
+        self.ram_set(addr as usize, v);
         if addr < 2 {
             self.update_banks();
         }

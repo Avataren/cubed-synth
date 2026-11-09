@@ -43,6 +43,10 @@ required-features = ["edit"]
 name = "controls"
 required-features = ["edit"]
 
+[[test]]
+name = "psid_import"
+required-features = ["edit"]
+
 [[bench]]
 name = "sid_render"
 harness = false

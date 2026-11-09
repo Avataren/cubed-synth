@@ -280,6 +280,18 @@ impl SidDoc {
         Err("it is not a SID song (no ASID, GTS5 or GTS! identification string)".into())
     }
 
+    /// A `.sid` tune (PSID or RSID, the C64's music files) as a song to edit: GoatTracker's own
+    /// tunes are unpacked, any other is transcribed from what its player plays (see
+    /// [`crate::psid::import`]). It runs the tune, which takes up to seconds: call it off the audio
+    /// thread. Returns the document and what the import has to tell (fidelity, notes, subsongs).
+    pub fn from_psid(
+        bytes: &[u8],
+        opts: &crate::psid::import::ImportOptions,
+    ) -> Res<(SidDoc, crate::psid::import::ImportReport)> {
+        let r = crate::psid::import::import(bytes, opts)?;
+        Ok((SidDoc::from_song(r.song)?, r.report))
+    }
+
     /// The song as the DAW's `.asid` file.
     pub fn to_asid_bytes(&self) -> Vec<u8> {
         self.song.to_bytes()
