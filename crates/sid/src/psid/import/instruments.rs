@@ -529,7 +529,7 @@ fn merged_to(progs: &[Rc<NoteProgram>], p: &mut Plans, max: usize) {
         plan.used = used_frames(progs, plan);
     }
     while p.plans.len() > max {
-        p.plans.sort_by(|a, b| b.used.cmp(&a.used));
+        p.plans.sort_by_key(|plan| std::cmp::Reverse(plan.used));
         let victim = p.plans.pop().unwrap();
         let mut best = 0usize;
         let mut best_d = i64::MAX;
@@ -1327,8 +1327,7 @@ fn note_timing(
     // (The song starts at GoatTracker's tempo 6 until an `F` command runs: a gate timer at or past it stops the player.)
     let gate_timer = 1i64.max(
         (row_frames - 1)
-            .max(1)
-            .min(DEFAULT_TEMPO - 1)
+            .clamp(1, DEFAULT_TEMPO - 1)
             .min(gap_after.unwrap_or(2) - lead),
     );
     // A legato note: no gate-off before it (GoatTracker's $40 gate-timer bit).
@@ -1490,7 +1489,7 @@ fn fit_pulse_programs(pulse: &mut [Program], plans: &[InstrumentPlan], budget: u
         .enumerate()
         .map(|(i, p)| (p.members.len(), i))
         .collect();
-    by_use.sort_by(|a, b| b.0.cmp(&a.0));
+    by_use.sort_by_key(|&(uses, _)| std::cmp::Reverse(uses));
     while rows_of(pulse) > budget {
         let donor: Program = by_use.iter().find_map(|&(_, i)| pulse[i].clone());
         let victim = by_use.iter().rev().find(|&&(_, i)| {
@@ -1594,7 +1593,7 @@ pub fn build_instruments(
     row_frames: i64,
     name: &dyn Fn(&NoteProgram, bool, usize) -> String,
     reserve_filter_rows: usize,
-    mut filter_accents: Option<&mut Vec<Option<(u8, u8)>>>,
+    filter_accents: Option<&mut Vec<Option<(u8, u8)>>>,
 ) -> Vec<Instrument> {
     let plans = &p.plans;
     let wave_budget = 255usize.saturating_sub(tables.wave.len());
@@ -1682,7 +1681,7 @@ pub fn build_instruments(
     fit_filter_programs(&mut filters, budget);
     // The instruments' own programs come first; an alternative goes in only if it fits what is left,
     // the most shared first (whole or not at all).
-    if let Some(accents) = filter_accents.as_deref_mut() {
+    if let Some(accents) = filter_accents {
         let mut placed: Vec<&TableProgram> = filters.iter().flatten().map(|f| f.as_ref()).collect();
         let mut order: Vec<usize> = (0..alts.len()).collect();
         order.sort_by(|&x, &y| alts[y].members.len().cmp(&alts[x].members.len()));

@@ -33,7 +33,7 @@ const rawPlugin = {
 };
 
 await esbuild.build({
-  entryPoints: [join(here, 'import_oracle.ts')],
+  entryPoints: [join(here, process.env.ENTRY ?? 'import_oracle.ts')],
   bundle: true,
   platform: 'node',
   format: 'esm',

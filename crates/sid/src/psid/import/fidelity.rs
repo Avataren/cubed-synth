@@ -29,7 +29,7 @@ use super::capture::{
     SID_EVENT_GATE_ON, SID_EVENT_TEST, SID_TRACE_REGS,
 };
 use super::envelope::{envelope_levels, EnvelopeFrame};
-use super::frames::{pitch_of, trace_frames, TraceFrames, VoiceFrames};
+use super::frames::{pitch_of, trace_frames, trace_frames_with, TraceFrames, VoiceFrames};
 use super::util::js_round;
 use crate::player::{frame_cycles, SidSongPlayer};
 use crate::psid::c64::C64Clock;
@@ -385,9 +385,19 @@ pub fn unrolled(f: &TraceFrames, n: usize) -> TraceFrames {
 fn play_trace(song: &SidSong, subsong: usize, ticks: usize) -> Result<SidTrace, String> {
     let mut player = SidSongPlayer::with_model(song.clone(), song.model, 44_100.0, subsong)
         .map_err(|e| e.to_string())?;
-    let mut regs: Vec<u8> = Vec::with_capacity(ticks * SID_TRACE_REGS);
-    let mut events: Vec<u8> = Vec::with_capacity(ticks * 3);
+    // GoatTracker's 6502 player reads the first row after counting its start tempo down, one tick
+    // later than this player (which reads it on its first frame): the song starts that many ticks
+    // late, and the ticks before are silent but for the volume its init sets. Start the same.
+    let lead = player.tempo() as usize + 1;
+    let mut regs: Vec<u8> = Vec::with_capacity((lead + ticks) * SID_TRACE_REGS);
+    let mut events: Vec<u8> = Vec::with_capacity((lead + ticks) * 3);
     let mut ctrl = [0u8; 3];
+    for _ in 0..lead {
+        let mut idle = [0u8; SID_TRACE_REGS];
+        idle[0x18] = 0x0f;
+        regs.extend_from_slice(&idle);
+        events.extend_from_slice(&[SID_EVENT_CTRL_WRITTEN | SID_EVENT_GATE_LOW; 3]);
+    }
     for _ in 0..ticks {
         player.frame();
         for r in 0..SID_TRACE_REGS {
@@ -410,6 +420,7 @@ fn play_trace(song: &SidSong, subsong: usize, ticks: usize) -> Result<SidTrace, 
         }
     }
     let tick = frame_cycles(song.speed_multiplier) as u64;
+    let ticks = lead + ticks;
     Ok(SidTrace {
         clock: C64Clock::Pal,
         mode: CaptureMode::Play,
@@ -435,18 +446,11 @@ pub fn measure_fidelity(
     max_frames: usize,
 ) -> Result<Fidelity, String> {
     let a = unrolled(&trace_frames(trace), max_frames);
-    // The transcription, played: enough frames that decimation (a player that writes on every
-    // n-th tick only) still leaves `max_frames + 200`.
-    let want = max_frames + 200;
-    let mut ticks = want;
-    let b = loop {
-        let t = play_trace(song, gt_subsong, ticks)?;
-        let f = trace_frames(&t);
-        if f.frames >= want || ticks >= want * 16 {
-            break f;
-        }
-        ticks = (ticks * 2).min(want * 16);
-    };
+    // The transcription, played: a frame per tick. (The DAW's trace of the exported player is cut
+    // into frames like any other, and may be decimated; the player here writes all it has every
+    // tick, and the registers of a silent voice that the real player moves and this one does not
+    // would only make that decimation differ.)
+    let b = trace_frames_with(&play_trace(song, gt_subsong, max_frames + 200)?, false);
     // Each voice's delay: where it scores best over a stretch of the song (a transcription's voices need
     // not start at the same frame, and a tune whose rows repeat every few frames has note starts that
     // line up at many delays, which the score tells apart). Delays that score alike keep the one nearest

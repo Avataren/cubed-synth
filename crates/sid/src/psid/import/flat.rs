@@ -296,11 +296,7 @@ fn pack_pattern(rows: &[Row]) -> Option<Vec<u8>> {
                     t[c][3] = 0;
                 }
             }
-            0xf => {
-                if (t[c][3] & 0x7f) >= 3 {
-                    t[c][3] -= 1;
-                }
-            }
+            0xf if (t[c][3] & 0x7f) >= 3 => t[c][3] -= 1,
             _ => {}
         }
     }

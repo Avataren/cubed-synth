@@ -319,7 +319,7 @@ pub fn split_lines(
 fn gate_off_run(f: &TraceFrames, v: usize, frame: i64, max: i64) -> i64 {
     let ctrl = &f.voices[v].ctrl;
     let mut n = 0;
-    while n < max && frame - n - 1 >= 0 && at8(ctrl, frame - n - 1) & 1 == 0 {
+    while n < max && frame - n > 0 && at8(ctrl, frame - n - 1) & 1 == 0 {
         n += 1;
     }
     n

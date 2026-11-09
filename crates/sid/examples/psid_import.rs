@@ -2,10 +2,10 @@
 //! `tests/fixtures/psid/import_oracle.ts` writes for the DAW's own importer, so the two can be
 //! compared tune by tune (`tests/fixtures/psid/compare_import.py`).
 //!
-//! cargo run --release -p cubed-sid --example psid_import -- list.txt out.json [import|start|capture] [max_seconds] [shard shards]
+//! cargo run --release -p cubed-sid --example psid_import -- list.txt out.json [import|start|capture|gt] [max_seconds] [shard shards]
 //!
 //! `list.txt` has one `.sid` path per line. `import` (the default) imports every subsong, `start`
-//! only the start song, `capture` records only the start song's register trace. With `shard n`
+//! only the start song, `capture` records only the start song's register trace, `gt` only the GoatTracker unpack. With `shard n`
 //! only every `shards`-th tune from the n-th is done, to run several at once.
 
 use cubed_sid::psid::import::capture::{capture_sid, CaptureOptions};
@@ -48,7 +48,7 @@ fn base64(bytes: &[u8]) -> String {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        eprintln!("usage: psid_import list.txt out.json [import|start|capture] [max_seconds] [shard shards]");
+        eprintln!("usage: psid_import list.txt out.json [import|start|capture|gt] [max_seconds] [shard shards]");
         std::process::exit(2);
     }
     let list = std::fs::read_to_string(&args[0]).expect("list");
@@ -98,6 +98,35 @@ fn main() {
 }
 
 fn run(file: &PsidFile, mode: &str, max_seconds: Option<f64>) -> Value {
+    if mode == "gtfid" {
+        // What the unpacked song scores against the file itself (how the import decides to keep it).
+        let Ok(u) = cubed_sid::psid::import::gt_unpack::unpack_gt_sid(file) else {
+            return json!({"ok": false, "reason": "not a GoatTracker tune"});
+        };
+        let trace = capture_sid(
+            file,
+            &CaptureOptions {
+                subsong: 0,
+                max_ticks: None,
+                max_seconds: Some(120.0),
+            },
+        );
+        let Ok(trace) = trace else {
+            return json!({"ok": false, "reason": "capture failed"});
+        };
+        return match cubed_sid::psid::import::fidelity::measure_fidelity(&trace, &u.song, 0, 3000) {
+            Err(e) => json!({"ok": false, "reason": e}),
+            Ok(f) => json!({"ok": true, "score": f.score, "filter": f.filter, "offset": f.offset,
+                "voiceOffsets": f.voice_offsets, "frames": f.frames, "ticks": trace.ticks,
+                "voices": f.voices.iter().map(|v| json!([v.gate, v.onsets, v.pitch, v.wave, v.envelope, v.level, v.pulse, v.score])).collect::<Vec<_>>()}),
+        };
+    }
+    if mode == "gt" {
+        return match cubed_sid::psid::import::gt_unpack::unpack_gt_sid(file) {
+            Err(reason) => json!({"ok": false, "reason": reason}),
+            Ok(u) => json!({"ok": true, "notes": u.notes, "asid": base64(&u.song.to_bytes())}),
+        };
+    }
     if mode == "capture" {
         let c = capture_sid(
             file,

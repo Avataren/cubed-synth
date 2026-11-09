@@ -8,12 +8,15 @@
 //
 //  - `import` (default): the whole import, every subsong, as the app does it;
 //  - `start`: the same with only the start subsong imported (`subsongs: [start]`), much faster;
-//  - `capture`: only the capture of the start song (ticks, loop, a hash of the registers).
+//  - `capture`: only the capture of the start song (ticks, loop, a hash of the registers);
+//  - `gt`: only the GoatTracker unpack (`unpackGtSid`): whether the file is one, what it unpacks to, and
+//    whether packing that again gives the file's bytes (`exact`).
 //
 //   CUBED_PSID_IMPORT_ORACLE=out.json cargo test --release -p cubed-sid --test psid_import oracle
 import { parsePsid } from 'src/audio/tracker/psid/psid-file';
 import { captureSid } from 'src/audio/tracker/psid/sid-capture';
 import { importPsid } from 'src/audio/tracker/psid';
+import { unpackGtSid } from 'src/audio/tracker/psid/gt-unpack';
 import { serializeSidFile } from 'src/audio/tracker/sid-doc/sid-file-codec';
 import { readFileSync, writeFileSync } from 'node:fs';
 
@@ -39,6 +42,11 @@ for (const path of paths) {
   }
   const file = parsed.file;
   try {
+    if (mode === 'gt') {
+      const u = unpackGtSid(file);
+      results[path] = u.ok ? { ok: true, exact: u.exact, notes: u.notes, asid: Buffer.from(serializeSidFile(u.doc)).toString('base64'), ms: performance.now() - t0 } : { ok: false, reason: u.reason };
+      continue;
+    }
     if (mode === 'capture') {
       const c = captureSid(file, maxSeconds === undefined ? { subsong: file.startSong - 1 } : { subsong: file.startSong - 1, maxSeconds });
       if (!c.ok) {

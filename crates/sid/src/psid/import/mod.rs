@@ -34,6 +34,7 @@ pub mod flat;
 pub mod fold;
 pub mod frames;
 pub mod grid;
+pub mod gt_unpack;
 pub mod instruments;
 pub mod notes;
 pub mod pitch;
@@ -47,7 +48,6 @@ pub use transcribe::{SubsongReport, TranscribeOptions};
 
 use super::file::{looks_like_psid, PsidFile};
 use crate::song::SidSong;
-use std::collections::BTreeMap;
 
 /// What to import and how far to go.
 #[derive(Clone, Debug)]
@@ -60,6 +60,8 @@ pub struct ImportOptions {
     pub measure: bool,
     /// Frames the fidelity compares (default 3000: a minute).
     pub fidelity_frames: usize,
+    /// Recognise a tune GoatTracker made and unpack its song data (default true); false transcribes every tune.
+    pub gt_unpack: bool,
 }
 
 impl Default for ImportOptions {
@@ -69,6 +71,7 @@ impl Default for ImportOptions {
             max_seconds: None,
             measure: true,
             fidelity_frames: 3000,
+            gt_unpack: true,
         }
     }
 }
@@ -154,8 +157,50 @@ pub fn import(bytes: &[u8], opts: &ImportOptions) -> Result<ImportResult, String
     import_file(&file, opts)
 }
 
+/// An unpacked song that does not play like the file plays less like it than this, or it is transcribed instead.
+const UNPACKED_FIDELITY: f64 = 0.98;
+
+/// `file` unpacked from its GoatTracker data, or `None` when it is not a GoatTracker file (or
+/// unpacks to something that does not play like it).
+fn unpacked(file: &PsidFile, opts: &ImportOptions) -> Option<ImportResult> {
+    let u = gt_unpack::unpack_gt_sid(file).ok()?;
+    // Kept only when it plays like the file (the DAW also keeps one that packs again to the file's
+    // bytes; that packer is not ported, see `gt_unpack`).
+    let trace = capture::capture_sid(
+        file,
+        &capture::CaptureOptions {
+            subsong: 0,
+            max_ticks: None,
+            max_seconds: Some(120.0),
+        },
+    )
+    .ok()?;
+    let m = fidelity::measure_fidelity(&trace, &u.song, 0, opts.fidelity_frames).ok()?;
+    if m.score < UNPACKED_FIDELITY {
+        return None;
+    }
+    Some(ImportResult {
+        report: ImportReport {
+            fidelity: if opts.measure { Some(m) } else { None },
+            notes: u.notes,
+            warnings: Vec::new(),
+            used_gt_unpack: true,
+            exact: None,
+            subsong: 0,
+            frames: 0,
+            subsongs: Vec::new(),
+        },
+        song: u.song,
+    })
+}
+
 /// [`import`] of a parsed file.
 pub fn import_file(file: &PsidFile, opts: &ImportOptions) -> Result<ImportResult, String> {
+    if opts.gt_unpack {
+        if let Some(r) = unpacked(file, opts) {
+            return Ok(r);
+        }
+    }
     let t = transcribe::transcribe_psid(
         file,
         &TranscribeOptions {
@@ -199,7 +244,6 @@ pub fn import_file(file: &PsidFile, opts: &ImportOptions) -> Result<ImportResult
             }
         }
     }
-    let _: Option<BTreeMap<u8, u8>> = None;
     Ok(ImportResult {
         report: ImportReport {
             fidelity,

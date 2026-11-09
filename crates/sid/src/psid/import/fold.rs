@@ -142,11 +142,10 @@ pub fn fold_instruments(
                     found = Some((h, 0, 0));
                     break;
                 }
-                Some(How::Command(c, p)) => {
-                    if !busy.contains(&n) && found.is_none() {
-                        found = Some((h, c, p));
-                    }
+                Some(How::Command(c, p)) if !busy.contains(&n) && found.is_none() => {
+                    found = Some((h, c, p));
                 }
+                Some(How::Command(..)) => {}
                 None => {}
             }
         }

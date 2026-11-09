@@ -223,7 +223,7 @@ fn pairwise_delays(onsets: &[Vec<i64>]) -> Vec<i64> {
                 j += 1;
             }
             let d = o - b[j];
-            if d.abs() <= MIN_ROW_FRAMES - 1 {
+            if d.abs() < MIN_ROW_FRAMES {
                 close += 1;
                 *counts.entry_or_insert_with(d, || 0) += 1;
             }
@@ -371,8 +371,7 @@ fn held_steps(
                 let c = best[i];
                 let d = b - a;
                 if d != c - b
-                    || d < MIN_ROW_FRAMES
-                    || d > MAX_STEADY_ROW
+                    || !(MIN_ROW_FRAMES..=MAX_STEADY_ROW).contains(&d)
                     || d % t == 0
                     || t % d == 0
                 {
