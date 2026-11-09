@@ -121,8 +121,10 @@ pub struct Sampler {
     base_gain: f32,      // Output gain
     trigger_mode: SamplerTriggerMode,
     loop_mode: SamplerLoopMode,
-    loop_start: f32, // Loop start point (in frames)
-    loop_end: f32,   // Loop end point (in frames)
+    /// Loop points as fractions of the sample's length (0 to 1), as a patch
+    /// stores them (`loopStart`, `loopEnd`).
+    loop_start: f32,
+    loop_end: f32,
     active: bool,
 
     // State
@@ -154,7 +156,7 @@ impl Sampler {
             trigger_mode: SamplerTriggerMode::Gate,
             loop_mode: SamplerLoopMode::Off,
             loop_start: 0.0,
-            loop_end: 0.0,
+            loop_end: 1.0,
             active: true,
             playhead: 0.0,
             direction: 1.0,
@@ -186,10 +188,9 @@ impl Sampler {
         self.is_playing = false;
         self.oneshot_complete = false;
 
-        // Update loop_end to sample length if not set
-        let sample_len = self.sample_data.borrow().len() as f32;
+        // A loop end that was never set is the end of the sample.
         if self.loop_end <= 0.0 {
-            self.loop_end = sample_len;
+            self.loop_end = 1.0;
         }
     }
 
@@ -205,12 +206,15 @@ impl Sampler {
         self.loop_mode = mode;
     }
 
+    /// Where the loop starts, as a fraction (0 to 1) of the sample's length.
     pub fn set_loop_start(&mut self, start: f32) {
-        self.loop_start = start.max(0.0);
+        self.loop_start = start.clamp(0.0, 1.0);
     }
 
+    /// Where the loop ends, as a fraction (0 to 1) of the sample's length; 0
+    /// (or less) is the end of the sample.
     pub fn set_loop_end(&mut self, end: f32) {
-        self.loop_end = end;
+        self.loop_end = if end > 0.0 { end.min(1.0) } else { 1.0 };
     }
 
     pub fn set_trigger_mode(&mut self, mode: SamplerTriggerMode) {
@@ -540,8 +544,8 @@ impl AudioNode for Sampler {
 
             // Get sample value at current playhead with simple 2x oversampling
             let (mut left, mut right) = if self.is_playing {
-                let loop_start = self.loop_start.clamp(0.0, sample_len - 1.0);
-                let loop_end = self.loop_end.clamp(loop_start + 1.0, sample_len);
+                let loop_start = (self.loop_start * sample_len).clamp(0.0, sample_len - 1.0);
+                let loop_end = (self.loop_end * sample_len).clamp(loop_start + 1.0, sample_len);
                 let step = (playback_rate * self.direction) / SAMPLER_OVERSAMPLE_FACTOR as f32;
 
                 let mut acc_left = 0.0;
@@ -673,5 +677,89 @@ mod tests {
             right.iter().any(|&v| v.abs() > 1e-6),
             "Right channel is entirely silent"
         );
+    }
+
+    /// A ramp sample (frame n holds n / len) played at its own rate, free
+    /// running, for `blocks` blocks of 64 frames.
+    fn play_ramp(
+        len: usize,
+        mode: SamplerLoopMode,
+        start: f32,
+        end: f32,
+        blocks: usize,
+    ) -> Vec<f32> {
+        let rate = 48_000.0;
+        let mut sampler = Sampler::new(rate);
+        let data = Rc::new(RefCell::new(SampleData::new()));
+        {
+            let mut d = data.borrow_mut();
+            d.load_from_wav((0..len).map(|n| n as f32 / len as f32).collect(), 1, rate);
+            d.root_note = 69.0;
+        }
+        sampler.set_sample_data(data);
+        sampler.set_trigger_mode(SamplerTriggerMode::FreeRunning);
+        sampler.set_loop_mode(mode);
+        sampler.set_loop_start(start);
+        sampler.set_loop_end(end);
+        let inputs: PortMap<Vec<ModulationSource<'static>>> = PortMap::default();
+        let mut played = Vec::new();
+        for _ in 0..blocks {
+            let mut left = vec![0.0_f32; 64];
+            let mut right = vec![0.0_f32; 64];
+            let mut outputs: Outputs<'_> = Outputs::default();
+            outputs.insert(PortId::AudioOutput0, &mut left[..]);
+            outputs.insert(PortId::AudioOutput1, &mut right[..]);
+            sampler.process(&inputs.as_inputs(), &mut outputs, 64);
+            played.extend_from_slice(&left);
+        }
+        played
+    }
+
+    #[test]
+    fn loop_points_are_fractions_of_the_sample_as_a_patch_stores_them() {
+        // 1,000 frames looping from 0.25 to 0.5: after the run up to the loop end the
+        // sound stays between frames 250 and 500 for as long as it plays.
+        let played = play_ramp(1000, SamplerLoopMode::Loop, 0.25, 0.5, 40);
+        let tail = &played[600..];
+        let low = tail.iter().cloned().fold(f32::MAX, f32::min);
+        let high = tail.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            (0.24..=0.26).contains(&low),
+            "the loop starts at 0.25, not {low}"
+        );
+        assert!(
+            (0.49..=0.51).contains(&high),
+            "the loop ends at 0.5, not {high}"
+        );
+        // And it did loop: 2,560 frames played of a 1,000 frame sample.
+        assert!(tail.iter().all(|v| *v > 0.2), "it kept on playing the loop");
+    }
+
+    #[test]
+    fn a_loop_end_of_one_loops_the_whole_sample_and_no_loop_plays_it_once() {
+        let looped = play_ramp(500, SamplerLoopMode::Loop, 0.0, 1.0, 20);
+        let after_one_pass = &looped[600..];
+        assert!(
+            after_one_pass.iter().any(|v| *v > 0.5) && after_one_pass.iter().any(|v| *v < 0.5),
+            "the ramp restarts over and over"
+        );
+        let once = play_ramp(500, SamplerLoopMode::Off, 0.0, 1.0, 20);
+        let end = &once[600..];
+        assert!(
+            end.iter().all(|v| *v > 0.9),
+            "it holds the last frame: {:?}",
+            &end[..4]
+        );
+    }
+
+    #[test]
+    fn a_loop_end_that_was_never_set_is_the_end_of_the_sample() {
+        let mut sampler = Sampler::new(48_000.0);
+        sampler.set_loop_end(0.0);
+        assert_eq!(sampler.loop_end, 1.0);
+        sampler.set_loop_end(7.0);
+        assert_eq!(sampler.loop_end, 1.0);
+        sampler.set_loop_start(-3.0);
+        assert_eq!(sampler.loop_start, 0.0);
     }
 }
