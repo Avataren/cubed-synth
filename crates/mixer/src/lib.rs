@@ -27,6 +27,7 @@ mod clip;
 mod command;
 pub mod effects;
 pub mod engine;
+pub mod eq;
 mod insert;
 mod mixer;
 pub mod probe;
@@ -60,8 +61,9 @@ pub use probe::SongProbe;
 pub use sfx::{Sfx, SfxPreset, SfxWave};
 pub use smooth::MIN_DB;
 pub use song::{
-    SongCell, SongControl, SongInstrument, SongLoop, SongReader, SongStatus, WebSong, WebSongs,
-    SONG_LEVEL_SLOTS, SONG_MAX_CHANNELS, SONG_SCOPE_FRAMES, SONG_STATUS_WORDS,
+    SongCell, SongControl, SongInstrument, SongLoop, SongReader, SongStatus, VoicePos, WebSong,
+    WebSongs, SONG_LEVEL_SLOTS, SONG_MAX_CHANNELS, SONG_MAX_VOICES, SONG_SCOPE_FRAMES,
+    SONG_STATUS_WORDS, SONG_VOICE_WORDS, SONG_VOICE_WORD_STRIDE,
 };
 pub use source::{Source, SourceEvent};
 pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};

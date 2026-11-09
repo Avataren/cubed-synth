@@ -13,7 +13,7 @@ in a browser AudioWorklet and in a native audio callback.
 | `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. The writers (`write_mod`, `write_s3m`, `write_xm`) and `edit::ModuleDoc`, which edits a module as data with JSON operations, format limits and undo. An `Observer` sees every row and command; a `Probe` shows the position, per-channel levels and scopes of a playing player, which also takes live control (stop and play, seek, loops, mute and solo, note preview) |
 | `cubed-dsp` | The synth engine: audio graph, oscillators (analog, wavetable), envelopes, LFOs, filters, chorus, delay, reverb, convolver, compressor, limiter, EQ, voices, automation and patch loading; a catalogue of its node types, patch documents that are edited as data, and live parameter edits |
 | `cubed-simd` | The slice of `std::simd` the crates above use, on stable Rust |
-| `cubed-mixer` | A game audio mixer: named buses with faders, mute/solo, inserts (built-in `effects` with live parameters), sends and ducking; clip voices and sources (chip songs, streams, synth patches played by note events), 2D/3D placement with doppler, long fades, meters; nothing allocates while it runs. `native` adds a cpal output host and streams fed from another thread; `songs` plays AHX/HVL, A2M and SID songs and MOD/S3M/XM modules as sources (a module can be steered and read while it plays); `wire` encodes its commands as bytes |
+| `cubed-mixer` | A game audio mixer: named buses with faders, mute/solo, inserts (built-in `effects` with live parameters, among them a ten-band parametric `eq`), sends and ducking; clip voices and sources (chip songs, streams, synth patches played by note events), 2D/3D placement with doppler, long fades, meters; nothing allocates while it runs. `native` adds a cpal output host and streams fed from another thread; `songs` plays AHX/HVL, A2M and SID songs and MOD/S3M/XM modules as sources (a module can be steered and read while it plays); `wire` encodes its commands as bytes |
 | `cubed-worklet` | `cubed-mixer` as a wasm module for a browser AudioWorklet (raw exports, no JS glue) and its processor, `js/cubed-worklet.js` |
 | `cubed-rt-check` | Tests only: every render path checked for allocations with a counting allocator |
 
@@ -256,6 +256,67 @@ the table to the audio thread, in the wire protocol and the worklet); a sample h
 reverse or crop operations (`load_sample` takes the audio already prepared); no resampling of samples;
 a sample is stored as 16-bit.
 
+## The mixer's effects and the equaliser
+
+A bus's inserts are `cubed_mixer::EffectKind`s, plain data (a kind and its parameters in
+the order of `kind.params()`) that `Effect::build` turns into an insert off the audio thread and
+`Command::SetInsertParam` changes while it runs: `reverb`, `delay`, `low_pass`, `high_pass`,
+`compressor`, `limiter`, `chorus`, `saturation`, `bitcrusher` and `eq`. A kind's number in the byte
+protocol (`EffectKind::index`) is its place in `EffectKind::ALL`, so new kinds go last. `MAX_PARAMS`
+is the most parameters any has: 6 until the equaliser, 52 now. `params()` lists each parameter's
+`name`, range, default and unit.
+
+**The equaliser** (`EffectKind::Eq`, `"eq"`; `cubed_mixer::eq`) is the DAW's post-fx equaliser
+(another_synth's `eq-math.ts` / `eq-stage.ts`) as an insert: ten bands in series, stereo, with the
+DAW's layout as its defaults: a low shelf at 31 Hz, peaking bands at 62, 125, 250, 500 Hz and 1, 2,
+4, 8 kHz (Q 0.7) and a high shelf at 16 kHz, all flat.
+
+| Parameter | Range | Default | |
+|---|---|---|---|
+| `bypass` | 0 or 1 | 0 | 1 crossfades to the dry signal in 5 ms (the filters keep running, so switching back is seamless) |
+| `graphic` | 0 or 1 | 0 | 1: the gains are the *curve you see* (below) |
+| `band1_freq_hz` .. `band10_freq_hz` | 20 - 20,000 Hz | 31, 62, 125, 250, 500, 1k, 2k, 4k, 8k, 16k | the centre of a peaking band, the corner of a shelf (held below 0.49 of the sample rate) |
+| `bandN_gain_db` | -24 - 24 dB | 0 | in graphic mode limited to +-12 dB, as in the DAW |
+| `bandN_q` | 0.1 - 10 | 0.7 (bands 1 and 10: 0.7071) | 0.7071 is a shelf of slope 1, the one Web Audio's `BiquadFilterNode` always makes |
+| `bandN_enabled` | 0 or 1 | 1 | a disabled band is flat (and costs nothing) |
+| `bandN_type` | 0 low shelf, 1 peaking, 2 high shelf | 0 for band 1, 2 for band 10, else 1 | changing it is not smoothed |
+
+The filters are the RBJ cookbook biquads the DAW computes, in transposed direct form II in `f64`.
+A band's gain, frequency and Q glide to a new value (time constant 6.7 ms, the DAW's) and the
+coefficients ramp sample by sample between designs made every 32 frames, so editing a parameter
+live does not click, even a fast sweep of several bands; a band at 0 dB is skipped and a flat
+equaliser passes the signal through unchanged. States that decay to nothing are flushed, so a
+tail does not end in denormals. Nothing allocates after `build`: `set_param` records the value,
+and the next block retargets the bands once for however many changed.
+
+**Graphic mode** is the DAW's curve editor. Octave-spaced bands overlap, so applying the gains as
+they are stacks neighbours (a flat +6 on every band comes out near +9, with scallops between the
+centres). With `graphic` = 1 the band gains are targets of a smooth curve through the band
+centres, and the gains that are applied are the DAW's `eqEffectiveGains`: a weighted least-squares
+fit of the combined response to that curve, nodes weighted heavily, four Gauss-Newton steps, the
+solved gains limited to +-24 dB. It works for any frequencies, Qs and types (the enabled bands,
+sorted by frequency, are the nodes). The fit is solved on the audio thread when a parameter
+changed (a block that solves it takes about 40 us in release, 70 us at worst, where a block
+with ten active bands and nothing to solve takes about 6 us), allocates nothing and is rebuilt only when a frequency, Q, type or
+switch changed, not for a gain. `cubed_mixer::eq::response_db(params, sample_rate, hz, out)`
+gives the combined response in dB for a curve display (it allocates).
+
+From the worklet the page sends `{type: 'effect', bus, slot, kind: 9, params: Float32Array}` with
+the parameters in the order above (`bypass`, `graphic`, then for each band `freq_hz`, `gain_db`,
+`q`, `enabled`, `type`); any it leaves off are the defaults (`cw_effect_defaults`), and
+`cw_effect_param_count()` is how many a message can carry (the processor reads that many; a
+wasm built before it carried 6). Changes after that are `SetInsertParam` commands (the wire is
+unchanged: its parameter number is a `u8`).
+
+Checks: `tests/eq/main.rs` compares the response and the fitted gains with what the DAW's
+TypeScript computes (`tests/eq/daw_reference.mjs` runs `eq-math.ts` under Node and writes
+`tests/eq/reference.rs`; the fitted gains agree to 1e-6 dB, the responses to 2e-6 dB), plays sines
+through the real filters at the band centres and in between, at 22.05 to 96 kHz, and checks the
+flat, live-change, bypass and denormal behaviour; `rt-check`'s `mixer_eq` moves every kind of
+parameter every block and counts allocations; and the worklet page test renders the equaliser
+in a real browser against a chain of the browser's own `BiquadFilterNode`s set up as the DAW's
+`EqStage` is (relative error 4e-5, -88 dB).
+
 ## Analysis: taps, spectrum, levels
 
 What an editor shows of the sound (a scope, a spectrum, level meters) comes from
@@ -346,6 +407,7 @@ source.song_reader().unwrap();`, then `PrepareSource` and `PlaySource` as for an
 ```rust
 enum SongControl {
     Play, Stop, Seek { order: u16, row: u16 },
+    SeekVoice { voice: u8, order: u16, row: u16 },    // SID: a seek by one voice's own place (wire kind 18)
     Loop(SongLoop),                                   // None | Pattern { order } | Range { order, row0, row1 }
     Mute { channel: u8, on: bool }, Solo { channel: u8, on: bool },
     MuteMask(u32), SoloMask(u32),                     // every channel at once, a bit each
@@ -360,7 +422,7 @@ enum SongControl {
     SetTableRow { table, row, left, right },          // SID: a row of a step table (wire kind 17)
 }
 trait SongReader: Send + Sync {                       // natively: the song's probe; on the web: WebSong
-    fn status(&self) -> SongStatus;                   // as Player::status, plus `version`
+    fn status(&self) -> SongStatus;                   // as Player::status, plus `version` and `voices` (SID: each voice's own order, pattern, row)
     fn channels(&self) -> usize;
     fn levels(&self, out: &mut [f32]) -> usize;       // the channels' peaks, then the preview's
     fn scope(&self, channel: usize, out: &mut [f32]) -> usize;   // mono frames, oldest first, <= 512
@@ -375,7 +437,7 @@ batch): tag 30, 24 bytes, little endian: `u8 tag, u64 voice, u8 kind, u16 a, u16
 u32 frames`. Kinds: 0 Play, 1 Stop, 2 Seek (a order, b row), 3 Loop none, 4 Loop pattern (a order), 5 Loop
 range (a order, b row0, c row1), 6 Mute (a channel, b on), 7 Solo (a, b), 8 MuteMask (frames), 9 SoloMask
 (frames), 10 PreviewOn (a instrument, b note, value velocity, frames duration), 11 PreviewOff, 12 Looped
-(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order), 17 SetTableRow (a table | row << 8, b left | right << 8). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
+(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order), 17 SetTableRow (a table | row << 8, b left | right << 8), 18 SeekVoice (a order, b row, c voice). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
 number, u8 fm[11], u8 panning, i8 finetune, u8 voice_type`. Tag 31, 21 bytes: `u8 tag, u64 voice, u16 pattern, u16 row, u8 channel, u8 note
 (0 none, 255 key off, else MIDI; Adlib: the file's note byte), u16 period (Adlib: `effect2 << 8 | param2`), u8
 instrument, u8 volume, u8 effect, u8 param` (SetCell). An
@@ -387,9 +449,13 @@ or 5, or an Adlib song (format 1); the reply is the usual `{type: 'song', source
 with `'commands'`. The worklet posts, about 60 times a second (init's `songHz`) and only for the followed
 songs that moved:
 
-- `{type: 'songpos', frame, sources: Uint32Array, status: Uint32Array, levels: Float32Array}`: for song i
-  its source slot, 12 status words (flags playing/preview/alive/scopes on, order, pattern, row, tick,
-  speed, tempo, rows, frames low and high, version, channels; `SongStatus::to_words`) and 33 levels. (The
+- `{type: 'songpos', frame, sources: Uint32Array, status: Uint32Array, levels: Float32Array, voices:
+  Uint32Array}`: for song i its source slot, 12 status words (flags playing/preview/alive/scopes on, order,
+  pattern, row, tick, speed, tempo, rows, frames low and high, version, channels; `SongStatus::to_words`),
+  33 levels and 6 voice words (`SongStatus::voice_words`: the order, pattern and row each of up to
+  `SONG_MAX_VOICES` = 3 voices is at, two words a voice, `pattern << 16 | order` then `valid << 16 | row`;
+  all 0 for a format whose voices share one position; a separate array, so a page that predates it reads
+  the message as before, and a worklet that predates it posts none: no voice is then reported). (The
   type is not `'song'`, which is the reply to a prepare and has an `ok`.) A song gone is reported once
   more with alive 0: its voice was freed by the first message handler after it ended; a page that tracks
   its voices sees `Ended` sooner.
@@ -397,7 +463,8 @@ songs that moved:
   Float32Array}`, with each `'songpos'` for the songs whose scopes are on: per song its channel count, in
   `data` each channel's 512 latest frames, in `written` how many each ring has seen.
 
-On the page, `WebSongs` (one `WebSong` per source slot; `update_positions(sources, status, levels)`,
+On the page, `WebSongs` (one `WebSong` per source slot; `update_positions(sources, status, levels)` or, with the
+message's `voices`, `update_positions_voices(sources, status, levels, voices)`,
 `update_scopes(frames, sources, channels, written, data)`, `get(source) -> Option<&WebSong>`, `forget`)
 parses them, and a `WebSong` is a `SongReader`, so the editor reads natively and on the web the same
 way. Exports for hosts that drive the wasm themselves: `cw_prepare_module(source, format, subsong,
@@ -460,10 +527,15 @@ allocates when it is switched on, which an audio thread may not do.
 
 **SID.** Three voices (the channels), an orderlist each over one pool of patterns. `SidSongPlayer` has no pause, so **stopped is
 its preview mode** (the sequencer is off, the notes die away, the position stays, auditions play on any voice) and `Play` leaves
-it; a song opens stopped. `Seek { order, row }`, `Loop` and the status refer to **voice 0**: voice 0 reads row `row` of the
-pattern at its orderlist position `order`, a range loop repeats rows of voice 0's entry, and `status()` is voice 0's position (the
-other voices' places are not reported yet; `pattern` is the pattern number, `speed` the frames per row, `tempo` the timer's Hz, 50
-x the speed multiplier, `rows` the song row of the reference voice). The preview is the player's audition on voice 0 (held until
+it; a song opens stopped. The voices run on orderlists of their own, so each has its own place at any time:
+`status().voices[v]` is voice `v`'s orderlist position, pattern and row (`VoicePos`, the row it started last; right after a seek, the
+row it will start; `valid` is true for the three voices). `Seek { order, row }`, `Loop` and the status's plain `order`, `pattern`,
+`row` and `tick` stay **voice 0**'s: voice 0 reads row `row` of the pattern at its orderlist position `order`, a range loop repeats
+rows of voice 0's entry. `SeekVoice { voice, order, row }` is the same for any voice (`Seek` is `voice: 0`): the song is replayed to
+the moment that voice reads that row, so the other voices stand where the song has them then (voices that keep step with it show the
+same row), not where they were; stopped or playing, and a place the song does not have moves nothing. (`pattern` is the pattern
+number, `speed` the frames per row, `tempo` the timer's Hz, 50 x the speed multiplier, `rows` the song row of the reference voice;
+`SONG_MAX_VOICES` is the voices a status can carry.) The preview is the player's audition on voice 0 (held until
 `PreviewOff`, or for `duration` frames; over a playing song voice 0 is taken for it; a note is MIDI, 12 is C-0). `levels` are the
 voices' peaks (the taps), then 0; the scopes are the voices' own signals before the filter. Live edits on the wire: `SetCell` (a
 row: `pattern` is the pattern number, `note` 1-93 / 126 off / 127 on, `effect` the command), `SetInstrument` (the ten bytes in
@@ -1083,6 +1155,8 @@ cargo test -p cubed-sid --test sng_write            # CUBED_SNG_WRITE_ORACLE=<js
 cargo test -p cubed-rt-check --test sid_controls    # the controls allocate nothing
 cargo test -p cubed-sid --test psid                 # PSID/RSID: CUBED_PSID=<dir>, CUBED_PSID_ORACLE=<json>
 cargo test -p cubed-rt-check --test psid_alloc      # the PSID player allocates nothing
+cargo test -p cubed-mixer --test eq                 # the equaliser against the DAW's numbers
+node crates/mixer/tests/eq/daw_reference.mjs <another_synth checkout> > crates/mixer/tests/eq/reference.rs
 cargo bench -p cubed-opl --bench opl_render
 cargo bench -p cubed-ahx --bench ahx_render
 cargo bench -p cubed-dsp --bench patch_render

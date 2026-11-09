@@ -202,6 +202,35 @@ fn seek_lands_where_the_song_has_the_place() {
     assert_eq!(p.subsong(), 0);
 }
 
+#[test]
+fn right_after_a_seek_the_status_shows_the_place_sought() {
+    let s = song();
+    let mut p = player(&s);
+    for _ in 0..40 {
+        p.frame();
+    }
+    // Voice 0 at row 5 of order 1; the voices that stand at the start of a row show theirs too.
+    p.seek(0, 0, 1, 5).unwrap();
+    let st = p.status();
+    assert_eq!((st.order[0], st.row[0], st.tick[0]), (1, 5, 0));
+    assert_eq!(st.pattern[0], 3);
+    // The next frame reads that row, so nothing moves on screen.
+    let before = place(&st);
+    p.frame();
+    assert_eq!(place(&p.status()), before);
+    // Another voice's place is its own: the sought voice shows it.
+    p.seek(0, 2, 0, 9).unwrap();
+    let st = p.status();
+    assert_eq!((st.order[2], st.pattern[2], st.row[2]), (0, 2, 9));
+    let before = place(&st);
+    p.frame();
+    assert_eq!(place(&p.status()), before);
+    // By song row too.
+    p.seek_row(10);
+    let st = p.status();
+    assert_eq!(st.row[p.ref_voice()], 10);
+}
+
 /// One frame of a fresh player.
 trait TapFrame {
     fn tap_frame(self) -> SidStatus;

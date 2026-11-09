@@ -9,8 +9,8 @@ use std::sync::Arc;
 use cubed_mixer::songs::{open_controlled_song, open_sid, SongFormat, SongOptions};
 use cubed_mixer::{
     wire, BusId, BusSettings, Command, Event, Mixer, MixerConfig, PlaySource, SongCell,
-    SongControl, SongInstrument, SongLoop, SongReader, SourceEvent, SourceId, VoiceId,
-    SONG_SCOPE_FRAMES,
+    SongControl, SongInstrument, SongLoop, SongReader, SongStatus, SourceEvent, SourceId, VoiceId,
+    VoicePos, SONG_SCOPE_FRAMES,
 };
 use cubed_sid::edit::SidDoc;
 use serde_json::json;
@@ -333,4 +333,120 @@ fn a_controlled_song_stops_at_its_end_and_an_uncontrolled_one_ends() {
     let mut rig = rig_of(open_sid(song, RATE, options, false).unwrap());
     rig.run(1.5);
     assert!(rig.events().contains(&Event::Ended(VOICE)));
+}
+
+/// A song whose voices run on their own (rows of 6 frames), with voice 0 on a 4-row pattern,
+/// voice 1 on a 6-row one and then a 5-row one, voice 2 on a 10-row one.
+fn staggered_song() -> cubed_sid::song::SidSong {
+    let mut doc = SidDoc::new();
+    for op in [
+        json!({"op": "set_pattern_rows", "pattern": 0, "rows": 4, "force": true}),
+        json!({"op": "set_pattern_rows", "pattern": 1, "rows": 6, "force": true}),
+        json!({"op": "set_pattern_rows", "pattern": 2, "rows": 10, "force": true}),
+        json!({"op": "new_pattern", "rows": 5}),
+        json!({"op": "insert_order", "voice": 1, "index": 1, "pattern": 3}),
+    ] {
+        doc.apply(&op).unwrap_or_else(|e| panic!("{op}: {e}"));
+    }
+    doc.song().clone()
+}
+
+fn places(s: &SongStatus) -> [(u16, u16, u16); 3] {
+    [0, 1, 2].map(|v| (s.voices[v].order, s.voices[v].pattern, s.voices[v].row))
+}
+
+#[test]
+fn every_voice_reports_its_own_position_and_voice_zeros_fields_stay() {
+    let mut rig = rig_of(open_sid(staggered_song(), RATE, SongOptions::default(), true).unwrap());
+    let s = rig.reader.status();
+    assert!(s.voices.iter().all(|v| v.valid), "{s:?}");
+    assert_eq!(places(&s), [(0, 0, 0), (0, 1, 0), (0, 2, 0)]);
+    rig.control(SongControl::Play);
+    let (mut seen, mut orders, mut patterns) = (std::collections::BTreeSet::new(), vec![], vec![]);
+    for _ in 0..80 {
+        rig.run(0.05);
+        let s = rig.reader.status();
+        assert_eq!(
+            (s.order, s.pattern, s.row),
+            (s.voices[0].order, s.voices[0].pattern, s.voices[0].row),
+            "voice 0's own fields repeat voices[0]: {s:?}"
+        );
+        let [a, b, c] = places(&s);
+        assert!(a.2 < 4 && b.2 < 6 + 5 && c.2 < 10, "{s:?}");
+        seen.insert((a.2, b.2, c.2));
+        orders.push(b.0);
+        patterns.push(b.1);
+    }
+    // The voices' rows are not the same row: 4, 6 and 10 rows go round at their own paces.
+    assert!(seen.iter().any(|&(a, b, c)| a != b || b != c), "{seen:?}");
+    assert!(seen.len() > 8, "{seen:?}");
+    // Voice 1 goes through both its entries; voices 0 and 2 stay in their one.
+    assert!(orders.contains(&0) && orders.contains(&1), "{orders:?}");
+    assert!(
+        patterns.contains(&1) && patterns.contains(&3),
+        "{patterns:?}"
+    );
+}
+
+#[test]
+fn a_voice_is_seeked_by_its_own_place_while_stopped_or_playing_and_by_wire() {
+    let mut rig = rig_of(open_sid(staggered_song(), RATE, SongOptions::default(), true).unwrap());
+    rig.run(0.3);
+    // Stopped: voice 1 to its second entry (pattern 3), row 3.
+    rig.control_by_wire(SongControl::SeekVoice {
+        voice: 1,
+        order: 1,
+        row: 3,
+    });
+    rig.run(0.1);
+    let s = rig.reader.status();
+    assert!(!s.playing);
+    assert_eq!(
+        s.voices[1],
+        VoicePos {
+            order: 1,
+            pattern: 3,
+            row: 3,
+            valid: true
+        },
+        "{s:?}"
+    );
+    // Play: the song goes on from there; voice 1 reads row 3 of pattern 3 first.
+    rig.control(SongControl::Play);
+    rig.run(0.05);
+    let s = rig.reader.status();
+    assert_eq!((s.voices[1].order, s.voices[1].pattern), (1, 3), "{s:?}");
+    // Voice 2 by its own place, over the playing song.
+    rig.control_by_wire(SongControl::SeekVoice {
+        voice: 2,
+        order: 0,
+        row: 7,
+    });
+    rig.control(SongControl::Stop);
+    rig.run(0.1);
+    let s = rig.reader.status();
+    assert_eq!(s.voices[2].row, 7, "{s:?}");
+    // The old Seek is voice 0's, and the other forms agree with it.
+    rig.control(SongControl::Seek { order: 0, row: 2 });
+    rig.run(0.1);
+    let s = rig.reader.status();
+    assert_eq!((s.row, s.voices[0].row), (2, 2), "{s:?}");
+    rig.control(SongControl::SeekVoice {
+        voice: 0,
+        order: 0,
+        row: 3,
+    });
+    rig.run(0.1);
+    assert_eq!(rig.reader.status().row, 3);
+    // A place that does not exist (voice 0 has one entry, no row 9, no voice 5) changes nothing.
+    let before = places(&rig.reader.status());
+    for (voice, order, row) in [(0, 1, 0), (0, 0, 9), (1, 2, 0), (5, 0, 0)] {
+        rig.control(SongControl::SeekVoice { voice, order, row });
+        rig.run(0.1);
+        assert_eq!(
+            places(&rig.reader.status()),
+            before,
+            "{voice} {order} {row}"
+        );
+    }
 }

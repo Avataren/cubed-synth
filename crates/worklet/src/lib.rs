@@ -44,7 +44,7 @@ use cubed_mixer::effects::MAX_PARAMS;
 use cubed_mixer::{
     wire, BusId, Clip, ClipId, Command, Effect, EffectKind, HeldNote, Mixer, MixerConfig, Returned,
     SongReader, SynthBuild, SynthSource, TapSet, VoiceId, SONG_LEVEL_SLOTS, SONG_SCOPE_FRAMES,
-    SONG_STATUS_WORDS, TAP_FRAMES,
+    SONG_STATUS_WORDS, SONG_VOICE_WORDS, TAP_FRAMES,
 };
 
 /// The Web Audio render quantum.
@@ -99,6 +99,8 @@ struct State {
     songs: Vec<Option<SongSlot>>,
     song_sources: Vec<u32>,
     song_status: Vec<u32>,
+    /// The voices' own positions of each reported song (`SongStatus::voice_words`).
+    song_voices: Vec<u32>,
     song_levels: Vec<f32>,
     scope_sources: Vec<u32>,
     scope_channels: Vec<u32>,
@@ -180,6 +182,7 @@ pub extern "C" fn cw_init(
         songs: (0..sources).map(|_| None).collect(),
         song_sources: Vec::with_capacity(sources),
         song_status: Vec::with_capacity(sources * SONG_STATUS_WORDS),
+        song_voices: Vec::with_capacity(sources * SONG_VOICE_WORDS),
         song_levels: Vec::with_capacity(sources * SONG_LEVEL_SLOTS),
         scope_sources: Vec::with_capacity(sources),
         scope_channels: Vec::with_capacity(sources),
@@ -477,7 +480,9 @@ fn prepare_module(_: &mut State, _: u32, _: u32, _: SongOptions, _: bool) -> Res
 /// about 60 times a second; it allocates and frees nothing. For each of those
 /// songs: its source slot (`cw_song_sources`, `u32`s), its status words
 /// (`cw_song_status`, `cw_song_status_words()` `u32`s each, see
-/// `cubed_mixer::SongStatus::to_words`) and its levels (`cw_song_levels`,
+/// `cubed_mixer::SongStatus::to_words`), its voices' own positions
+/// (`cw_song_voices`, `cw_song_voice_words()` `u32`s each, see
+/// `cubed_mixer::SongStatus::voice_words`) and its levels (`cw_song_levels`,
 /// `cw_song_level_slots()` floats each: the channels', then the preview's). Of
 /// those with their scopes on, also: how many there are
 /// (`cw_song_scope_count`), their slots (`cw_song_scope_sources`), channel counts
@@ -490,6 +495,7 @@ pub extern "C" fn cw_songs_prepare() -> u32 {
         songs,
         song_sources,
         song_status,
+        song_voices,
         song_levels,
         scope_sources,
         scope_channels,
@@ -499,6 +505,7 @@ pub extern "C" fn cw_songs_prepare() -> u32 {
     } = state();
     song_sources.clear();
     song_status.clear();
+    song_voices.clear();
     song_levels.clear();
     scope_sources.clear();
     scope_channels.clear();
@@ -525,6 +532,7 @@ pub extern "C" fn cw_songs_prepare() -> u32 {
         }
         song_sources.push(source as u32);
         song_status.extend_from_slice(&status.to_words(channels, alive, scopes));
+        song_voices.extend_from_slice(&status.voice_words());
         let at = song_levels.len();
         song_levels.resize(at + SONG_LEVEL_SLOTS, 0.0);
         slot.reader
@@ -568,6 +576,12 @@ pub extern "C" fn cw_song_status_words() -> u32 {
     SONG_STATUS_WORDS as u32
 }
 
+/// `u32`s per song in `cw_song_voices`.
+#[no_mangle]
+pub extern "C" fn cw_song_voice_words() -> u32 {
+    SONG_VOICE_WORDS as u32
+}
+
 /// Floats per song in `cw_song_levels`.
 #[no_mangle]
 pub extern "C" fn cw_song_level_slots() -> u32 {
@@ -589,6 +603,13 @@ pub extern "C" fn cw_song_sources() -> *const u32 {
 #[no_mangle]
 pub extern "C" fn cw_song_status() -> *const u32 {
     state().song_status.as_ptr()
+}
+
+/// The voices' own positions of the songs `cw_songs_prepare` reported, `cw_song_voice_words()`
+/// `u32`s each (a format whose voices have none reads all 0: no voice valid).
+#[no_mangle]
+pub extern "C" fn cw_song_voices() -> *const u32 {
+    state().song_voices.as_ptr()
 }
 
 #[no_mangle]
@@ -888,11 +909,30 @@ pub extern "C" fn cw_error_len() -> u32 {
     state().error.len() as u32
 }
 
-/// Where `cw_set_effect` reads its parameters: `MAX_PARAMS` floats, in the
-/// order of the effect's parameter list.
+/// Where `cw_set_effect` reads its parameters: `cw_effect_param_count` floats,
+/// in the order of the effect's parameter list.
 #[no_mangle]
 pub extern "C" fn cw_effect_params() -> *mut f32 {
     state().effect_params.as_mut_ptr()
+}
+
+/// Fills `cw_effect_params` with the default parameters of built-in effect
+/// `kind` (`EffectKind::index`), so that a page that sends only some of them
+/// leaves the others at their defaults. Returns 1 if there is such an effect.
+#[no_mangle]
+pub extern "C" fn cw_effect_defaults(kind: u32) -> u32 {
+    let Some(kind) = u8::try_from(kind).ok().and_then(EffectKind::from_index) else {
+        return 0;
+    };
+    state().effect_params = Effect::new(kind).params;
+    1
+}
+
+/// How many floats `cw_effect_params` holds (`MAX_PARAMS`: 52 since the
+/// equaliser, 6 before it; a page built for the six reads only those).
+#[no_mangle]
+pub extern "C" fn cw_effect_param_count() -> u32 {
+    MAX_PARAMS as u32
 }
 
 /// Puts built-in effect `kind` (`EffectKind::index`) with the parameters at
@@ -1572,6 +1612,11 @@ mod tests {
         assert!(std::str::from_utf8(error).unwrap().contains("format"));
 
         // SAFETY: cw_effect_params holds MAX_PARAMS floats.
+        assert_eq!(cw_effect_param_count() as usize, MAX_PARAMS);
+        assert_eq!(cw_effect_defaults(EffectKind::Eq.index() as u32), 1);
+        assert_eq!(cw_effect_defaults(99), 0);
+        let defaults = unsafe { std::slice::from_raw_parts(cw_effect_params(), MAX_PARAMS) };
+        assert_eq!(defaults, Effect::new(EffectKind::Eq).params);
         let params = unsafe { std::slice::from_raw_parts_mut(cw_effect_params(), MAX_PARAMS) };
         params.copy_from_slice(&Effect::new(EffectKind::LowPass).params);
         assert_eq!(cw_set_effect(2, 0, EffectKind::LowPass.index() as u32), 1);
@@ -1623,6 +1668,18 @@ mod tests {
         unsafe { std::ptr::copy_nonoverlapping(module.as_ptr(), at, module.len()) };
     }
 
+    /// A file of the sid crate's fixtures into `cw_file_buffer`.
+    fn put_sid(name: &str) {
+        let bytes = std::fs::read(format!(
+            "{}/../sid/tests/fixtures/sid/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let at = cw_file_buffer(bytes.len() as u32);
+        // SAFETY: cw_file_buffer made room for the file.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len()) };
+    }
+
     fn song_control(voice: u64, control: cubed_mixer::SongControl) {
         send(Command::SourceEvent {
             voice: VoiceId(voice),
@@ -1634,6 +1691,7 @@ mod tests {
     struct Reported {
         source: u32,
         status: cubed_mixer::SongStatus,
+        voice_words: Vec<u32>,
         channels: usize,
         alive: bool,
         scopes: bool,
@@ -1645,20 +1703,25 @@ mod tests {
         let words = cw_song_status_words() as usize;
         let slots = cw_song_level_slots() as usize;
         // SAFETY: the buffers hold what `cw_songs_prepare` just cut.
-        let (sources, status, levels) = unsafe {
+        let vwords = cw_song_voice_words() as usize;
+        let (sources, status, voices, levels) = unsafe {
             (
                 std::slice::from_raw_parts(cw_song_sources(), count),
                 std::slice::from_raw_parts(cw_song_status(), count * words),
+                std::slice::from_raw_parts(cw_song_voices(), count * vwords),
                 std::slice::from_raw_parts(cw_song_levels(), count * slots),
             )
         };
         (0..count)
             .map(|i| {
-                let (status, channels, alive, scopes) =
+                let (mut status, channels, alive, scopes) =
                     cubed_mixer::SongStatus::from_words(&status[i * words..]).unwrap();
+                let voice_words = voices[i * vwords..(i + 1) * vwords].to_vec();
+                status.set_voice_words(&voice_words);
                 Reported {
                     source: sources[i],
                     status,
+                    voice_words,
                     channels,
                     alive,
                     scopes,
@@ -1811,6 +1874,7 @@ mod tests {
         assert_eq!(cw_prepare_song(0, 3, 0, 1, -1.0), 1);
         assert_eq!(cw_song_count(), 0, "the slot holds another song now");
     }
+
     /// A patch that plays a sampler's sample (a sine of `hz`, `seconds` of 48 kHz stereo) and
     /// carries a 256-frame wavetable on a silent wavetable oscillator: about 6 MB of JSON, what
     /// an editor sends after a sample was loaded into a patch that has a big table.
@@ -1959,5 +2023,85 @@ mod tests {
             "the new sample is heard at 2.5 kHz: {hz}"
         );
         assert_eq!(cw_bad_batches(), 0);
+    }
+
+    #[test]
+    fn a_sid_song_reports_each_voices_own_place_and_seeks_one_voice() {
+        use cubed_mixer::{PlaySource, SongControl, SourceId};
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 5, 6);
+        send(Command::SetBus(BusId(2), BusSettings::default()));
+        assert_eq!(cw_song_voice_words(), 6);
+        put_sid("s3-chain.asid");
+        assert_eq!(cw_prepare_module(2, 2, 0, 1, -1.0, 1), 1);
+        send(Command::PlaySource(PlaySource::new(
+            VoiceId(1),
+            SourceId(2),
+            BusId(2),
+        )));
+        cw_process(128);
+        // Opened stopped: every voice is reported at its start, valid, with its words.
+        let first = songs_prepare();
+        assert_eq!(first.len(), 1);
+        let song = &first[0];
+        assert_eq!((song.source, song.channels), (2, 3));
+        assert!(
+            song.status.voices.iter().all(|v| v.valid),
+            "{:?}",
+            song.status
+        );
+        assert_eq!(
+            song.status.voices.map(|v| (v.order, v.pattern, v.row)),
+            [(0, 0, 0), (0, 1, 0), (0, 2, 0)]
+        );
+        assert_eq!(song.voice_words.len(), 6);
+        assert!(songs_prepare().is_empty(), "nothing moved");
+        // Played: the voices' rows move (voice 2's 16-row pattern goes round twice for one of
+        // voice 0's) and every move of any voice is reported.
+        song_control(1, SongControl::Play);
+        let mut places = std::collections::BTreeSet::new();
+        for _ in 0..800 {
+            cw_process(128);
+            for r in songs_prepare() {
+                assert_eq!(
+                    (r.status.order, r.status.pattern, r.status.row),
+                    {
+                        let v = r.status.voices[0];
+                        (v.order, v.pattern, v.row)
+                    },
+                    "voice 0's fields repeat voices[0]"
+                );
+                places.insert(r.status.voices.map(|v| v.row));
+            }
+        }
+        assert!(
+            places.iter().any(|rows| rows[2] != rows[0]),
+            "voice 2 runs on its own: {places:?}"
+        );
+        // One voice alone, while the song plays.
+        song_control(1, SongControl::Stop);
+        cw_process(128);
+        songs_prepare();
+        song_control(
+            1,
+            SongControl::SeekVoice {
+                voice: 2,
+                order: 0,
+                row: 9,
+            },
+        );
+        cw_process(128);
+        let seeked = songs_prepare();
+        assert_eq!(seeked.len(), 1, "the seek is news");
+        let v = seeked[0].status.voices[2];
+        assert_eq!((v.order, v.pattern, v.row, v.valid), (0, 2, 9, true));
+        assert_eq!(cw_rejected(), 0);
+        // A module has none of these: nothing valid.
+        put_module("demo.mod");
+        assert_eq!(cw_prepare_module(3, 3, 0, 1, -1.0, 1), 1);
+        let modules = songs_prepare();
+        let module = modules.iter().find(|r| r.source == 3).unwrap();
+        assert!(module.status.voices.iter().all(|v| !v.valid));
+        assert!(module.voice_words.iter().all(|&w| w == 0));
     }
 }

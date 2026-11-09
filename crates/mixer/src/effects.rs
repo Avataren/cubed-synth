@@ -7,10 +7,12 @@ use cubed_dsp::biquad::{Biquad, Filter, FilterType};
 use cubed_dsp::nodes::{Bitcrusher, Chorus, Compressor, Delay, Freeverb, Limiter, Saturation};
 use cubed_dsp::{AudioNode, StereoEffect};
 
+use crate::eq::EqInsert;
 use crate::insert::Insert;
 
-/// The most parameters an effect has.
-pub const MAX_PARAMS: usize = 6;
+/// The most parameters an effect has (the equaliser's: two switches and five
+/// for each of its bands).
+pub const MAX_PARAMS: usize = crate::eq::PARAM_COUNT;
 
 /// The longest delay the delay effect is built for.
 const MAX_DELAY_MS: f32 = 2000.0;
@@ -31,6 +33,9 @@ pub enum EffectKind {
     Chorus,
     Saturation,
     Bitcrusher,
+    /// A ten-band parametric equaliser (see [`crate::eq`]); added after the
+    /// others so that their numbers in the byte protocol stay as they were.
+    Eq,
 }
 
 /// One of an effect's parameters.
@@ -45,7 +50,7 @@ pub struct ParamInfo {
     pub unit: &'static str,
 }
 
-const fn param(
+pub(crate) const fn param(
     name: &'static str,
     min: f32,
     max: f32,
@@ -111,7 +116,7 @@ const BITCRUSHER: [ParamInfo; 3] = [
 ];
 
 impl EffectKind {
-    pub const ALL: [EffectKind; 9] = [
+    pub const ALL: [EffectKind; 10] = [
         EffectKind::Reverb,
         EffectKind::Delay,
         EffectKind::LowPass,
@@ -121,6 +126,7 @@ impl EffectKind {
         EffectKind::Chorus,
         EffectKind::Saturation,
         EffectKind::Bitcrusher,
+        EffectKind::Eq,
     ];
 
     /// snake_case, as saved in layouts.
@@ -135,6 +141,7 @@ impl EffectKind {
             EffectKind::Chorus => "chorus",
             EffectKind::Saturation => "saturation",
             EffectKind::Bitcrusher => "bitcrusher",
+            EffectKind::Eq => "eq",
         }
     }
 
@@ -165,6 +172,7 @@ impl EffectKind {
             EffectKind::Chorus => &CHORUS,
             EffectKind::Saturation => &SATURATION,
             EffectKind::Bitcrusher => &BITCRUSHER,
+            EffectKind::Eq => &crate::eq::PARAMS,
         }
     }
 
@@ -282,6 +290,7 @@ impl Effect {
                     _ => n.set_mix(v),
                 },
             ),
+            EffectKind::Eq => Box::new(EqInsert::new(sr, &self.params)),
         };
         // One block of silence sizes any buffers the effect grows on first use.
         let (mut left, mut right) = (vec![0.0; max_block.max(1)], vec![0.0; max_block.max(1)]);
@@ -291,7 +300,7 @@ impl Effect {
     }
 }
 
-fn clamp_param(kind: EffectKind, index: usize, value: f32) -> f32 {
+pub(crate) fn clamp_param(kind: EffectKind, index: usize, value: f32) -> f32 {
     match kind.params().get(index) {
         Some(info) if value.is_finite() => value.clamp(info.min, info.max),
         Some(info) => info.default,

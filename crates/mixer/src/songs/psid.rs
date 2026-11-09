@@ -168,6 +168,7 @@ impl SongPlayer for PsidSongPlayer {
             rows: seconds as u32,
             frames: self.player.frames(),
             version: 0,
+            voices: Default::default(),
         }
     }
 

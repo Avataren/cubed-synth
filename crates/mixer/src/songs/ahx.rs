@@ -150,7 +150,8 @@ impl SongPlayer for AhxSongPlayer {
             | SongControl::Scopes(_)
             | SongControl::SetInstrument(_)
             | SongControl::Timing { .. }
-            | SongControl::SetTableRow { .. } => {}
+            | SongControl::SetTableRow { .. }
+            | SongControl::SeekVoice { .. } => {}
         }
     }
 
@@ -178,6 +179,7 @@ impl SongPlayer for AhxSongPlayer {
             rows: s.rows,
             frames: s.frames,
             version: 0,
+            voices: Default::default(),
         }
     }
 

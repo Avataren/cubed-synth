@@ -19,7 +19,9 @@
 //    (`cubed_mixer::SongControl`: play, stop, seek, loop, mute, solo, note preview, scopes);
 //    live edits are wire tags 31 (a cell) and 32 (an Adlib instrument).
 //   {type: 'effect', bus, slot, kind (EffectKind index; -1 empties the slot),
-//    params: Float32Array}
+//    params: Float32Array}  the effect's parameters in the order of
+//    `EffectKind::params()`, as many as cw_effect_param_count() (52 since the equaliser,
+//    kind 9; the other effects have at most 6); those left out are the effect's defaults
 //   {type: 'tap', bus, enable}  switches the analysis tap of a bus on or off
 //    (the bus must exist); answered by {type: 'tap', bus, enable, ok}
 //   {type: 'synth', source, bytes: ArrayBuffer (the patch JSON, UTF-8), oneShot,
@@ -55,13 +57,18 @@
 //    data: Float32Array}  about 40 times a second (init's `tapHz`) while a tap is
 //    on: for each bus in `buses`, its latest `frames` frames, left then right,
 //    in `data`; `written` is how many frames each tap had seen
-//   {type: 'songpos', frame, sources: Uint32Array, status: Uint32Array, levels: Float32Array}
+//   {type: 'songpos', frame, sources: Uint32Array, status: Uint32Array, levels: Float32Array,
+//    voices: Uint32Array}
 //    about 60 times a second (init's `songHz`) for the followed module songs that moved since
 //    the last one (and once more when one is gone): for song i, its source slot
 //    `sources[i]`, its status words `status[i * 12 ..]` (see `cubed_mixer::SongStatus::to_words`:
 //    flags playing/preview/alive/scopes, order, pattern, row, tick, speed, tempo, rows,
 //    frames lo and hi, version, channels) and its levels `levels[i * 33 ..]` (the channels'
-//    peaks, then the preview's). Not a reply to a 'song' message: that one has `ok`.
+//    peaks, then the preview's). `voices[i * 6 ..]` holds the song's voices' own positions, for a
+//    format whose voices have them (SID: each voice runs its own order list), two words per voice
+//    (`cubed_mixer::SongStatus::voice_words`: `pattern << 16 | order`, then `valid << 16 | row`;
+//    a voice that is not reported reads 0); a page that predates `voices` ignores it, a worklet
+//    that predates it posts none. Not a reply to a 'song' message: that one has `ok`.
 //   {type: 'songscope', frame, frames: 512, sources: Uint32Array, channels: Uint32Array,
 //    written: Float64Array, data: Float32Array}  with each 'songpos', for the songs that
 //    have their scopes on (SongControl 'Scopes'): per song its channel count, then in `data`
@@ -250,11 +257,14 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         this.port.postMessage({ type: 'tap', bus: message.bus, enable: !!message.enable, ok });
       } else if (message.type === 'effect') {
         const params = message.params ?? new Float32Array(0);
-        const paramsAt = x.cw_effect_params();
-        const room = new Float32Array(x.memory.buffer, paramsAt, 6);
-        room.fill(0);
-        room.set(params.subarray(0, 6));
+        // 6 floats before the equaliser; a wasm built then has no count.
+        const count = x.cw_effect_param_count ? x.cw_effect_param_count() : 6;
         const kind = message.kind >= 0 ? message.kind >>> 0 : 0xffffffff;
+        // The defaults first (a wasm built before the equaliser has none: zeros).
+        const defaults = x.cw_effect_defaults ? x.cw_effect_defaults(kind) : 0;
+        const room = new Float32Array(x.memory.buffer, x.cw_effect_params(), count);
+        if (!defaults) room.fill(0);
+        room.set(params.subarray(0, count));
         x.cw_set_effect(message.bus >>> 0, message.slot >>> 0, kind);
       }
     } catch (error) {
@@ -322,9 +332,11 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
     // can grow on any call that does).
     const words = x.cw_song_status_words();
     const slots = x.cw_song_level_slots();
+    const voiceWords = x.cw_song_voice_words();
     const at = {
       sources: x.cw_song_sources(),
       status: x.cw_song_status(),
+      voices: x.cw_song_voices(),
       levels: x.cw_song_levels(),
       scopeSources: x.cw_song_scope_sources(),
       channels: x.cw_song_scope_channels(),
@@ -339,9 +351,10 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
     const sources = new Uint32Array(memory, at.sources, count).slice();
     const status = new Uint32Array(memory, at.status, count * words).slice();
     const levels = new Float32Array(memory, at.levels, count * slots).slice();
+    const voices = new Uint32Array(memory, at.voices, count * voiceWords).slice();
     this.port.postMessage(
-      { type: 'songpos', frame, sources, status, levels },
-      [sources.buffer, status.buffer, levels.buffer],
+      { type: 'songpos', frame, sources, status, levels, voices },
+      [sources.buffer, status.buffer, levels.buffer, voices.buffer],
     );
     if (scoped > 0) {
       const scopeSources = new Uint32Array(memory, at.scopeSources, scoped).slice();
