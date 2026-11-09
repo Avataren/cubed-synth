@@ -7,7 +7,9 @@
 //! subsongs) or runs at another speed is left out with a note. A port of
 //! `transcribe/index.ts`.
 
-use super::capture::{capture_sid_with, CaptureOptions, SidTrace, CANCELLED, SID_EVENT_GATE_ON};
+use super::capture::{
+    capture_sid_with, CaptureOptions, Progress, SidTrace, CANCELLED, SID_EVENT_GATE_ON,
+};
 use super::export::gt_packed_pattern_size;
 use super::flat::{compile_flat_song, FlatSubsong};
 use super::fold::fold_instruments;
@@ -50,6 +52,9 @@ pub struct TranscribeOptions {
     pub kernal: Kernal,
     /// Set from another thread to stop the import between ticks of a capture and between subsongs.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Told how far the transcription is (0 to 1 of the range it is given): the subsongs' captures
+    /// first, then the building of the song.
+    pub progress: Option<Progress>,
 }
 
 /// How one subsong went.
@@ -67,7 +72,7 @@ pub struct SubsongReport {
     pub loop_kind: Option<LoopKind>,
     pub rows: Option<usize>,
     /// The capture (for measuring the result against).
-    pub trace: Option<Rc<SidTrace>>,
+    pub trace: Option<Arc<SidTrace>>,
     /// It did not loop and was cut to this many rows to fit GoatTracker.
     pub cut_rows: Option<usize>,
 }
@@ -139,7 +144,7 @@ struct Prepared {
     subsong: usize,
     /// The voice whose notes drive the filter, or `None`.
     driver: Option<usize>,
-    trace: Rc<SidTrace>,
+    trace: Arc<SidTrace>,
     frames: Rc<TraceFrames>,
     grid: Rc<RowGrid>,
     lp: SongLoop,
@@ -217,10 +222,14 @@ fn pitch_steps(f: &TraceFrames) -> Vec<Vec<i64>> {
         .collect()
 }
 
+/// Of a subsong's share of the progress, the part its capture takes (the rest is the transcribing).
+const CAPTURE_SHARE: f64 = 0.85;
+
 fn prepare(
     file: &PsidFile,
     subsong: usize,
     options: &TranscribeOptions,
+    progress: Option<&Progress>,
 ) -> Result<Prepared, String> {
     let trace = capture_sid_with(
         file,
@@ -229,16 +238,21 @@ fn prepare(
             max_ticks: None,
             max_seconds: options.max_seconds,
             cancel: options.cancel.clone(),
+            progress: progress.map(|p| p.window(0.0, CAPTURE_SHARE)),
         },
         options.kernal,
     )?;
-    transcribed(subsong, Rc::new(trace), true)
+    let prepared = transcribed(subsong, Arc::new(trace), true);
+    if let Some(p) = progress {
+        p.report(1.0);
+    }
+    prepared
 }
 
 /// The rows and notes of a captured subsong; `effects`: its pitch as pattern
 /// effects (`pitch.rs`), or, when the song must be smaller to fit
 /// GoatTracker, as the instruments' wave tables alone.
-fn transcribed(subsong: usize, trace: Rc<SidTrace>, effects: bool) -> Result<Prepared, String> {
+fn transcribed(subsong: usize, trace: Arc<SidTrace>, effects: bool) -> Result<Prepared, String> {
     let frames = trace_frames(&trace);
     let onsets = onsets_of(&frames);
     if onsets.iter().all(|l| l.is_empty()) {
@@ -357,7 +371,20 @@ pub fn transcribe_psid(
     let mut preps: Vec<Prepared> = Vec::new();
     let mut speed_multiplier: Option<u8> = None;
 
-    for s in order {
+    // The subsongs' captures and transcribing are the first part of the progress, an equal share each (a
+    // subsong that is left out counts as done), and building the song the rest.
+    const PREPARING: f64 = 0.85;
+    let subsongs = order.len().max(1) as f64;
+    for (n, s) in order.into_iter().enumerate() {
+        let share = options.progress.as_ref().map(|p| {
+            p.window(
+                PREPARING * n as f64 / subsongs,
+                PREPARING * (n + 1) as f64 / subsongs,
+            )
+        });
+        if let Some(share) = &share {
+            share.report(0.0);
+        }
         if preps.len() >= MAX_SUBSONGS {
             reports.push(SubsongReport::left_out(
                 s,
@@ -365,7 +392,7 @@ pub fn transcribe_psid(
             ));
             continue;
         }
-        let prep = match prepare(file, s, options) {
+        let prep = match prepare(file, s, options, share.as_ref()) {
             Ok(p) => p,
             Err(reason) if reason == CANCELLED => {
                 return Err(TranscribeFailure { reason, reports });
@@ -433,9 +460,15 @@ pub fn transcribe_psid(
     // Per-note filter pointers (`Axx`) make patterns unique: first try with them, and without them
     // before anything is cut or left out.
     let mut point_filter = true;
+    if let Some(p) = &options.progress {
+        p.report(PREPARING);
+    }
     loop {
         match build(file, &current, speed_multiplier, point_filter) {
             Ok((song, rows)) => {
+                if let Some(p) = &options.progress {
+                    p.report(1.0);
+                }
                 for prep in &preps {
                     let at = current.iter().position(|p| p.subsong == prep.subsong);
                     let Some((at, r)) = at.and_then(|a| rows.get(a).map(|r| (a, r))) else {

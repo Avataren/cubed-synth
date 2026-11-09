@@ -32,7 +32,7 @@ use super::super::runner::{
     RETURN_TRAP,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// Per voice per tick, `SidTrace::voice_events` bits: a 0 -> 1 gate edge.
@@ -97,6 +97,52 @@ pub struct SidTrace {
     pub end: CaptureEnd,
 }
 
+/// What an import's progress counter reads when the import is done (ten thousandths).
+pub const PROGRESS_DONE: u32 = 10_000;
+
+/// Where an import is, for another thread to read: a counter in ten thousandths of the whole
+/// ([`PROGRESS_DONE`]) that only ever goes up, shared as an `Arc<AtomicU32>`. A stage of the import
+/// gets a window of it (`window`) and reports how far it is through its own work (`report`, 0 to 1).
+///
+/// The numbers are an estimate, not a measure: a capture reports its emulated time over its cap
+/// (ten minutes by default), which a tune that repeats sooner never reaches (the capture stops when
+/// the machine is in a state it was in before, and the bar steps on to the next stage); the stages
+/// after the captures are weighed by what they cost on real tunes.
+#[derive(Clone, Debug)]
+pub struct Progress {
+    cell: Arc<AtomicU32>,
+    lo: f64,
+    hi: f64,
+}
+
+impl Progress {
+    /// The whole range of `cell`.
+    pub fn new(cell: Arc<AtomicU32>) -> Progress {
+        Progress {
+            cell,
+            lo: 0.0,
+            hi: 1.0,
+        }
+    }
+
+    /// The part `lo..hi` (0 to 1) of this progress's own range.
+    pub fn window(&self, lo: f64, hi: f64) -> Progress {
+        let span = self.hi - self.lo;
+        Progress {
+            cell: self.cell.clone(),
+            lo: self.lo + span * lo.clamp(0.0, 1.0),
+            hi: self.lo + span * hi.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Says the stage is `fraction` (0 to 1) done. The counter never goes down.
+    pub fn report(&self, fraction: f64) {
+        let at = self.lo + (self.hi - self.lo) * fraction.clamp(0.0, 1.0);
+        self.cell
+            .fetch_max((at * PROGRESS_DONE as f64) as u32, Ordering::Relaxed);
+    }
+}
+
 /// What a capture is asked to do.
 #[derive(Clone, Debug, Default)]
 pub struct CaptureOptions {
@@ -108,6 +154,8 @@ pub struct CaptureOptions {
     pub max_seconds: Option<f64>,
     /// Set from another thread to stop the capture (it ends with the reason [`CANCELLED`]).
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Told how far the capture is, as its emulated time over its cap (`max_seconds`).
+    pub progress: Option<Progress>,
 }
 
 /// The reason a capture, and an import, ends with when its `cancel` flag was set.
@@ -358,9 +406,18 @@ pub fn capture_sid_with(
             .max_ticks
             .unwrap_or_else(|| ((600.0 * hz) / tick_cycles as f64).ceil() as usize);
         let mut next = machine.cpu.cycles;
+        let first_cycle = machine.cpu.cycles;
         while store.ticks < max_ticks {
             if cancelled(&options.cancel) {
                 return Err(CANCELLED.to_string());
+            }
+            if store.ticks & 0x7f == 0 {
+                if let Some(p) = &options.progress {
+                    p.report(
+                        (store.ticks as f64 / max_ticks as f64)
+                            .max((machine.cpu.cycles - first_cycle) as f64 / max_cycles),
+                    );
+                }
             }
             machine.idle_to(next);
             machine.set_banks(psid_banks_for(file.play_address));
@@ -505,8 +562,16 @@ fn run_interrupt_driven(
     let mut spins = 0u32;
     while store.ticks < max_ticks {
         spins = spins.wrapping_add(1);
-        if spins & 0xfff == 0 && cancelled(&options.cancel) {
-            return Err(CANCELLED.to_string());
+        if spins & 0xfff == 0 {
+            if cancelled(&options.cancel) {
+                return Err(CANCELLED.to_string());
+            }
+            if let Some(p) = &options.progress {
+                p.report(
+                    ((machine.cpu.cycles - start) as f64 / max_cycles)
+                        .max(store.ticks as f64 / max_ticks as f64),
+                );
+            }
         }
         if (machine.cpu.cycles - start) as f64 > max_cycles {
             end = Some(CaptureEnd::Cycles);

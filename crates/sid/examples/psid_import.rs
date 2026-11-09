@@ -110,6 +110,7 @@ fn run(file: &PsidFile, mode: &str, max_seconds: Option<f64>) -> Value {
                 max_ticks: None,
                 max_seconds: Some(120.0),
                 cancel: None,
+                progress: None,
             },
         );
         let Ok(trace) = trace else {
@@ -144,6 +145,7 @@ fn run(file: &PsidFile, mode: &str, max_seconds: Option<f64>) -> Value {
                 max_ticks: None,
                 max_seconds,
                 cancel: None,
+                progress: None,
             },
         );
         return match c {

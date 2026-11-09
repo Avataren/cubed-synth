@@ -227,6 +227,86 @@ fn an_import_can_be_cancelled_from_another_thread() {
     assert_eq!(import(IRQ, &opts).unwrap_err(), "the import was cancelled");
 }
 
+/// What an import made, enough to tell two of them apart.
+fn digest(r: &cubed_sid::psid::import::ImportResult) -> (Vec<u8>, Vec<String>, Option<f64>) {
+    (
+        r.song.to_bytes(),
+        r.report.notes.clone(),
+        r.report.fidelity.as_ref().map(|f| f.score),
+    )
+}
+
+#[test]
+fn an_import_reports_its_progress_and_is_the_same_import_for_it() {
+    use cubed_sid::psid::import::capture::PROGRESS_DONE;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
+    // The result crosses threads (a host runs the import on one).
+    fn send<T: Send>(_: &T) {}
+    let mut imported = 0;
+    for (name, tune) in FIXTURES {
+        // (Some fixtures are tunes that cannot be imported: they are for the refusals.)
+        let Ok(plain) = import(tune, &ImportOptions::default()) else {
+            continue;
+        };
+        imported += 1;
+        send(&plain);
+        let progress = Arc::new(AtomicU32::new(0));
+        let opts = ImportOptions {
+            progress: Some(progress.clone()),
+            ..Default::default()
+        };
+        // Watched from another thread while the import runs: it only ever goes up.
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (progress, stop) = (progress.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut seen = vec![0u32];
+                while !stop.load(Ordering::Relaxed) {
+                    let now = progress.load(Ordering::Relaxed);
+                    if now != *seen.last().unwrap() {
+                        seen.push(now);
+                    }
+                    std::thread::yield_now();
+                }
+                seen.push(progress.load(Ordering::Relaxed));
+                seen
+            })
+        };
+        let watched = import(tune, &opts).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let seen = watcher.join().unwrap();
+        assert_eq!(digest(&watched), digest(&plain), "{name}: the same song");
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{name}: {seen:?}");
+        assert_eq!(progress.load(Ordering::Relaxed), PROGRESS_DONE, "{name}");
+        assert_eq!(*seen.last().unwrap(), PROGRESS_DONE, "{name}: {seen:?}");
+        // Without the measure the progress still ends at the whole.
+        let progress = Arc::new(AtomicU32::new(0));
+        import(
+            tune,
+            &ImportOptions {
+                progress: Some(progress.clone()),
+                measure: false,
+                gt_unpack: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(progress.load(Ordering::Relaxed), PROGRESS_DONE, "{name}");
+    }
+    assert!(imported >= 4, "{imported} fixtures imported");
+    // A cancelled import does not reach the whole, a refused one neither.
+    let progress = Arc::new(AtomicU32::new(0));
+    let cancel = Arc::new(AtomicBool::new(true));
+    let opts = ImportOptions {
+        progress: Some(progress.clone()),
+        cancel: Some(cancel),
+        ..Default::default()
+    };
+    assert!(import(TUNE, &opts).is_err());
+    assert!(progress.load(Ordering::Relaxed) < PROGRESS_DONE);
+}
+
 #[test]
 fn damaged_tunes_are_refused_or_imported_never_a_panic() {
     // A deterministic scramble of the tunes' bytes: whatever runs, the import ends with a song or a reason.

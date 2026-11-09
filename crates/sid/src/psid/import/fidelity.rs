@@ -406,6 +406,7 @@ pub fn measure_fidelity(
             max_ticks: None,
             max_seconds: Some(seconds),
             cancel: None,
+            progress: None,
         },
         kernal,
     )?;

@@ -50,7 +50,8 @@ pub use transcribe::{SubsongReport, TranscribeOptions};
 use super::c64::Kernal;
 use super::file::{looks_like_psid, PsidFile};
 use crate::song::SidSong;
-use std::sync::atomic::AtomicBool;
+use capture::Progress;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
 /// What to import and how far to go.
@@ -71,6 +72,12 @@ pub struct ImportOptions {
     /// Set from another thread to stop the import (it returns `Err("the import was cancelled")`): checked
     /// between the ticks of a capture, which is nearly all the time an import takes, and between subsongs.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Another thread's view of how far the import is: a counter in ten thousandths of the whole
+    /// ([`capture::PROGRESS_DONE`] when done) that the import raises as it goes and never lowers. An estimate (see
+    /// [`capture::Progress`]): the captures, nearly all the time an import takes, report their emulated
+    /// time over the cap, which a tune that repeats earlier skips ahead of. It does not change what the import
+    /// does or returns.
+    pub progress: Option<Arc<AtomicU32>>,
 }
 
 impl Default for ImportOptions {
@@ -82,6 +89,7 @@ impl Default for ImportOptions {
             gt_unpack: true,
             kernal: Kernal::default(),
             cancel: None,
+            progress: None,
         }
     }
 }
@@ -172,7 +180,11 @@ const UNPACKED_FIDELITY: f64 = 0.98;
 
 /// `file` unpacked from its GoatTracker data, or `None` when it is not a GoatTracker file (or
 /// unpacks to something that does not play like it).
-fn unpacked(file: &PsidFile, opts: &ImportOptions) -> Option<ImportResult> {
+fn unpacked(
+    file: &PsidFile,
+    opts: &ImportOptions,
+    progress: Option<&Progress>,
+) -> Option<ImportResult> {
     let u = gt_unpack::unpack_gt_sid(file).ok()?;
     let mut fidelity = None;
     if !u.exact {
@@ -185,10 +197,14 @@ fn unpacked(file: &PsidFile, opts: &ImportOptions) -> Option<ImportResult> {
                 max_ticks: None,
                 max_seconds: Some(120.0),
                 cancel: opts.cancel.clone(),
+                progress: progress.map(|p| p.window(0.0, 0.2)),
             },
             opts.kernal,
         )
         .ok()?;
+        if let Some(p) = progress {
+            p.report(0.2);
+        }
         let m = fidelity::measure_fidelity(&trace, &u.song, 0, 3000, opts.kernal).ok()?;
         if m.score < UNPACKED_FIDELITY {
             return None;
@@ -212,9 +228,16 @@ fn unpacked(file: &PsidFile, opts: &ImportOptions) -> Option<ImportResult> {
 
 /// [`import`] of a parsed file.
 pub fn import_file(file: &PsidFile, opts: &ImportOptions) -> Result<ImportResult, String> {
+    let progress = opts.progress.clone().map(Progress::new);
+    let done = |r: ImportResult| {
+        if let Some(p) = &progress {
+            p.report(1.0);
+        }
+        Ok(r)
+    };
     if opts.gt_unpack {
-        if let Some(r) = unpacked(file, opts) {
-            return Ok(r);
+        if let Some(r) = unpacked(file, opts, progress.as_ref()) {
+            return done(r);
         }
     }
     let t = transcribe::transcribe_psid(
@@ -224,6 +247,10 @@ pub fn import_file(file: &PsidFile, opts: &ImportOptions) -> Result<ImportResult
             max_seconds: opts.max_seconds,
             kernal: opts.kernal,
             cancel: opts.cancel.clone(),
+            // The measure after it is the last of the progress.
+            progress: progress
+                .as_ref()
+                .map(|p| p.window(0.0, if opts.measure { 0.88 } else { 1.0 })),
         },
     )
     .map_err(|f| f.reason)?;
@@ -256,13 +283,16 @@ pub fn import_file(file: &PsidFile, opts: &ImportOptions) -> Result<ImportResult
     let start = t.reports.iter().find(|r| r.gt_subsong == Some(0));
     if opts.measure {
         if let Some(trace) = start.and_then(|s| s.trace.as_ref()) {
+            if let Some(p) = &progress {
+                p.report(0.88);
+            }
             match fidelity::measure_fidelity(trace, &t.song, 0, 3000, opts.kernal) {
                 Ok(f) => fidelity = Some(f),
                 Err(e) => warnings.push(format!("the fidelity could not be measured: {e}")),
             }
         }
     }
-    Ok(ImportResult {
+    done(ImportResult {
         report: ImportReport {
             fidelity,
             notes,

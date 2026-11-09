@@ -1175,10 +1175,16 @@ r.report.used_gt_unpack;      // GoatTracker's own song data read back, not tran
 let (doc, report) = SidDoc::from_psid(&bytes, &ImportOptions::default())?;   // the same as a document
 ```
 
-`ImportOptions { subsongs, max_seconds, measure, gt_unpack, kernal, cancel }`: the subsongs to import (0-based, default the start song
+`ImportOptions { subsongs, max_seconds, measure, gt_unpack, kernal, cancel, progress }`: the subsongs to import (0-based, default the start song
 first, then the rest, up to GoatTracker's 32), the capture cap per subsong (default 600 s of emulated time, as the
 DAW), whether to measure the fidelity (default yes), whether to recognise GoatTracker's tunes (default yes), the stand-in KERNAL
-(below) and a cancel flag.
+(below), a cancel flag (`Arc<AtomicBool>`, read between a capture's ticks: the import ends with `"the import was cancelled"`) and a progress counter
+(`Arc<AtomicU32>`, which the import raises and never lowers, in ten thousandths: `capture::PROGRESS_DONE` when it is done). The progress is an
+estimate that a host shows as a bar, not a measure: a capture counts its emulated time over its cap, so a tune that repeats sooner (the
+capture stops when the machine is in a state it was in before, which is most tunes) steps ahead to the next stage; the captures are the
+first 85% (an equal share per subsong), building the song the next 3%, the fidelity measure (one step, from 88%) the rest; an unpacked
+GoatTracker tune only counts the capture it makes to check the unpack. Unset, it costs nothing and the import is the same one
+(`ImportResult` is `Send`, so a host runs `import` on a thread and reads the counter from another).
 `ImportReport { fidelity, notes, warnings, used_gt_unpack, exact, subsong, frames, subsongs }`: `subsongs` has one
 `SubsongReport` per PSID subsong (where it went, why it was left out, its rows, loop, grid, capture).
 
