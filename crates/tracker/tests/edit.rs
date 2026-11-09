@@ -849,6 +849,79 @@ fn wav_loops_and_exports() {
 }
 
 #[test]
+fn a_sample_is_halved_and_a_pulse_sweep_is_baked() {
+    let mut m = doc("demo.mod");
+    ok(
+        &mut m,
+        json!({"op":"generate_wave","instrument":2,"wave":"saw","length":64}),
+    );
+    let before = m.module().samples[1].data.clone();
+    let r = ok(&mut m, json!({"op":"halve_sample","instrument":2}));
+    assert_eq!(r["changed"]["instruments"][0], 2);
+    let after = &m.module().samples[1].data;
+    assert_eq!(after.len(), 32);
+    for (i, v) in after.iter().enumerate() {
+        assert_eq!(
+            *v,
+            before[i * 2],
+            "frame {i} is the source's frame {}",
+            i * 2
+        );
+    }
+    assert_eq!(
+        m.module().samples[1].loop_len,
+        32,
+        "the loop halved with it"
+    );
+    // Undo puts the whole sample back.
+    m.undo().unwrap();
+    assert_eq!(m.module().samples[1].data, before);
+
+    // A sweep: 8 cycles of 32 frames, duty from 10 % to 50 %: the first cycle has fewer high frames than the last.
+    let r = ok(
+        &mut m,
+        json!({"op":"generate_pulse","instrument":2,"cycle_length":32,"cycles":8,"duty_start":10,"duty_end":50}),
+    );
+    assert_eq!(r["sample"]["length"], 256);
+    assert_eq!(r["sample"]["loop_kind"], "forward");
+    let data = &m.module().samples[1].data;
+    let high = |c: usize| {
+        data[c * 32..(c + 1) * 32]
+            .iter()
+            .filter(|v| **v > 0.0)
+            .count()
+    };
+    assert!(high(0) < high(7), "{} < {}", high(0), high(7));
+    assert_eq!(high(0), 3, "10 % of 32 is 3 frames");
+    assert_eq!(high(7), 16, "50 % of 32 is 16 frames");
+    // A ping-pong sweep ends where it began.
+    ok(
+        &mut m,
+        json!({"op":"generate_pulse","instrument":2,"cycle_length":32,"cycles":8,"duty_start":10,"duty_end":50,"sweep":"pingpong"}),
+    );
+    let data = &m.module().samples[1].data;
+    let high = |c: usize| {
+        data[c * 32..(c + 1) * 32]
+            .iter()
+            .filter(|v| **v > 0.0)
+            .count()
+    };
+    assert_eq!(high(0), 3);
+    assert!(high(4) > high(1) && high(7) < high(4));
+    assert!(err(
+        &mut m,
+        json!({"op":"generate_pulse","instrument":2,"duty_start":0})
+    )
+    .contains("duty"));
+    assert!(err(
+        &mut m,
+        json!({"op":"generate_pulse","instrument":2,"sweep":"sideways"})
+    )
+    .contains("sweep"));
+    assert!(err(&mut m, json!({"op":"halve_sample","instrument":99})).len() > 0);
+}
+
+#[test]
 fn generate_and_edit_samples() {
     let mut m = doc("demo.mod");
     let r = ok(

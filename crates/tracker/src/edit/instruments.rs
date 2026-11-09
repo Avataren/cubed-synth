@@ -891,6 +891,115 @@ impl ModuleDoc {
         Ok((j, changes))
     }
 
+    /// Every other frame: half the length, an octave up at the same note (the DAW's "halve"). A loop
+    /// is halved with it (and dropped when under two frames).
+    pub fn halve_sample(&mut self, r: SampleRef) -> Res<Changes> {
+        let index = self.resolve_sample(r)?;
+        let s = &self.module.samples[index];
+        if s.adlib.is_some() {
+            return Err("this slot is an AdLib instrument".into());
+        }
+        let mut data: Vec<f32> = s.data.iter().step_by(2).copied().collect();
+        if self.module.format == Format::Mod {
+            data.truncate(data.len() & !1);
+        }
+        if data.len() < 2 {
+            return Err("a sample of fewer than 4 frames cannot be halved".into());
+        }
+        let mut meta = sample_meta(s);
+        meta.loop_start /= 2;
+        meta.loop_len /= 2;
+        if meta.loop_len < 2 {
+            meta.loop_kind = LoopKind::Off;
+            meta.loop_start = 0;
+            meta.loop_len = 0;
+        }
+        let ((), changes) = self.edit(|d| d.put_sample(index, data, meta))?;
+        Ok(changes)
+    }
+
+    /// A pulse wave whose width moves through the sample (the DAW's `generatePulse`: a module has no PWM,
+    /// so the sweep is baked into `cycles` cycles of `cycle_length` frames), looped. `duty_start` and
+    /// `duty_end` are 1-99 percent; `pingpong` returns to the start by the end, so the loop is seamless.
+    pub fn generate_pulse(
+        &mut self,
+        r: SampleRef,
+        cycle_length: usize,
+        cycles: usize,
+        duty_start: f32,
+        duty_end: f32,
+        pingpong: bool,
+    ) -> Res<(Value, Changes)> {
+        let index = self.resolve_sample(r)?;
+        let format = self.module.format;
+        let max = if format == Format::Mod {
+            MOD_MAX_SAMPLE
+        } else {
+            S3M_MAX_SAMPLE
+        };
+        if self.module.samples[index].adlib.is_some() {
+            return Err("this slot is an AdLib instrument".into());
+        }
+        let cycle = cycle_length.max(4);
+        let cycles = cycles.max(1);
+        let mut length = (cycle * cycles).min(max);
+        if format == Format::Mod {
+            length &= !1;
+        }
+        if length < 4 {
+            return Err("a pulse is at least 4 frames".into());
+        }
+        let mut data = vec![-1.0f32; length];
+        for c in 0..cycles {
+            if c * cycle >= length {
+                break;
+            }
+            let p = if cycles == 1 {
+                0.0
+            } else {
+                c as f32 / cycles as f32
+            };
+            let along = if pingpong {
+                1.0 - (2.0 * p - 1.0).abs()
+            } else if cycles == 1 {
+                0.0
+            } else {
+                c as f32 / (cycles - 1) as f32
+            };
+            let duty = (duty_start + (duty_end - duty_start) * along) / 100.0;
+            let high = ((duty * cycle as f32).round() as usize).clamp(1, cycle - 1);
+            for i in 0..cycle {
+                let at = c * cycle + i;
+                if at < length {
+                    data[at] = if i < high { 1.0 } else { -1.0 };
+                }
+            }
+        }
+        let top = if format == Format::Mod {
+            127.0 / 128.0
+        } else {
+            32767.0 / 32768.0
+        };
+        wav::normalize(&mut data, top);
+        wav::quantize_to(&mut data, if format == Format::Mod { 8 } else { 16 });
+        let mut meta = sample_meta(&self.module.samples[index]);
+        if meta.name.is_empty() {
+            meta.name = "pulse".to_string();
+        }
+        if meta.volume == 0 {
+            meta.volume = 64;
+        }
+        if format == Format::S3m && meta.c2spd == 0 {
+            meta.c2spd = 8363;
+        }
+        meta.loop_kind = LoopKind::Forward;
+        meta.loop_start = 0;
+        meta.loop_len = length;
+        let ((), changes) = self.edit(|d| d.put_sample(index, data, meta))?;
+        let j = self.sample_json(r.instrument, r.sample, &self.module.samples[index]);
+        Ok((j, changes))
+    }
+
     // ----- the instrument list -----------------------------------------------------------------
 
     /// Cells that name instrument `number` (1-based) in any pattern.

@@ -635,7 +635,9 @@ impl ModuleDoc {
     ///   raw, `mix`, `resample`: `"sinc"`/`"linear"`, `note` (MOD), `target_rate`,
     ///   `bits`, `normalize`, `name`, `keep_loop`, `truncate`)
     /// - `normalize_sample`, `reverse_sample`, `clear_sample`,
-    ///   `generate_wave` (`wave`, `length`, `seed`)
+    ///   `generate_wave` (`wave`, `length`, `seed`), `halve_sample`,
+    ///   `generate_pulse` (`cycle_length`, `cycles`, `duty_start`, `duty_end`,
+    ///   `sweep`: `up` or `pingpong`)
     /// - `add_instrument` (`name`), `remove_instrument` (`instrument`, `force`),
     ///   XM: `add_sample`, `remove_sample`, `set_instrument` (`name`, `fadeout`,
     ///   `vibrato_kind`, `vibrato_sweep`, `vibrato_depth`, `vibrato_rate`),
@@ -873,6 +875,32 @@ impl ModuleDoc {
             "normalize_sample" => done(self.normalize_sample(sample_ref(op)?)?),
             "reverse_sample" => done(self.reverse_sample(sample_ref(op)?)?),
             "clear_sample" => done(self.clear_sample(sample_ref(op)?)?),
+            "halve_sample" => done(self.halve_sample(sample_ref(op)?)?),
+            "generate_pulse" => {
+                let duty = |key: &str, default: f64| -> Res<f32> {
+                    let v = op.get(key).and_then(Value::as_f64).unwrap_or(default);
+                    if (1.0..=99.0).contains(&v) {
+                        Ok(v as f32)
+                    } else {
+                        Err(format!(
+                            "'{key}' is a duty cycle of 1 to 99 percent, not {v}"
+                        ))
+                    }
+                };
+                let sweep = opt_str(op, "sweep")?.unwrap_or("up");
+                if sweep != "up" && sweep != "pingpong" {
+                    return Err(format!("'{sweep}' is not a sweep (up, pingpong)"));
+                }
+                let (s, c) = self.generate_pulse(
+                    sample_ref(op)?,
+                    opt_usize(op, "cycle_length")?.unwrap_or(64),
+                    opt_usize(op, "cycles")?.unwrap_or(8),
+                    duty("duty_start", 25.0)?,
+                    duty("duty_end", 50.0)?,
+                    sweep == "pingpong",
+                )?;
+                Ok(json!({"sample": s, "changed": c.to_json()}))
+            }
             "generate_wave" => {
                 let wave = req_str(op, "wave")?;
                 let wave = Wave::parse(wave).ok_or_else(|| {
