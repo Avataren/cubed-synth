@@ -219,6 +219,7 @@ source.song_reader().unwrap();`, then `PrepareSource` and `PlaySource` as for an
 ```rust
 enum SongControl {
     Play, Stop, Seek { order: u16, row: u16 },
+    SeekVoice { voice: u8, order: u16, row: u16 },    // SID: a seek by one voice's own place (wire kind 18)
     Loop(SongLoop),                                   // None | Pattern { order } | Range { order, row0, row1 }
     Mute { channel: u8, on: bool }, Solo { channel: u8, on: bool },
     MuteMask(u32), SoloMask(u32),                     // every channel at once, a bit each
@@ -233,7 +234,7 @@ enum SongControl {
     SetTableRow { table, row, left, right },          // SID: a row of a step table (wire kind 17)
 }
 trait SongReader: Send + Sync {                       // natively: the song's probe; on the web: WebSong
-    fn status(&self) -> SongStatus;                   // as Player::status, plus `version`
+    fn status(&self) -> SongStatus;                   // as Player::status, plus `version` and `voices` (SID: each voice's own order, pattern, row)
     fn channels(&self) -> usize;
     fn levels(&self, out: &mut [f32]) -> usize;       // the channels' peaks, then the preview's
     fn scope(&self, channel: usize, out: &mut [f32]) -> usize;   // mono frames, oldest first, <= 512
@@ -248,7 +249,7 @@ batch): tag 30, 24 bytes, little endian: `u8 tag, u64 voice, u8 kind, u16 a, u16
 u32 frames`. Kinds: 0 Play, 1 Stop, 2 Seek (a order, b row), 3 Loop none, 4 Loop pattern (a order), 5 Loop
 range (a order, b row0, c row1), 6 Mute (a channel, b on), 7 Solo (a, b), 8 MuteMask (frames), 9 SoloMask
 (frames), 10 PreviewOn (a instrument, b note, value velocity, frames duration), 11 PreviewOff, 12 Looped
-(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order), 17 SetTableRow (a table | row << 8, b left | right << 8). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
+(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order), 17 SetTableRow (a table | row << 8, b left | right << 8), 18 SeekVoice (a order, b row, c voice). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
 number, u8 fm[11], u8 panning, i8 finetune, u8 voice_type`. Tag 31, 21 bytes: `u8 tag, u64 voice, u16 pattern, u16 row, u8 channel, u8 note
 (0 none, 255 key off, else MIDI; Adlib: the file's note byte), u16 period (Adlib: `effect2 << 8 | param2`), u8
 instrument, u8 volume, u8 effect, u8 param` (SetCell). An
@@ -260,9 +261,13 @@ or 5, or an Adlib song (format 1); the reply is the usual `{type: 'song', source
 with `'commands'`. The worklet posts, about 60 times a second (init's `songHz`) and only for the followed
 songs that moved:
 
-- `{type: 'songpos', frame, sources: Uint32Array, status: Uint32Array, levels: Float32Array}`: for song i
-  its source slot, 12 status words (flags playing/preview/alive/scopes on, order, pattern, row, tick,
-  speed, tempo, rows, frames low and high, version, channels; `SongStatus::to_words`) and 33 levels. (The
+- `{type: 'songpos', frame, sources: Uint32Array, status: Uint32Array, levels: Float32Array, voices:
+  Uint32Array}`: for song i its source slot, 12 status words (flags playing/preview/alive/scopes on, order,
+  pattern, row, tick, speed, tempo, rows, frames low and high, version, channels; `SongStatus::to_words`),
+  33 levels and 6 voice words (`SongStatus::voice_words`: the order, pattern and row each of up to
+  `SONG_MAX_VOICES` = 3 voices is at, two words a voice, `pattern << 16 | order` then `valid << 16 | row`;
+  all 0 for a format whose voices share one position; a separate array, so a page that predates it reads
+  the message as before, and a worklet that predates it posts none: no voice is then reported). (The
   type is not `'song'`, which is the reply to a prepare and has an `ok`.) A song gone is reported once
   more with alive 0: its voice was freed by the first message handler after it ended; a page that tracks
   its voices sees `Ended` sooner.
@@ -270,7 +275,8 @@ songs that moved:
   Float32Array}`, with each `'songpos'` for the songs whose scopes are on: per song its channel count, in
   `data` each channel's 512 latest frames, in `written` how many each ring has seen.
 
-On the page, `WebSongs` (one `WebSong` per source slot; `update_positions(sources, status, levels)`,
+On the page, `WebSongs` (one `WebSong` per source slot; `update_positions(sources, status, levels)` or, with the
+message's `voices`, `update_positions_voices(sources, status, levels, voices)`,
 `update_scopes(frames, sources, channels, written, data)`, `get(source) -> Option<&WebSong>`, `forget`)
 parses them, and a `WebSong` is a `SongReader`, so the editor reads natively and on the web the same
 way. Exports for hosts that drive the wasm themselves: `cw_prepare_module(source, format, subsong,
@@ -333,10 +339,15 @@ allocates when it is switched on, which an audio thread may not do.
 
 **SID.** Three voices (the channels), an orderlist each over one pool of patterns. `SidSongPlayer` has no pause, so **stopped is
 its preview mode** (the sequencer is off, the notes die away, the position stays, auditions play on any voice) and `Play` leaves
-it; a song opens stopped. `Seek { order, row }`, `Loop` and the status refer to **voice 0**: voice 0 reads row `row` of the
-pattern at its orderlist position `order`, a range loop repeats rows of voice 0's entry, and `status()` is voice 0's position (the
-other voices' places are not reported yet; `pattern` is the pattern number, `speed` the frames per row, `tempo` the timer's Hz, 50
-x the speed multiplier, `rows` the song row of the reference voice). The preview is the player's audition on voice 0 (held until
+it; a song opens stopped. The voices run on orderlists of their own, so each has its own place at any time:
+`status().voices[v]` is voice `v`'s orderlist position, pattern and row (`VoicePos`, the row it started last; right after a seek, the
+row it will start; `valid` is true for the three voices). `Seek { order, row }`, `Loop` and the status's plain `order`, `pattern`,
+`row` and `tick` stay **voice 0**'s: voice 0 reads row `row` of the pattern at its orderlist position `order`, a range loop repeats
+rows of voice 0's entry. `SeekVoice { voice, order, row }` is the same for any voice (`Seek` is `voice: 0`): the song is replayed to
+the moment that voice reads that row, so the other voices stand where the song has them then (voices that keep step with it show the
+same row), not where they were; stopped or playing, and a place the song does not have moves nothing. (`pattern` is the pattern
+number, `speed` the frames per row, `tempo` the timer's Hz, 50 x the speed multiplier, `rows` the song row of the reference voice;
+`SONG_MAX_VOICES` is the voices a status can carry.) The preview is the player's audition on voice 0 (held until
 `PreviewOff`, or for `duration` frames; over a playing song voice 0 is taken for it; a note is MIDI, 12 is C-0). `levels` are the
 voices' peaks (the taps), then 0; the scopes are the voices' own signals before the filter. Live edits on the wire: `SetCell` (a
 row: `pattern` is the pattern number, `note` 1-93 / 126 off / 127 on, `effect` the command), `SetInstrument` (the ten bytes in

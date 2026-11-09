@@ -306,7 +306,7 @@ async function bigSwap() {
 // followed, seeked while stopped, looped, previewed, muted, played and stopped by
 // wire commands; the page reads 'songpos' and 'songscope' messages.
 const SONG = { play: 0, stop: 1, seek: 2, loopNone: 3, loopPattern: 4, loopRange: 5, mute: 6, solo: 7,
-  muteMask: 8, soloMask: 9, previewOn: 10, previewOff: 11, looped: 12, scopes: 13 };
+  muteMask: 8, soloMask: 9, previewOn: 10, previewOff: 11, looped: 12, scopes: 13, seekVoice: 18 };
 function songCommand(voice, kind, ...rest) {
   const v = new DataView(new ArrayBuffer(24));
   v.setUint8(0, 30); v.setBigUint64(1, BigInt(voice), true); v.setUint8(9, kind);
@@ -319,7 +319,13 @@ function songCommand(voice, kind, ...rest) {
 // One song's entry of a 'songpos' message, decoded as WebSong does.
 function decodeSong(m, i) {
   const w = m.status.subarray(i * 12, i * 12 + 12);
+  // The voices' own positions ('voices', 6 words a song; two per voice: pattern << 16 | order, valid << 16 | row).
+  const v = m.voices ? m.voices.subarray(i * 6, i * 6 + 6) : new Uint32Array(6);
+  const voices = [0, 1, 2].map((k) => ({
+    order: v[2 * k] & 0xffff, pattern: v[2 * k] >>> 16, row: v[2 * k + 1] & 0xffff, valid: !!(v[2 * k + 1] >>> 16 & 1),
+  }));
   return {
+    voices,
     source: m.sources[i], playing: !!(w[0] & 1), preview: !!(w[0] & 2), alive: !!(w[0] & 4),
     scopes: !!(w[0] & 8), order: w[1], pattern: w[2], row: w[3], tick: w[4], speed: w[5], tempo: w[6],
     rows: w[7], frames: w[8] + w[9] * 2 ** 32, version: w[10], channels: w[11],
@@ -529,8 +535,16 @@ async function ahxControlled() {
   const tracks = first ? first.channels : 0;
   const loudest = Math.max(...during.map((p) => Math.max(...p.levels.subarray(0, tracks))));
   const previewed = during.some((p) => p.preview && p.levels[tracks] > 0.0);
+  // Each voice has its own place: voice 2's 16-row pattern goes round twice for one of voice 0's 32 rows.
+  const apart = during.some((p) => p.voices[2].valid && p.voices[2].row !== p.voices[0].row);
+  const voices = during.every((p) => p.voices.every((v) => v.valid) && p.voices[0].row === p.row && p.voices[0].order === p.order);
   send(songCommand(5, SONG.previewOff), songCommand(5, SONG.stop));
   const stopped = await waitFor((p) => !p.playing, 3000, positions.length);
+  // A voice by its own place (kind 18: a order, b row, c voice), while stopped: voice 2 to row 9 of its pattern; the
+  // others are where the song has them then (voices 0 and 1 are in step with voice 2 on the first pass: row 9 too).
+  send(songCommand(5, SONG.seekVoice, 0, 9, 2));
+  const voiceSeeked = await waitFor((p) => p.voices[2].row === 9 && p.voices[2].pattern === 2, 3000, positions.length);
+  const othersStayed = !!voiceSeeked && voiceSeeked.voices[0].row === 9 && voiceSeeked.voices[1].row === 9 && !voiceSeeked.playing;
   send(stop(5, 0));
   await sleep(100);
   send(setBus(3, 0));
@@ -577,7 +591,7 @@ async function sidControlled() {
   send(setBus(2, 0), playSource(5, 2, 2));
   const first = await waitFor((p) => p.source === 2);
   const openedOk = replies.length === 2 && replies[0].ok && !replies[1].ok;
-  send(songCommand(5, SONG.seek, 0, 8));
+  send(songCommand(5, SONG.seek, 0, 24));
   const seeked = true;
   const mark = positions.length;
   send(songCommand(5, SONG.play), cellCommand(5, 0, 20, 0, 40, 1, 0x0f, 4, 0),
@@ -590,8 +604,16 @@ async function sidControlled() {
   const tracks = first ? first.channels : 0;
   const loudest = Math.max(...during.map((p) => Math.max(...p.levels.subarray(0, tracks))));
   const previewed = during.some((p) => p.preview);
+  // Each voice has its own place: voice 2's 16-row pattern goes round twice for one of voice 0's 32 rows.
+  const apart = during.some((p) => p.voices[2].valid && p.voices[2].row !== p.voices[0].row);
+  const voices = during.every((p) => p.voices.every((v) => v.valid) && p.voices[0].row === p.row && p.voices[0].order === p.order);
   send(songCommand(5, SONG.previewOff), songCommand(5, SONG.stop));
   const stopped = await waitFor((p) => !p.playing, 3000, positions.length);
+  // A voice by its own place (kind 18: a order, b row, c voice), while stopped: voice 2 to row 9 of its pattern; the
+  // others are where the song has them then (voices 0 and 1 are in step with voice 2 on the first pass: row 9 too).
+  send(songCommand(5, SONG.seekVoice, 0, 9, 2));
+  const voiceSeeked = await waitFor((p) => p.voices[2].row === 9 && p.voices[2].pattern === 2, 3000, positions.length);
+  const othersStayed = !!voiceSeeked && voiceSeeked.voices[0].row === 9 && voiceSeeked.voices[1].row === 9 && !voiceSeeked.playing;
   send(stop(5, 0));
   await sleep(100);
   send(setBus(3, 0));
@@ -602,6 +624,8 @@ async function sidControlled() {
     openedOk, first: !!first && !first.playing && first.order === 0 && first.row === 0 && first.channels === 3 && first.alive && first.speed > 0,
     seeked: !!seeked, moved: rows.length >= 3 && during.some((p) => p.playing && p.playing),
     loud: loudest > 0.001, previewed, stopped: !!stopped, gone: !!gone,
+    voicesReported: !!first && first.voices.every((v, k) => v.valid && v.pattern === k && v.row === 0 && v.order === 0),
+    voicesTogether: voices, voicesApart: apart, voiceSeeked: !!voiceSeeked, othersWhereTheSongHasThem: othersStayed,
   };
   results.ok = Object.values(results.checks).every(Boolean);
   return results;
