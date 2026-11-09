@@ -385,6 +385,17 @@ impl AhxPlayer {
         self.engine.read_channel_snapshot(voice, out)
     }
 
+    /// The newest `out.len()` frames of `voice`'s capture, one point per frame (see
+    /// [`AhxEngine::read_channel_recent`]).
+    pub fn read_channel_recent(&self, voice: usize, out: &mut [i16]) -> usize {
+        self.engine.read_channel_recent(voice, out)
+    }
+
+    /// Whether the mix drops voice `i` (muted, or not soloed while another is).
+    pub fn voice_silenced(&self, i: usize) -> bool {
+        self.engine.voice_silenced(i)
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.engine.sample_rate()
     }

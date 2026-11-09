@@ -15,8 +15,10 @@
 //! struck again on the new voice.
 //!
 //! Levels are `AhxPlayer::levels` (a bound on the channel's loudest sample at the latest tick,
-//! falling 24 dB a second). There are no scopes: the engine's per-voice capture allocates when
-//! it is switched on, which the audio thread may not do.
+//! falling 24 dB a second). Scopes are the engine's per-voice capture, which allocates its rings
+//! when it is switched on, so it is switched on when the player is built (off the audio thread) and
+//! stays on: it only reads what the mix computed, so the sound is the same, and a scope is the
+//! newest frames of a voice's ring (a muted voice, or one a solo leaves out, reads silent).
 //!
 //! `status().tempo` is the timer's rate in Hz (50 x the speed multiplier) and `speed` the ticks
 //! per row; `pattern` is the position (AHX has no patterns, a position names a track per channel).
@@ -58,6 +60,8 @@ impl AhxSongPlayer {
     ) -> Result<AhxSongPlayer, String> {
         let mut player = AhxPlayer::from_song(song, sample_rate.round() as u32, STEREO_MODE)?;
         player.set_hifi(hifi);
+        // The capture rings are made here, not when a scope is first asked for on the audio thread.
+        player.enable_capture(true);
         player.set_levels(true);
         player.play();
         let (mut left, mut right) = ([0.0; CHUNK], [0.0; CHUNK]);
@@ -209,5 +213,25 @@ impl SongPlayer for AhxSongPlayer {
         } else {
             0.0
         }
+    }
+
+    /// The scopes are always being captured (see the module docs): nothing to switch.
+    fn set_scopes(&mut self, _on: bool) {}
+
+    fn scope(&self, channel: usize, out: &mut [f32]) -> usize {
+        let mut raw = [0i16; CHUNK];
+        let wanted = out.len().min(CHUNK);
+        let got = self.player.read_channel_recent(channel, &mut raw[..wanted]);
+        // A voice's full scale is the capture's 8192 (a signed byte times a volume of 64); a voice the
+        // mix drops is silent in its scope too.
+        let scale = if self.player.voice_silenced(channel) {
+            0.0
+        } else {
+            1.0 / 8192.0
+        };
+        for (o, &r) in out[..got].iter_mut().zip(&raw) {
+            *o = r as f32 * scale;
+        }
+        got
     }
 }

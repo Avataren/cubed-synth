@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use cubed_ahx::edit::AhxDoc;
 use cubed_ahx::format::SongFormat as AhxFormat;
-use cubed_mixer::songs::{open_ahx, open_controlled_song, SongFormat, SongOptions};
+use cubed_mixer::songs::{open_ahx, open_controlled_song, open_song, SongFormat, SongOptions};
 use cubed_mixer::{
     wire, BusId, BusSettings, Command, Event, Mixer, MixerConfig, PlaySource, SongCell,
-    SongControl, SongLoop, SongReader, SourceEvent, SourceId, VoiceId,
+    SongControl, SongLoop, SongReader, SourceEvent, SourceId, VoiceId, SONG_SCOPE_FRAMES,
 };
 use serde_json::json;
 
@@ -127,6 +127,37 @@ fn the_hifi_option_chooses_the_band_limited_oscillators() {
         );
         rig.run(1.5)
     };
+    let plain = |hifi: bool| {
+        let options = SongOptions {
+            ahx_hifi: hifi,
+            ..SongOptions::default()
+        };
+        // The song an uncontrolled play (a sound file, a music track) builds: no reader, no transport.
+        let source = open_song(SongFormat::Ahx, &fixture(SONG), RATE, options).unwrap();
+        let mut mixer = Mixer::new(MixerConfig {
+            sample_rate: RATE,
+            max_block: BLOCK,
+            ..MixerConfig::default()
+        });
+        mixer.apply(Command::SetBus(MUSIC, BusSettings::default()));
+        mixer.apply(Command::PrepareSource(SourceId(0), source));
+        mixer.apply(Command::PlaySource(PlaySource::new(
+            VOICE,
+            SourceId(0),
+            MUSIC,
+        )));
+        let (mut out, mut l, mut r) = (Vec::new(), [0.0; BLOCK], [0.0; BLOCK]);
+        for _ in 0..(1.5 * RATE as f64) as usize / BLOCK {
+            mixer.process(&mut l, &mut r);
+            out.extend(l.iter().zip(&r).map(|(a, b)| a + b));
+        }
+        out
+    };
+    assert_ne!(
+        plain(true),
+        plain(false),
+        "plain playback follows the option too"
+    );
     let (hifi, reference) = (render(true), render(false));
     assert!(energy(&hifi) > 1.0 && energy(&reference) > 1.0);
     let difference: Vec<f32> = hifi.iter().zip(&reference).map(|(a, b)| a - b).collect();
@@ -134,6 +165,32 @@ fn the_hifi_option_chooses_the_band_limited_oscillators() {
         energy(&difference) > 1e-3 * energy(&reference),
         "hi-fi renders the reference's signal"
     );
+}
+
+/// An AHX song has a scope for each voice (the engine's capture, switched on when the player is built): a voice
+/// that sounds draws a wave within full scale, and a muted one reads silent.
+#[test]
+fn an_ahx_song_has_a_scope_for_each_voice() {
+    let mut rig = rig(SONG, true);
+    rig.control(SongControl::Scopes(true));
+    rig.control(SongControl::Play);
+    rig.run(2.0);
+    assert!(rig.reader.scopes_enabled());
+    let mut audible = 0;
+    for voice in 0..4 {
+        let mut scope = [0.0f32; SONG_SCOPE_FRAMES];
+        assert_eq!(rig.reader.scope(voice, &mut scope), SONG_SCOPE_FRAMES);
+        assert!(peak(&scope) <= 1.01, "voice {voice} is over full scale");
+        audible += (peak(&scope) > 0.02) as usize;
+    }
+    assert!(audible >= 1, "no voice drew a wave");
+    rig.control(SongControl::MuteMask(0b1111));
+    rig.run(0.5);
+    for voice in 0..4 {
+        let mut scope = [0.0f32; SONG_SCOPE_FRAMES];
+        rig.reader.scope(voice, &mut scope);
+        assert_eq!(peak(&scope), 0.0, "voice {voice} is muted");
+    }
 }
 
 #[test]

@@ -224,3 +224,24 @@ fn player_exposes_the_same_contract() {
     assert!(heard >= 1, "at least one voice is sounding after ~0.6 s");
     assert_eq!(p.read_channel_snapshot(p.channels(), &mut out), 0);
 }
+
+/// `read_channel_recent` is the newest frames of the full snapshot, one per frame, whatever the length asked.
+#[test]
+fn recent_frames_are_the_tail_of_the_full_snapshot() {
+    let mut e = engine("karma.ahx", Some(2));
+    e.enable_capture(true);
+    render(&mut e, RATE as usize, &BLOCKS);
+    let mut full = vec![0i16; CAPTURE_FRAMES];
+    assert_eq!(e.read_channel_snapshot(1, &mut full), CAPTURE_FRAMES);
+    for n in [1usize, 7, 256, 1000, CAPTURE_FRAMES] {
+        let mut recent = vec![0i16; n];
+        assert_eq!(e.read_channel_recent(1, &mut recent), n);
+        assert_eq!(recent, full[CAPTURE_FRAMES - n..], "{n} frames");
+    }
+    // The edges: capture off, a voice that is not there, nothing asked.
+    let mut out = [0i16; 8];
+    assert_eq!(e.read_channel_recent(9, &mut out), 0);
+    assert_eq!(e.read_channel_recent(0, &mut []), 0);
+    e.enable_capture(false);
+    assert_eq!(e.read_channel_recent(0, &mut out), 0);
+}

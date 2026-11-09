@@ -325,6 +325,7 @@ struct AhxSong {
 impl AhxSong {
     fn new(bytes: &[u8], sample_rate: f32, options: SongOptions) -> Result<AhxSong, String> {
         let mut player = AhxPlayer::new(bytes, sample_rate.round() as u32, AHX_STEREO_MODE)?;
+        player.set_hifi(options.ahx_hifi);
         player.play();
         warm_up(|l, r| {
             player.render(l, r);

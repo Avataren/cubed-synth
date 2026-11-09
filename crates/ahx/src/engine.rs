@@ -948,6 +948,27 @@ impl AhxEngine {
         n
     }
 
+    /// Fills `out` with the newest `out.len()` frames of `voice`'s capture, oldest first, one point per
+    /// frame: [`read_channel_snapshot`](Self::read_channel_snapshot) without the decimation, reading only
+    /// the frames asked for (a host that wants the block it just rendered). Returns how many it wrote: 0
+    /// with capture off, an out-of-range `voice` or an empty `out`; `out.len()` is capped at
+    /// [`CAPTURE_FRAMES`]. Writes only into `out`; no allocation.
+    pub fn read_channel_recent(&self, voice: usize, out: &mut [i16]) -> usize {
+        let Some(c) = self.capture.as_ref() else {
+            return 0;
+        };
+        if voice >= self.channels || out.is_empty() {
+            return 0;
+        }
+        let n = out.len().min(CAPTURE_FRAMES);
+        let ring = &c.ring[voice * CAPTURE_FRAMES..(voice + 1) * CAPTURE_FRAMES];
+        let start = c.written.wrapping_sub(n as u64) as usize;
+        for (k, o) in out[..n].iter_mut().enumerate() {
+            *o = ring[start.wrapping_add(k) & CAPTURE_MASK];
+        }
+        n
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.freq
     }
