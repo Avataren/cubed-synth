@@ -23,6 +23,9 @@ const FULL_SCALE: f32 = 1.0 / 32768.0;
 const MAX_DEFERRED: usize = 32;
 /// Register writes remembered for an observer, per event.
 const MAX_LOGGED: usize = 256;
+/// The most frames of one `render` call whose per-channel scope frames are kept (the player renders its blocks in
+/// chunks no longer than this).
+pub(crate) const SCOPE_BLOCK: usize = 1024;
 
 /// ST3's period for a musical frequency (`14317056 / hz`, the DAW's scale).
 fn period_for_frequency(frequency: f64) -> i64 {
@@ -111,6 +114,13 @@ pub(crate) struct AdlibDriver {
     /// This event's writes (register, value, held back), for an observer.
     logged: [(u16, u8, bool); MAX_LOGGED],
     logged_len: usize,
+    /// Each OPL channel's own output for the frames of the last `render` that asked for it
+    /// (`SCOPE_BLOCK` frames a channel, at the song's rate, in the chip's level), and how many.
+    scope: Vec<f32>,
+    scope_frames: usize,
+    /// The channels' latest native-rate outputs: held between the chip's samples, so the scope
+    /// follows the chip's own rate, a hair off the song's.
+    hold: [f32; 9],
 }
 
 impl AdlibDriver {
@@ -143,6 +153,9 @@ impl AdlibDriver {
             deferred_len: 0,
             logged: [(0, 0, false); MAX_LOGGED],
             logged_len: 0,
+            scope: vec![0.0; 9 * SCOPE_BLOCK],
+            scope_frames: 0,
+            hold: [0.0; 9],
         };
         // Initialized by the player's first seek.
         driver.channels.iter_mut().for_each(|c| c.avol = 63);
@@ -401,14 +414,40 @@ impl AdlibDriver {
         &self.logged[..n]
     }
 
-    /// Adds the chip's next `left.len()` frames into the buffers, at `gain`.
-    pub(crate) fn render(&mut self, left: &mut [f32], right: &mut [f32], gain: f32) {
+    /// Whether `track` plays on an OPL channel (it has played a note there): its sound is the chip's, not a
+    /// sample voice's.
+    pub(crate) fn drives(&self, track: usize) -> bool {
+        self.existing(track).is_some()
+    }
+
+    /// The frames `track`'s OPL channel made in the last `render` that captured them (what that channel
+    /// contributes to the mix, at the mix's level), or none.
+    pub(crate) fn scope_of(&self, track: usize) -> Option<&[f32]> {
+        let ch = self.existing(track)?;
+        (self.scope_frames > 0)
+            .then(|| &self.scope[ch * SCOPE_BLOCK..ch * SCOPE_BLOCK + self.scope_frames])
+    }
+
+    /// Adds the chip's next `left.len()` frames into the buffers, at `gain`. With `capture`, each OPL
+    /// channel's own frames are kept for `scope_of` (up to `SCOPE_BLOCK` of them).
+    pub(crate) fn render(&mut self, left: &mut [f32], right: &mut [f32], gain: f32, capture: bool) {
         let scale = FULL_SCALE * self.gain * gain;
-        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let (chip, deferred, deferred_len) =
-                (&mut self.chip, &self.deferred, &mut self.deferred_len);
+        let capture = capture && left.len() <= SCOPE_BLOCK;
+        self.scope_frames = if capture { left.len() } else { 0 };
+        for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+            let (chip, deferred, deferred_len, hold) = (
+                &mut self.chip,
+                &self.deferred,
+                &mut self.deferred_len,
+                &mut self.hold,
+            );
             let [a, b] = self.resampler.next(|| {
                 let (a, b) = chip.clock_sample();
+                if capture {
+                    for (ch, held) in hold.iter_mut().enumerate() {
+                        *held = chip.channel_output(ch) as f32;
+                    }
+                }
                 // Key-ons held back a native sample go in after it.
                 for &(reg, val) in &deferred[..*deferred_len] {
                     chip.write(reg, val);
@@ -418,6 +457,11 @@ impl AdlibDriver {
             });
             *l += a * scale;
             *r += b * scale;
+            if capture {
+                for (ch, held) in self.hold.iter().enumerate() {
+                    self.scope[ch * SCOPE_BLOCK + i] = held * scale;
+                }
+            }
         }
     }
 }

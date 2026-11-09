@@ -527,3 +527,40 @@ fn a_live_cell_edit_is_played_the_next_time_it_is_reached() {
     let (_, sound) = run(&mut p, 0.3, 128);
     assert!(energy(&sound) > 0.01, "the new note plays");
 }
+
+#[test]
+fn an_adlib_channel_has_a_scope_of_its_own() {
+    // The S3M demo's fifth track plays an AdLib organ on the chip: no sample voice makes its sound, so its
+    // scope comes from the chip's own channel, written in step with the other tracks'.
+    let mut p = player("demo.s3m");
+    let probe = Probe::new(5);
+    p.attach_probe(probe.clone());
+    probe.set_scopes(true);
+    let (mut l, mut r) = ([0.0f32; 128], [0.0f32; 128]);
+    let mut best = [0.0f32; 5];
+    let mut ring = [0.0f32; SCOPE_FRAMES];
+    for _ in 0..(RATE as usize * 6 / 128) {
+        p.render(&mut l, &mut r);
+        for (c, best) in best.iter_mut().enumerate() {
+            probe.scope(c, &mut ring);
+            *best = best.max(peak(&ring));
+        }
+    }
+    assert!(best[4] > 0.01, "the organ is seen: {best:?}");
+    assert!(
+        best[..4].iter().any(|&v| v > 0.01),
+        "and so are the samples: {best:?}"
+    );
+    let written: Vec<u64> = (0..5).map(|c| probe.scope_position(c)).collect();
+    assert!(
+        written.iter().all(|&w| w == written[0] && w > 0),
+        "every track's ring moves by the same frames: {written:?}"
+    );
+    // A muted AdLib track reads flat.
+    p.set_mute(4, true);
+    for _ in 0..200 {
+        p.render(&mut l, &mut r);
+    }
+    probe.scope(4, &mut ring);
+    assert_eq!(peak(&ring), 0.0, "muted");
+}

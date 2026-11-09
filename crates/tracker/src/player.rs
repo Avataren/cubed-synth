@@ -2218,7 +2218,12 @@ impl Player {
                         }
                     }
                 }
-                if let Some(probe) = scopes {
+                // A track on the AdLib chip has its own frames, written after the chip renders.
+                #[cfg(feature = "adlib")]
+                let on_chip = self.adlib.as_ref().is_some_and(|a| a.drives(ci));
+                #[cfg(not(feature = "adlib"))]
+                let on_chip = false;
+                if let (Some(probe), false) = (scopes, on_chip) {
                     probe.write_scope(ci, mono);
                 }
             }
@@ -2247,7 +2252,33 @@ impl Player {
         // The AdLib chip, which (as in the DAW) the global volume leaves alone.
         #[cfg(feature = "adlib")]
         if let Some(adlib) = &mut self.adlib {
-            adlib.render(left, right, self.output_gain);
+            // In chunks the chip can keep each channel's own frames of, for the scopes.
+            let mut at = 0;
+            while at < n {
+                let k = (n - at).min(crate::adlib::SCOPE_BLOCK);
+                adlib.render(
+                    &mut left[at..at + k],
+                    &mut right[at..at + k],
+                    self.output_gain,
+                    scopes.is_some(),
+                );
+                if let Some(probe) = scopes {
+                    for (ci, channel) in self.channels.iter().enumerate() {
+                        if let Some(frames) = adlib.scope_of(ci) {
+                            if channel.muted {
+                                // (A muted track's note still rings out its release on the chip: its scope reads
+                                // flat, as a sample channel's does.)
+                                let flat = &mut self.scratch_mono[..frames.len()];
+                                flat.fill(0.0);
+                                probe.write_scope(ci, flat);
+                            } else {
+                                probe.write_scope(ci, frames);
+                            }
+                        }
+                    }
+                }
+                at += k;
+            }
             for (ci, channel) in self.channels.iter().enumerate() {
                 if !channel.muted {
                     self.block_peaks[ci] = self.block_peaks[ci].max(adlib.level(ci));
