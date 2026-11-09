@@ -13,7 +13,7 @@ in a browser AudioWorklet and in a native audio callback.
 | `cubed-tracker` | Tracker modules: ProTracker MOD (Soundtracker, multi-channel), Scream Tracker 3 S3M (AdLib instruments on `cubed-opl`) and FastTracker 2 XM. An editable module model, the parsers, and a replayer ported from another_synth's TypeScript `tracker-playback` (checked against it command for command), with one voice per channel, 32-tap windowed-sinc interpolation, XM envelopes, fadeout and auto-vibrato, the Amiga output filter and stereo separation. The writers (`write_mod`, `write_s3m`, `write_xm`) and `edit::ModuleDoc`, which edits a module as data with JSON operations, format limits and undo. An `Observer` sees every row and command; a `Probe` shows the position, per-channel levels and scopes of a playing player, which also takes live control (stop and play, seek, loops, mute and solo, note preview) |
 | `cubed-dsp` | The synth engine: audio graph, oscillators (analog, wavetable), envelopes, LFOs, filters, chorus, delay, reverb, convolver, compressor, limiter, EQ, voices, automation and patch loading; a catalogue of its node types, patch documents that are edited as data, and live parameter edits |
 | `cubed-simd` | The slice of `std::simd` the crates above use, on stable Rust |
-| `cubed-mixer` | A game audio mixer: named buses with faders, mute/solo, inserts (built-in `effects` with live parameters), sends and ducking; clip voices and sources (chip songs, streams, synth patches played by note events), 2D/3D placement with doppler, long fades, meters; nothing allocates while it runs. `native` adds a cpal output host and streams fed from another thread; `songs` plays AHX/HVL, A2M and SID songs and MOD/S3M/XM modules as sources (a module can be steered and read while it plays); `wire` encodes its commands as bytes |
+| `cubed-mixer` | A game audio mixer: named buses with faders, mute/solo, inserts (built-in `effects` with live parameters, among them a ten-band parametric `eq`), sends and ducking; clip voices and sources (chip songs, streams, synth patches played by note events), 2D/3D placement with doppler, long fades, meters; nothing allocates while it runs. `native` adds a cpal output host and streams fed from another thread; `songs` plays AHX/HVL, A2M and SID songs and MOD/S3M/XM modules as sources (a module can be steered and read while it plays); `wire` encodes its commands as bytes |
 | `cubed-worklet` | `cubed-mixer` as a wasm module for a browser AudioWorklet (raw exports, no JS glue) and its processor, `js/cubed-worklet.js` |
 | `cubed-rt-check` | Tests only: every render path checked for allocations with a counting allocator |
 
@@ -128,6 +128,67 @@ native swap's `PlaySource`, `FadeVoice` and `Stop` are ordinary `'commands'`. Fo
 `cw_swap_play_buffer`, `cw_swap_begin(source, one_shot, old_voice: f64, fade_frames, warm_blocks,
 slice_blocks, held_count)`, `cw_warm_step(frames)` (call it ahead of `cw_process` each quantum:
 0 idle, 1 warming, 2 took over, 3 given up), `cw_swap_old`, `cw_swap_new`, `cw_swap_pending`.
+
+## The mixer's effects and the equaliser
+
+A bus's inserts are `cubed_mixer::EffectKind`s, plain data (a kind and its parameters in
+the order of `kind.params()`) that `Effect::build` turns into an insert off the audio thread and
+`Command::SetInsertParam` changes while it runs: `reverb`, `delay`, `low_pass`, `high_pass`,
+`compressor`, `limiter`, `chorus`, `saturation`, `bitcrusher` and `eq`. A kind's number in the byte
+protocol (`EffectKind::index`) is its place in `EffectKind::ALL`, so new kinds go last. `MAX_PARAMS`
+is the most parameters any has: 6 until the equaliser, 52 now. `params()` lists each parameter's
+`name`, range, default and unit.
+
+**The equaliser** (`EffectKind::Eq`, `"eq"`; `cubed_mixer::eq`) is the DAW's post-fx equaliser
+(another_synth's `eq-math.ts` / `eq-stage.ts`) as an insert: ten bands in series, stereo, with the
+DAW's layout as its defaults: a low shelf at 31 Hz, peaking bands at 62, 125, 250, 500 Hz and 1, 2,
+4, 8 kHz (Q 0.7) and a high shelf at 16 kHz, all flat.
+
+| Parameter | Range | Default | |
+|---|---|---|---|
+| `bypass` | 0 or 1 | 0 | 1 crossfades to the dry signal in 5 ms (the filters keep running, so switching back is seamless) |
+| `graphic` | 0 or 1 | 0 | 1: the gains are the *curve you see* (below) |
+| `band1_freq_hz` .. `band10_freq_hz` | 20 - 20,000 Hz | 31, 62, 125, 250, 500, 1k, 2k, 4k, 8k, 16k | the centre of a peaking band, the corner of a shelf (held below 0.49 of the sample rate) |
+| `bandN_gain_db` | -24 - 24 dB | 0 | in graphic mode limited to +-12 dB, as in the DAW |
+| `bandN_q` | 0.1 - 10 | 0.7 (bands 1 and 10: 0.7071) | 0.7071 is a shelf of slope 1, the one Web Audio's `BiquadFilterNode` always makes |
+| `bandN_enabled` | 0 or 1 | 1 | a disabled band is flat (and costs nothing) |
+| `bandN_type` | 0 low shelf, 1 peaking, 2 high shelf | 0 for band 1, 2 for band 10, else 1 | changing it is not smoothed |
+
+The filters are the RBJ cookbook biquads the DAW computes, in transposed direct form II in `f64`.
+A band's gain, frequency and Q glide to a new value (time constant 6.7 ms, the DAW's) and the
+coefficients ramp sample by sample between designs made every 32 frames, so editing a parameter
+live does not click, even a fast sweep of several bands; a band at 0 dB is skipped and a flat
+equaliser passes the signal through unchanged. States that decay to nothing are flushed, so a
+tail does not end in denormals. Nothing allocates after `build`: `set_param` records the value,
+and the next block retargets the bands once for however many changed.
+
+**Graphic mode** is the DAW's curve editor. Octave-spaced bands overlap, so applying the gains as
+they are stacks neighbours (a flat +6 on every band comes out near +9, with scallops between the
+centres). With `graphic` = 1 the band gains are targets of a smooth curve through the band
+centres, and the gains that are applied are the DAW's `eqEffectiveGains`: a weighted least-squares
+fit of the combined response to that curve, nodes weighted heavily, four Gauss-Newton steps, the
+solved gains limited to +-24 dB. It works for any frequencies, Qs and types (the enabled bands,
+sorted by frequency, are the nodes). The fit is solved on the audio thread when a parameter
+changed (a block that solves it takes about 40 us in release, 70 us at worst, where a block
+with ten active bands and nothing to solve takes about 6 us), allocates nothing and is rebuilt only when a frequency, Q, type or
+switch changed, not for a gain. `cubed_mixer::eq::response_db(params, sample_rate, hz, out)`
+gives the combined response in dB for a curve display (it allocates).
+
+From the worklet the page sends `{type: 'effect', bus, slot, kind: 9, params: Float32Array}` with
+the parameters in the order above (`bypass`, `graphic`, then for each band `freq_hz`, `gain_db`,
+`q`, `enabled`, `type`); any it leaves off are the defaults (`cw_effect_defaults`), and
+`cw_effect_param_count()` is how many a message can carry (the processor reads that many; a
+wasm built before it carried 6). Changes after that are `SetInsertParam` commands (the wire is
+unchanged: its parameter number is a `u8`).
+
+Checks: `tests/eq/main.rs` compares the response and the fitted gains with what the DAW's
+TypeScript computes (`tests/eq/daw_reference.mjs` runs `eq-math.ts` under Node and writes
+`tests/eq/reference.rs`; the fitted gains agree to 1e-6 dB, the responses to 2e-6 dB), plays sines
+through the real filters at the band centres and in between, at 22.05 to 96 kHz, and checks the
+flat, live-change, bypass and denormal behaviour; `rt-check`'s `mixer_eq` moves every kind of
+parameter every block and counts allocations; and the worklet page test renders the equaliser
+in a real browser against a chain of the browser's own `BiquadFilterNode`s set up as the DAW's
+`EqStage` is (relative error 4e-5, -88 dB).
 
 ## Analysis: taps, spectrum, levels
 
@@ -956,6 +1017,8 @@ cargo test -p cubed-sid --test sng_write            # CUBED_SNG_WRITE_ORACLE=<js
 cargo test -p cubed-rt-check --test sid_controls    # the controls allocate nothing
 cargo test -p cubed-sid --test psid                 # PSID/RSID: CUBED_PSID=<dir>, CUBED_PSID_ORACLE=<json>
 cargo test -p cubed-rt-check --test psid_alloc      # the PSID player allocates nothing
+cargo test -p cubed-mixer --test eq                 # the equaliser against the DAW's numbers
+node crates/mixer/tests/eq/daw_reference.mjs <another_synth checkout> > crates/mixer/tests/eq/reference.rs
 cargo bench -p cubed-opl --bench opl_render
 cargo bench -p cubed-ahx --bench ahx_render
 cargo bench -p cubed-dsp --bench patch_render

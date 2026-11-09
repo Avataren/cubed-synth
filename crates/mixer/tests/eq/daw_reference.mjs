@@ -4,7 +4,7 @@
 //   node crates/mixer/tests/eq/daw_reference.mjs [path to another_synth] > crates/mixer/tests/eq/reference.rs
 //
 // Needs Node 22.18 or newer (it imports the .ts file directly). The checkout defaults to
-// ~/src/rust/another_synth. The numbers are in the test, so nothing needs Node or the DAW to
+// ~/src/rust/another_synth. Run `cargo fmt` over the result. The numbers are in the test, so nothing needs Node or the DAW to
 // run the tests; run this only when the DAW's equaliser changes.
 import { homedir } from 'node:os';
 import { join } from 'node:path';
