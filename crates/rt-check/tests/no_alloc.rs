@@ -1025,6 +1025,96 @@ fn daw_patch() {
     });
 }
 
+/// A patch with a sample (looping, ping-pong) and a 16-frame wavetable put in through the edit
+/// layer, played on 4 voices while the table's position, the loop and the root note are edited:
+/// the render path with the assets allocates nothing.
+#[test]
+fn synth_with_a_sample_and_a_wavetable() {
+    use cubed_dsp::audio_engine::native::AudioEngine as Native;
+    use cubed_dsp::live::ParamEdit;
+    use cubed_dsp::patch_edit::PatchDoc;
+    use cubed_dsp::wav::{base64_encode, encode_wav_i16};
+    use serde_json::json;
+
+    let mut doc = PatchDoc::new("assets");
+    let mixer = doc
+        .nodes()
+        .into_iter()
+        .find(|n| n.type_name == "mixer")
+        .unwrap()
+        .id;
+    let sampler = doc.add_node("sampler").unwrap();
+    let table = doc.add_node("wavetable_oscillator").unwrap();
+    for node in [&sampler, &table] {
+        doc.connect(
+            node,
+            PortId::AudioOutput0,
+            &mixer,
+            PortId::AudioInput0,
+            1.0,
+            2,
+            0,
+        )
+        .unwrap();
+    }
+    let samples: Vec<f32> = (0..24_000)
+        .map(|n| 0.5 * (n as f32 * 0.07).sin() + 0.2 * (n as f32 * 0.31).sin())
+        .collect();
+    doc.apply(
+        &json!({"op": "load_sample", "node": sampler, "root_note": 60,
+        "data": base64_encode(&encode_wav_i16(&samples, 1, 48_000))}),
+    )
+    .unwrap();
+    doc.apply(
+        &json!({"op": "set_sample", "node": sampler, "loop_mode": "pingpong",
+        "loop_start": 0.2, "loop_end": 0.8}),
+    )
+    .unwrap();
+    doc.apply(
+        &json!({"op": "wavetable_preset", "node": table, "preset": "pulsePWM", "frames": 16}),
+    )
+    .unwrap();
+    doc.set_voice_count(4).unwrap();
+
+    let mut engine = Native::new_with_block_size(RATE as f32, 4, BLOCK);
+    let voices = engine
+        .init_with_patch(&doc.to_json())
+        .expect("the patch loads");
+    let mut frame = AutomationFrame::with_dimensions(voices, 4, BLOCK);
+    let (mut left, mut right) = ([0f32; BLOCK], [0f32; BLOCK]);
+    let edit = |doc: &mut PatchDoc, id: &str, key: &str, value: f64| -> ParamEdit {
+        doc.set_param(id, key, &json!(value)).unwrap().edit.unwrap()
+    };
+    let mut edits = vec![
+        edit(&mut doc, &table, "wave_index", 0.0),
+        edit(&mut doc, &table, "wave_index", 1.0),
+        edit(&mut doc, &sampler, "rootNote", 48.0),
+        edit(&mut doc, &sampler, "loopMode", 1.0),
+        edit(&mut doc, &sampler, "loopStart", 0.4),
+        edit(&mut doc, &sampler, "loopEnd", 0.6),
+        edit(&mut doc, &table, "wave_index", 0.5),
+    ];
+    edits.reverse();
+    assert_no_alloc("a sample and a wavetable", 5, |block| {
+        for voice in 0..voices {
+            let gate = if (block / 47 + voice) % 2 == 0 {
+                1.0
+            } else {
+                0.0
+            };
+            frame.set_voice_values(voice, gate, 110.0 * 2f32.powf(voice as f32 / 3.0), 1.0, 1.0);
+        }
+        if block >= WARMUP_BLOCKS && block % 60 == 0 {
+            if let Some(e) = edits.pop() {
+                engine.edit_param(e).unwrap();
+            }
+        }
+        engine.fill_macro_values(&mut frame);
+        engine.process_with_frame_instrument(&frame, &mut left, &mut right);
+    });
+    assert!(edits.is_empty(), "every edit was sent");
+}
+
 fn synth_patch(voices: usize) -> Result<AudioEngine, String> {
     let rate = RATE as f32;
     let mut engine = AudioEngine::new_with_block_size(rate, voices, BLOCK);

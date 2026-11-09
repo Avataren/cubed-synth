@@ -65,7 +65,9 @@ modulation, transform)` (an upsert; refuses unknown nodes and ports, loops, a co
 signal into an audio input and the inputs the engine wires), `disconnect`, `set_amount`,
 macro values and routes, `set_instrument_gain`, `set_voice_count`, effects
 (`add_node` of an effect type, `remove_node`, `move_effect`), `set_editor`, `validate`,
-`to_json`; `apply(&Value)` runs the same operations from a JSON description. Two keys are
+`to_json`; `apply(&Value)` runs the same operations from a JSON description (and
+`query(&Value)` answers reads). A sampler's sample and a wavetable oscillator's table are
+operations too, with an opt-in undo: "Samples and wavetables in patches", below. Two keys are
 the editor's: `editor` at the top (positions, view; kept untouched through edits, saving and
 loading) and `synthState.effectChain` (the effects in processing order as ids; a patch
 without it has the DAW's fixed chain, `"10000"` to `"10007"`). A connection may carry
@@ -128,6 +130,131 @@ native swap's `PlaySource`, `FadeVoice` and `Stop` are ordinary `'commands'`. Fo
 `cw_swap_play_buffer`, `cw_swap_begin(source, one_shot, old_voice: f64, fade_frames, warm_blocks,
 slice_blocks, held_count)`, `cw_warm_step(frames)` (call it ahead of `cw_process` each quantum:
 0 idle, 1 warming, 2 took over, 3 given up), `cw_swap_old`, `cw_swap_new`, `cw_swap_pending`.
+
+## Samples and wavetables in patches
+
+A sampler node plays a sample and a wavetable oscillator plays a table of frames; both live in the
+patch's `audioAssets`, in the DAW's own encoding, so the DAW reads a patch back. `PatchDoc` edits them
+(`cubed_dsp::patch_edit`, with `wav` and `wavetable_edit` for the decoding and the DAW's wavetable
+generation). Everything is `apply(op)` (a change) or `query(question)` (a read: `apply` refuses one
+by name, because a host would take it for a change and rebuild the synth).
+
+**Encoding.** `audioAssets["sample_<node id>"]` is `{id, type: "sample", base64Data, sampleRate,
+channels, rootNote, fileName?, duration}`: `base64Data` is the base64 text of a **16-bit PCM WAV**
+(the DAW's `float32ArrayToWav`: `round(x * 32768)`, clamped; a 16-bit file goes through unchanged;
+a 24-bit or float source is rounded to it). The node's state (`synthState.samplers[id]`) keeps
+`sampleLength` (frames), `sampleRate`, `channels`, `fileName`. `audioAssets["wavetable_<node id>"]`
+is `{id, type: "wavetable", base64Data, sampleRate: 44100, channels: 1, fileName?, duration}`,
+`base64Data` a **mono 32-bit float WAV**, 44-byte header, `frames * 2048` samples (the DAW's
+`encodeWavFile`; its engine cuts the file into frames of 2048, `import_wavetable(node, bytes, 2048)`),
+at most 256 frames. The oscillator's `wave_index` (0 to 1, an ordinary parameter, live) morphs along
+the frames. A wavetable node without the asset plays the built-in table: sine, triangle, saw and
+square as four frames; editing a frame of it makes the asset from those four. The frames are the
+whole truth (the DAW's editor does not keep its keyframes either): a frame is edited as samples or as
+harmonics (`wavetable_harmonics` reads a frame's harmonics back, so the editor needs no recipe). The
+native loader now imports `wavetable_*` assets (it skipped them), and applies a sampler's state
+again after its sample so the root note holds (the sample's own data had lost it).
+
+**Sampler operations** (`apply`; `node` is the sampler's id):
+
+- `load_sample`: `data` (base64 of a WAV file, 8/16/24/32-bit PCM or float, mono or stereo; or of
+  raw PCM when `format` is `i16`/`u8`/`i24`/`i32`/`f32` or `rate` is given) or `samples` (numbers,
+  interleaved, with `rate`, `channels`); `mix` (to mono), `normalize` (`true` or a peak above 0 up
+  to 1), `root_note` (0 to 127; else the node's), `name`, `peaks` (buckets of a waveform to answer
+  with). At most 16 Mi numbers; more than 2 channels needs `mix`. The loop points go back to the
+  whole sample. Answers `{asset, frames, rate, channels, duration, peak, root_note, name, bytes,
+  mixed, peaks?}`.
+- `clear_sample` (`{cleared}`): the node plays its built-in tone again.
+- `set_sample`: `root_note`, `loop_mode` (`off`/`loop`/`pingpong`), `loop_start`, `loop_end` (0 to 1 of
+  the sample, or frames with `unit: "frames"`; moving the start past the end pushes the end on and the
+  end stays 0.0005 after the start, as the DAW's sliders do), `gain` (0 to 1.5), `octave`,
+  `semitones`, `cents`, `trigger` (`free`/`gate`/`oneshot`), `active`. All are checked before any
+  is set. Answers `{state, edits}`: `edits` has a `{node, param, value}` (a `ParamEdit`) for each
+  thing that changed, which a host can send to a playing synth instead of rebuilding it (the
+  same fields are ordinary parameters for `set_param`).
+
+Sampler loop points are now **fractions** of the sample's length in the node, as the patch, the
+catalogue and the DAW's panel say (the node read them as frame numbers, so a looping sampler with
+the default loop end of 1 looped one frame).
+
+**Wavetable operations** (`node` is the oscillator's id; an answer is `{asset, frames, size: 2048,
+bytes, peak}` unless it says otherwise):
+
+- `set_wavetable`: `frames` (lists of numbers; `format: "i16"` for 16-bit integers) or `wav` (base64 of
+  a WAV file, cut into frames of `size` samples, 2048 by default); `size` is the length of the frames
+  given, 4 or more, equal for all, stored at 2048 (band-limited resampling, so a smooth cycle stays
+  smooth); `normalize`, `remove_dc` (per frame, as `processWaveform`), `name`. More than 256 frames
+  are cut (`truncated: true`).
+- `wavetable_preset`: `preset` is one of the editor's twelve (`analogPWM`, `pulsePWM`, `sine`,
+  `harmonicSeries`, `square`, `sawtooth`, `triangle`, `brightBrass`, `warmPad`, `vocalFormant`,
+  `metallicBell`, `evolvingTexture`; any case, `_`/`-`/space allowed, `saw`, `pwm`), `pulse`, `organ`,
+  or `default` (the built-in four). `harmonics` (1 to 1024, default 32), `frames` (default 256 for a
+  preset that moves, else 1), `remove_dc` (false), `normalize` (true): the editor's Apply.
+- `wavetable_from_keyframes`: `keyframes` `[{time 0..100, harmonics: [amplitude | {amplitude, phase}]}]`,
+  `warps` `[{time, x_amount, y_amount, asymmetric}]` (-4 to 50), `frames` (256), `remove_dc`,
+  `normalize`: `generateWavetableWav`.
+- `wavetable_from_harmonics`: `harmonics` (amplitudes, with `phases`, or objects), `frame` (default 0,
+  or `"all"`), `normalize` (true), `remove_dc`; with no table yet it makes one of `frames` (1) copies.
+- `set_frame` (`frame`, `values`, `size`, `format`, `normalize`, `remove_dc`), `insert_frame` (`at`,
+  `source`), `copy_frame` (`from`, `to`), `delete_frame` (the last stays), `interpolate_frames` (`from`,
+  `to`), `wavetable_warp` (`frame` or all, `x_amount`, `y_amount`, `asymmetric`), `normalize_wavetable`,
+  `clear_wavetable` (`{cleared}`), `set_frame_position` (`frame`: sets `wave_index` so the oscillator
+  plays that frame; answers as `set_param` does, with its `edit`).
+
+The generation is the DAW's `WavetableUtils.ts` in `f64` (harmonic sums, warp, keyframe and warp
+interpolation, `processWaveform` with its peak taken before the DC is removed, the presets as the
+editor's `handlePresetChange`); `tests/wavetable_reference.rs` compares it with numbers the
+TypeScript produces (`tests/fixtures/make_wavetable_reference.py` makes them from the DAW's own files).
+
+**Queries** (`{"query": name, ...}`): `sample_info` (`{loaded, asset, name, frames, rate, channels,
+duration, peak, bytes, root_note, loop_mode, loop_start, loop_end` (fractions)`, loop_start_frame,
+loop_end_frame, gain, trigger, octave, semitones, cents, active}`), `sample_peaks` (`buckets` up to 8192,
+default 256, `from`, `to` in frames: `{from, to, frames, buckets, min: [..], max: [..]}`, for drawing),
+`sample_wav` (`{data` (the asset's WAV, base64)`, name, rate, channels, frames, bytes}`),
+`wavetable_info` (`{loaded, builtin, frames, size, peak, position, name?, bytes?}`), `wavetable`
+(`from`, `count`, `size` points a frame: `{frames, size, from, data: [[..]]}`), `wavetable_preview`
+(`frame`, or `position` (0 to 1, blended as `wave_index` does), or the node's own; `points` 2 to 4096,
+default 256: `{points, data, peak}`), `wavetable_harmonics` (`frame`, `count`: `{amplitudes,
+phases}` in the editor's convention, `sin(2 pi h i / n + phase)`), `wavetable_presets`, `history`.
+The decoded asset is kept (a few at a time), so a read after the first is cheap.
+
+**Undo.** `PatchDoc` had none (the Synth Studio editor keeps whole-JSON snapshots, which would copy
+megabytes per step). `{"op": "set_history", "steps": 100}` switches an opt-in history on (0 switches it
+off); then `undo` and `redo` ops, `history` query (`{enabled, steps, undo, redo, next_undo, next_redo,
+asset_bytes}`). A step is the document without its assets and its `editor` key as it was before (tens of
+kilobytes), and the asset entries the operation put in, took out or replaced, *moved* into the step
+(never copied): undoing swaps the step with the document, which makes it the redo step. An asset
+change is one step. At most `steps` steps and 128 MiB of replaced assets are kept, oldest dropped
+first. An operation with `"group": "<key>"` equal to the one before it joins that step and the assets
+it replaced are dropped at once (a drag over a wavetable holds one old table). `set_editor` is never a
+step and an undo leaves the `editor` as it is. `apply` is what records; the Rust methods
+(`add_node`, ...) do not. A clone has no history, and `set_json`-style replacement starts without it.
+
+**Live.** A sample load or a wavetable edit is a structural change for a playing synth: the host builds
+a new `SynthSource` from `to_json()` and swaps it in (the `classify` of a host that does not know the
+operation rebuilds, which is right for all of these; `set_sample`'s `edits` and `set_frame_position`'s
+`edit` can be sent as `SourceEvent::Param` instead, and so can `set_param` on `wave_index`, `loopStart`,
+`rootNote` and the rest: a parameter, never a rebuild). A frame's mip levels are built once and shared
+between engines (`morph_wavetable::mipmapped_frame`, a cache of up to 96 MiB, 24 on `wasm32`), so
+a rebuild after one frame changed builds that frame only. Measured (release, native, this
+machine): a rebuild of a patch with a 256-frame table: 47 ms the first time, 13 ms after
+(15 ms after one frame was edited); `wavetable_preset` of 256 frames 55 ms, `set_frame` 5 ms, a
+harmonics frame 3 ms, a preview 0.1 ms; `load_sample` of 10 s stereo 19 ms (2.3 MB of base64),
+`sample_peaks` 2 ms (17 ms for the first read of a loaded patch); `set_param` with the history on
+34 microseconds. A patch of 5 MB (12 s stereo sample, 256-frame table) builds in 59 ms the first
+time and 30 ms after. On the web the page's wasm edits the document and sends `to_json()` in a
+`'swap'` message: the worklet's `cw_file_buffer` takes any size (the swap test in `cubed-worklet`
+sends 5 MB), but the build runs in the message handler, on the audio thread, so a wasm build is
+a stall of about 2 to 3 times the native one (tens of milliseconds for a big patch): keep tables to
+the frames they need (32 frames builds in a few milliseconds), and the host's 30 ms debounce of
+structural edits matters. The render path allocates nothing with a sample and a table
+(`cubed-rt-check`, `synth_with_a_sample_and_a_wavetable`); `cargo check --target wasm32-unknown-unknown
+-p cubed-dsp` passes.
+
+**Not done:** a wavetable edit is a rebuild, not an in-place swap (that wants a command that carries
+the table to the audio thread, in the wire protocol and the worklet); a sample has no cut, fade,
+reverse or crop operations (`load_sample` takes the audio already prepared); no resampling of samples;
+a sample is stored as 16-bit.
 
 ## Analysis: taps, spectrum, levels
 

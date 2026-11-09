@@ -1811,4 +1811,153 @@ mod tests {
         assert_eq!(cw_prepare_song(0, 3, 0, 1, -1.0), 1);
         assert_eq!(cw_song_count(), 0, "the slot holds another song now");
     }
+    /// A patch that plays a sampler's sample (a sine of `hz`, `seconds` of 48 kHz stereo) and
+    /// carries a 256-frame wavetable on a silent wavetable oscillator: about 6 MB of JSON, what
+    /// an editor sends after a sample was loaded into a patch that has a big table.
+    fn heavy_patch(hz: f32, seconds: usize) -> Vec<u8> {
+        use cubed_dsp::patch_edit::PatchDoc;
+        use cubed_dsp::traits::PortId;
+        use cubed_dsp::wav::{base64_encode, encode_wav_i16};
+        use serde_json::json;
+        let mut doc = PatchDoc::new("heavy");
+        let find = |doc: &PatchDoc, t: &str| {
+            doc.nodes()
+                .into_iter()
+                .find(|n| n.type_name == t)
+                .unwrap()
+                .id
+        };
+        let (osc, mixer) = (find(&doc, "oscillator"), find(&doc, "mixer"));
+        doc.set_param(&osc, "active", &json!(false)).unwrap();
+        let sampler = doc.add_node("sampler").unwrap();
+        doc.connect(
+            &sampler,
+            PortId::AudioOutput0,
+            &mixer,
+            PortId::AudioInput0,
+            1.0,
+            2,
+            0,
+        )
+        .unwrap();
+        let frames = 48_000 * seconds;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for n in 0..frames {
+            let x = 0.6 * (std::f32::consts::TAU * hz * n as f32 / 48_000.0).sin();
+            samples.push(x);
+            samples.push(x);
+        }
+        doc.apply(
+            &json!({"op": "load_sample", "node": sampler, "root_note": 69,
+            "data": base64_encode(&encode_wav_i16(&samples, 2, 48_000))}),
+        )
+        .unwrap();
+        doc.apply(&json!({"op": "set_sample", "node": sampler, "loop_mode": "loop"}))
+            .unwrap();
+        let table = doc.add_node("wavetable_oscillator").unwrap();
+        doc.set_param(&table, "gain", &json!(0.0)).unwrap();
+        doc.apply(
+            &json!({"op": "wavetable_preset", "node": table, "preset": "analogPWM", "frames": 256}),
+        )
+        .unwrap();
+        doc.to_json().into_bytes()
+    }
+
+    /// Rising zero crossings a second in what was rendered.
+    fn pitch_of(out: &[f32]) -> f32 {
+        let crossings = out.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        crossings as f32 / (out.len() as f32 / 48_000.0)
+    }
+
+    fn render_quanta(n: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            cw_process(128);
+            // SAFETY: the output buffers hold BLOCK floats.
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(cw_left(), BLOCK) });
+        }
+        out
+    }
+
+    /// A patch of many megabytes (a long stereo sample, a 256-frame wavetable) goes through
+    /// `cw_file_buffer` and the sliced swap like a small one: the worklet's buffers take any
+    /// size, the new synth plays the new sample, and the old voice keeps going until it takes over.
+    #[test]
+    fn a_patch_of_megabytes_is_prepared_and_swapped_in() {
+        use cubed_mixer::{PlaySource, SourceEvent, SourceId, VoiceId};
+        let _turn = exports();
+        cw_init(48_000.0, 0, 0, 0, 15, 16);
+        send(Command::SetBus(BusId(1), BusSettings::default()));
+        let first = heavy_patch(1000.0, 12);
+        assert!(first.len() > 5_000_000, "{} bytes of JSON", first.len());
+        put(&first);
+        let started = std::time::Instant::now();
+        assert_eq!(cw_prepare_synth(0, 0), 1, "the patch builds");
+        eprintln!(
+            "prepare of {} MB of patch: {:?}",
+            first.len() / 1_000_000,
+            started.elapsed()
+        );
+        send(Command::PlaySource(PlaySource::new(
+            VoiceId(1),
+            SourceId(0),
+            BusId(1),
+        )));
+        send(Command::SourceEvent {
+            voice: VoiceId(1),
+            event: SourceEvent::NoteOn {
+                note: 69,
+                velocity: 1.0,
+                duration: 0,
+            },
+        });
+        let before = render_quanta(300);
+        let hz = pitch_of(&before[before.len() / 3..]);
+        assert!(
+            (hz - 1000.0).abs() < 40.0,
+            "the sample is heard at 1 kHz: {hz}"
+        );
+
+        // Swap in a patch with another sample: a sliced warm-up, the old voice sounds meanwhile.
+        put(&heavy_patch(2500.0, 12));
+        put_play(&PlaySource::new(VoiceId(2), SourceId(1), BusId(1)));
+        put_held(&[(69.0, 1.0)]);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            cw_swap_begin(1, 0, 1.0, 600, 400, 4, 1),
+            1,
+            "the swap begins"
+        );
+        eprintln!(
+            "swap begin with {} MB of patch: {:?}",
+            first.len() / 1_000_000,
+            started.elapsed()
+        );
+        let mut played = Vec::new();
+        let mut warming = 0;
+        loop {
+            let step = cw_warm_step(128);
+            cw_process(128);
+            // SAFETY: the output buffers hold BLOCK floats.
+            played.extend_from_slice(unsafe { std::slice::from_raw_parts(cw_left(), BLOCK) });
+            if step == 2 {
+                break;
+            }
+            assert_eq!(step, 1);
+            warming += 1;
+            assert!(warming < 600, "it never finished");
+        }
+        let old_voice = pitch_of(&played[played.len() / 4..played.len() / 2]);
+        assert!(
+            (old_voice - 1000.0).abs() < 40.0,
+            "the old voice plays on while it warms: {old_voice}"
+        );
+        let after = render_quanta(300);
+        let hz = pitch_of(&after[after.len() / 2..]);
+        assert!(
+            (hz - 2500.0).abs() < 80.0,
+            "the new sample is heard at 2.5 kHz: {hz}"
+        );
+        assert_eq!(cw_bad_batches(), 0);
+    }
 }
