@@ -9,10 +9,15 @@ use cubed_dsp::nodes::morph_wavetable::frame_cache_stats;
 use cubed_dsp::patch_edit::PatchDoc;
 use cubed_dsp::traits::PortId;
 use serde_json::json;
+use std::sync::Mutex;
 use std::time::Instant;
+
+/// The two tests build tables; the cache counts are only the first test's if they take turns.
+static TURN: Mutex<()> = Mutex::new(());
 
 #[test]
 fn a_rebuild_builds_only_the_frames_that_changed() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut doc = PatchDoc::new("cache");
     let wt = doc.add_node("wavetable_oscillator").unwrap();
     let mixer = doc
@@ -70,6 +75,7 @@ fn a_rebuild_builds_only_the_frames_that_changed() {
 
 #[test]
 fn what_the_operations_cost() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     use cubed_dsp::wav::{base64_encode, encode_wav_i16};
     let mut doc = PatchDoc::new("cost");
     let wt = doc.add_node("wavetable_oscillator").unwrap();
