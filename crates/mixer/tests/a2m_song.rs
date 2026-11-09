@@ -500,21 +500,15 @@ fn a_controlled_song_stops_at_its_end_instead_of_ending() {
 }
 
 #[test]
-fn the_formats_not_under_control_yet_say_so() {
-    for format in [SongFormat::Ahx, SongFormat::Sid] {
-        let error = open_controlled_song(format, &[0; 16], RATE, SongOptions::default(), true)
-            .err()
-            .expect("refused");
-        assert!(error.contains("live control"), "{error}");
+fn a_song_that_is_not_one_is_refused_in_every_controlled_format() {
+    // Every format is under live control now (the trait's README says how): bytes that are no song of the
+    // format are an error, not a silent voice.
+    for format in [SongFormat::A2m, SongFormat::Ahx, SongFormat::Sid] {
+        assert!(
+            open_controlled_song(format, b"not a song", RATE, SongOptions::default(), true).is_err(),
+            "{format:?}"
+        );
     }
-    assert!(open_controlled_song(
-        SongFormat::A2m,
-        b"not a song",
-        RATE,
-        SongOptions::default(),
-        true
-    )
-    .is_err());
 }
 
 #[test]
