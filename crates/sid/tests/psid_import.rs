@@ -345,7 +345,15 @@ fn oracle() {
             (Ok(r), true) if r.song.to_bytes() == unbase64(want["asid"].as_str().unwrap()) => {
                 same += 1
             }
-            (Err(e), false) if e == want["reason"].as_str().unwrap_or("") => same += 1,
+            // (The DAW's text for a BASIC program says "importer" where this crate's, like the player's, says "player".)
+            (Err(e), false)
+                if e == want["reason"]
+                    .as_str()
+                    .unwrap_or("")
+                    .replace("this importer", "this player") =>
+            {
+                same += 1
+            }
             _ => differ.push(path.clone()),
         }
     }
