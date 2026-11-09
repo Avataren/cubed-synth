@@ -405,6 +405,7 @@ pub fn measure_fidelity(
             subsong: 0,
             max_ticks: None,
             max_seconds: Some(seconds),
+            cancel: None,
         },
         kernal,
     )?;

@@ -32,6 +32,8 @@ use super::super::runner::{
     RETURN_TRAP,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Per voice per tick, `SidTrace::voice_events` bits: a 0 -> 1 gate edge.
 pub const SID_EVENT_GATE_ON: u8 = 1;
@@ -96,7 +98,7 @@ pub struct SidTrace {
 }
 
 /// What a capture is asked to do.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CaptureOptions {
     /// 0-based.
     pub subsong: usize,
@@ -104,6 +106,15 @@ pub struct CaptureOptions {
     pub max_ticks: Option<usize>,
     /// At most this much emulated time, in seconds (default 600).
     pub max_seconds: Option<f64>,
+    /// Set from another thread to stop the capture (it ends with the reason [`CANCELLED`]).
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+/// The reason a capture, and an import, ends with when its `cancel` flag was set.
+pub const CANCELLED: &str = "the import was cancelled";
+
+pub(crate) fn cancelled(flag: &Option<Arc<AtomicBool>>) -> bool {
+    flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
 pub(crate) fn hex4(v: u16) -> String {
@@ -348,6 +359,9 @@ pub fn capture_sid_with(
             .unwrap_or_else(|| ((600.0 * hz) / tick_cycles as f64).ceil() as usize);
         let mut next = machine.cpu.cycles;
         while store.ticks < max_ticks {
+            if cancelled(&options.cancel) {
+                return Err(CANCELLED.to_string());
+            }
             machine.idle_to(next);
             machine.set_banks(psid_banks_for(file.play_address));
             rec.tick_writes = 0;
@@ -488,7 +502,12 @@ fn run_interrupt_driven(
         }};
     }
 
+    let mut spins = 0u32;
     while store.ticks < max_ticks {
+        spins = spins.wrapping_add(1);
+        if spins & 0xfff == 0 && cancelled(&options.cancel) {
+            return Err(CANCELLED.to_string());
+        }
         if (machine.cpu.cycles - start) as f64 > max_cycles {
             end = Some(CaptureEnd::Cycles);
             break;

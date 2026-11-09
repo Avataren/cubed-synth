@@ -217,6 +217,50 @@ fn what_cannot_be_imported_is_refused_with_the_reason() {
 }
 
 #[test]
+fn an_import_can_be_cancelled_from_another_thread() {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let opts = ImportOptions {
+        cancel: Some(cancel),
+        ..Default::default()
+    };
+    assert_eq!(import(TUNE, &opts).unwrap_err(), "the import was cancelled");
+    assert_eq!(import(IRQ, &opts).unwrap_err(), "the import was cancelled");
+}
+
+#[test]
+fn damaged_tunes_are_refused_or_imported_never_a_panic() {
+    // A deterministic scramble of the tunes' bytes: whatever runs, the import ends with a song or a reason.
+    let mut x: u32 = 0x1234_5678;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x
+    };
+    for (name, base) in FIXTURES {
+        for round in 0..24 {
+            let mut bytes = base.to_vec();
+            for _ in 0..1 + round % 5 {
+                let at = 0x7c + 2 + next() as usize % (bytes.len() - 0x7c - 2);
+                bytes[at] = next() as u8;
+            }
+            if round % 6 == 5 {
+                bytes.truncate(0x7c + 2 + next() as usize % (bytes.len() - 0x7c - 2));
+            }
+            let opts = ImportOptions {
+                max_seconds: Some(4.0),
+                ..Default::default()
+            };
+            if let Ok(r) = import(&bytes, &opts) {
+                r.song
+                    .validate()
+                    .unwrap_or_else(|e| panic!("{name} round {round}: {e}"));
+            }
+        }
+    }
+}
+
+#[test]
 fn the_song_is_the_one_the_daws_importer_makes() {
     let expected: Value = serde_json::from_str(EXPECTED).unwrap();
     for (name, bytes) in FIXTURES {

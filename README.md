@@ -1037,9 +1037,10 @@ r.report.used_gt_unpack;      // GoatTracker's own song data read back, not tran
 let (doc, report) = SidDoc::from_psid(&bytes, &ImportOptions::default())?;   // the same as a document
 ```
 
-`ImportOptions { subsongs, max_seconds, measure, gt_unpack }`: the subsongs to import (0-based, default the start song
+`ImportOptions { subsongs, max_seconds, measure, gt_unpack, kernal, cancel }`: the subsongs to import (0-based, default the start song
 first, then the rest, up to GoatTracker's 32), the capture cap per subsong (default 600 s of emulated time, as the
-DAW), whether to measure the fidelity (default yes) and whether to recognise GoatTracker's tunes (default yes).
+DAW), whether to measure the fidelity (default yes), whether to recognise GoatTracker's tunes (default yes), the stand-in KERNAL
+(below) and a cancel flag.
 `ImportReport { fidelity, notes, warnings, used_gt_unpack, exact, subsong, frames, subsongs }`: `subsongs` has one
 `SubsongReport` per PSID subsong (where it went, why it was left out, its rows, loop, grid, capture).
 
@@ -1107,7 +1108,7 @@ The two messages that name the program (a BASIC RSID) say "player" where the DAW
 the fidelity. **Known gaps**, the DAW's too: the song is GoatTracker's model, so what it cannot say is left out (samples
 played through the volume register, more than one SID, a player's own tuning, a subsong at another speed than the start
 song's), each said in `report.notes`; a transcription approximates the original and can sound noticeably different (the
-fidelity compares registers frame by frame, not what the ear hears); no cancellation or progress callback yet.
+fidelity compares registers frame by frame, not what the ear hears); `ImportOptions::cancel` (an `Arc<AtomicBool>`) stops an import from another thread, but there is no progress callback.
 
 ## Building, testing, benchmarks
 

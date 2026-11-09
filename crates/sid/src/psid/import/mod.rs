@@ -50,6 +50,8 @@ pub use transcribe::{SubsongReport, TranscribeOptions};
 use super::c64::Kernal;
 use super::file::{looks_like_psid, PsidFile};
 use crate::song::SidSong;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 /// What to import and how far to go.
 #[derive(Clone, Debug)]
@@ -66,6 +68,9 @@ pub struct ImportOptions {
     /// interrupt handlers end in the middle of the real KERNAL's (`$EA34`, `$EA7B`); `Kernal::Daw` is the
     /// DAW's own, which refuses them.
     pub kernal: Kernal,
+    /// Set from another thread to stop the import (it returns `Err("the import was cancelled")`): checked
+    /// between the ticks of a capture, which is nearly all the time an import takes, and between subsongs.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for ImportOptions {
@@ -76,6 +81,7 @@ impl Default for ImportOptions {
             measure: true,
             gt_unpack: true,
             kernal: Kernal::default(),
+            cancel: None,
         }
     }
 }
@@ -178,6 +184,7 @@ fn unpacked(file: &PsidFile, opts: &ImportOptions) -> Option<ImportResult> {
                 subsong: 0,
                 max_ticks: None,
                 max_seconds: Some(120.0),
+                cancel: opts.cancel.clone(),
             },
             opts.kernal,
         )
@@ -216,6 +223,7 @@ pub fn import_file(file: &PsidFile, opts: &ImportOptions) -> Result<ImportResult
             subsongs: opts.subsongs.clone(),
             max_seconds: opts.max_seconds,
             kernal: opts.kernal,
+            cancel: opts.cancel.clone(),
         },
     )
     .map_err(|f| f.reason)?;

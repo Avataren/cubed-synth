@@ -109,6 +109,7 @@ fn run(file: &PsidFile, mode: &str, max_seconds: Option<f64>) -> Value {
                 subsong: 0,
                 max_ticks: None,
                 max_seconds: Some(120.0),
+                cancel: None,
             },
         );
         let Ok(trace) = trace else {
@@ -142,6 +143,7 @@ fn run(file: &PsidFile, mode: &str, max_seconds: Option<f64>) -> Value {
                 subsong: file.start_subsong(),
                 max_ticks: None,
                 max_seconds,
+                cancel: None,
             },
         );
         return match c {

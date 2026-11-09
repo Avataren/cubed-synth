@@ -7,7 +7,7 @@
 //! subsongs) or runs at another speed is left out with a note. A port of
 //! `transcribe/index.ts`.
 
-use super::capture::{capture_sid_with, CaptureOptions, SidTrace, SID_EVENT_GATE_ON};
+use super::capture::{capture_sid_with, CaptureOptions, SidTrace, CANCELLED, SID_EVENT_GATE_ON};
 use super::export::gt_packed_pattern_size;
 use super::flat::{compile_flat_song, FlatSubsong};
 use super::fold::fold_instruments;
@@ -36,6 +36,8 @@ use crate::song::{
 use crate::SidModel;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 /// What to transcribe.
 #[derive(Clone, Debug, Default)]
@@ -46,6 +48,8 @@ pub struct TranscribeOptions {
     pub max_seconds: Option<f64>,
     /// The stand-in KERNAL the tune runs on (default `Kernal::Extended`; `Kernal::Daw` is the DAW's own).
     pub kernal: Kernal,
+    /// Set from another thread to stop the import between ticks of a capture and between subsongs.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 /// How one subsong went.
@@ -216,17 +220,17 @@ fn pitch_steps(f: &TraceFrames) -> Vec<Vec<i64>> {
 fn prepare(
     file: &PsidFile,
     subsong: usize,
-    max_seconds: Option<f64>,
-    kernal: Kernal,
+    options: &TranscribeOptions,
 ) -> Result<Prepared, String> {
     let trace = capture_sid_with(
         file,
         &CaptureOptions {
             subsong,
             max_ticks: None,
-            max_seconds,
+            max_seconds: options.max_seconds,
+            cancel: options.cancel.clone(),
         },
-        kernal,
+        options.kernal,
     )?;
     transcribed(subsong, Rc::new(trace), true)
 }
@@ -361,8 +365,11 @@ pub fn transcribe_psid(
             ));
             continue;
         }
-        let prep = match prepare(file, s, options.max_seconds, options.kernal) {
+        let prep = match prepare(file, s, options) {
             Ok(p) => p,
+            Err(reason) if reason == CANCELLED => {
+                return Err(TranscribeFailure { reason, reports });
+            }
             Err(reason) => {
                 reports.push(SubsongReport::left_out(s, reason));
                 continue;
