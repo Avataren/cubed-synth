@@ -782,8 +782,12 @@ impl Insert for EqInsert {
 
     fn set_param(&mut self, index: usize, value: f32) {
         if index < PARAM_COUNT {
-            self.params[index] = clamp_param(EffectKind::Eq, index, value);
-            self.dirty = true;
+            // A host that sets every parameter every block costs nothing while they stay put.
+            let value = clamp_param(EffectKind::Eq, index, value);
+            if self.params[index] != value {
+                self.params[index] = value;
+                self.dirty = true;
+            }
         }
     }
 }
