@@ -18,6 +18,7 @@
 pub mod c64;
 pub mod cpu;
 pub mod file;
+pub mod import;
 pub mod player;
 pub mod runner;
 
