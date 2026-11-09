@@ -21,6 +21,7 @@ pub mod traits;
 pub mod utils;
 pub mod voice;
 pub mod wav;
+pub mod wavetable_edit;
 
 pub use automation::{AutomationFrame, ConnectionUpdate};
 pub use graph::AudioGraph;
