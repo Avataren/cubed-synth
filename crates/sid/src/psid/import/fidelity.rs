@@ -18,11 +18,12 @@
 //! whole. A port of `psid/fidelity.ts`: the transcribed subsong is exported with
 //! [`export`](super::export) and run on the emulated C64 like the original.
 
-use super::capture::{capture_sid, CaptureOptions, SidTrace, SID_EVENT_GATE_LOW};
+use super::capture::{capture_sid_with, CaptureOptions, SidTrace, SID_EVENT_GATE_LOW};
 use super::envelope::{envelope_levels, EnvelopeFrame};
 use super::export::{export_sid, SID_EXPORT_DEFAULTS};
 use super::frames::{pitch_of, trace_frames, TraceFrames, VoiceFrames};
 use super::util::js_round;
+use crate::psid::c64::Kernal;
 use crate::psid::file::PsidFile;
 use crate::song::SidSong;
 
@@ -392,18 +393,20 @@ pub fn measure_fidelity(
     song: &SidSong,
     gt_subsong: usize,
     max_frames: usize,
+    kernal: Kernal,
 ) -> Result<Fidelity, String> {
     let exported = export_sid(&song_for_subsong(song, gt_subsong), &SID_EXPORT_DEFAULTS)?;
     let parsed = PsidFile::parse(&exported).map_err(|e| e.to_string())?;
     let a = unrolled(&trace_frames(trace), max_frames);
     let seconds = 600f64.min((max_frames + 200) as f64 / a.rate_hz.max(1.0) + 5.0);
-    let capture = capture_sid(
+    let capture = capture_sid_with(
         &parsed,
         &CaptureOptions {
             subsong: 0,
             max_ticks: None,
             max_seconds: Some(seconds),
         },
+        kernal,
     )?;
     let b = unrolled(&trace_frames(&capture), max_frames + 200);
     // Each voice's delay: where it scores best over a stretch of the song (a transcription's voices need

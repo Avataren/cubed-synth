@@ -11,6 +11,9 @@
 //!   over the SID writes with the cycles they were made on (`advance`, `drain`):
 //!   what the player uses, and what a host with its own chip would.
 //! - [`C64`] and [`Cpu6510`]: the machine and the CPU, for tests and tools.
+//! - [`import`]: a tune as an editable GoatTracker-style song (`import::import(bytes, &ImportOptions::default())`),
+//!   transcribed from what its player does to the SID, or unpacked when GoatTracker made it; and
+//!   [`import::export`], a song as a `.sid` again.
 //!
 //! The CPU runs live inside `render` (see `player.rs` for why, and for how a
 //! block is played), not offline into a captured register stream.

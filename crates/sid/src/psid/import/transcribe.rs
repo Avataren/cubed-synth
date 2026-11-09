@@ -7,7 +7,7 @@
 //! subsongs) or runs at another speed is left out with a note. A port of
 //! `transcribe/index.ts`.
 
-use super::capture::{capture_sid, CaptureOptions, SidTrace, SID_EVENT_GATE_ON};
+use super::capture::{capture_sid_with, CaptureOptions, SidTrace, SID_EVENT_GATE_ON};
 use super::export::gt_packed_pattern_size;
 use super::flat::{compile_flat_song, FlatSubsong};
 use super::fold::fold_instruments;
@@ -27,6 +27,7 @@ use super::song::{
     SubsongRows,
 };
 use super::util::{js_round, OrdMap};
+use crate::psid::c64::Kernal;
 use crate::psid::file::{PsidFile, PsidSidModel};
 use crate::song::{
     Instrument, OrderEntry, Orderlist, Pattern, Row, SidSong, Subsong, TableRow, Tables,
@@ -43,6 +44,8 @@ pub struct TranscribeOptions {
     pub subsongs: Option<Vec<usize>>,
     /// Capture length cap per subsong, seconds (default 600).
     pub max_seconds: Option<f64>,
+    /// The stand-in KERNAL the tune runs on (default `Kernal::Extended`; `Kernal::Daw` is the DAW's own).
+    pub kernal: Kernal,
 }
 
 /// How one subsong went.
@@ -210,14 +213,20 @@ fn pitch_steps(f: &TraceFrames) -> Vec<Vec<i64>> {
         .collect()
 }
 
-fn prepare(file: &PsidFile, subsong: usize, max_seconds: Option<f64>) -> Result<Prepared, String> {
-    let trace = capture_sid(
+fn prepare(
+    file: &PsidFile,
+    subsong: usize,
+    max_seconds: Option<f64>,
+    kernal: Kernal,
+) -> Result<Prepared, String> {
+    let trace = capture_sid_with(
         file,
         &CaptureOptions {
             subsong,
             max_ticks: None,
             max_seconds,
         },
+        kernal,
     )?;
     transcribed(subsong, Rc::new(trace), true)
 }
@@ -352,7 +361,7 @@ pub fn transcribe_psid(
             ));
             continue;
         }
-        let prep = match prepare(file, s, options.max_seconds) {
+        let prep = match prepare(file, s, options.max_seconds, options.kernal) {
             Ok(p) => p,
             Err(reason) => {
                 reports.push(SubsongReport::left_out(s, reason));

@@ -47,6 +47,7 @@ pub mod vibrato;
 pub use fidelity::{Fidelity, VoiceFidelity};
 pub use transcribe::{SubsongReport, TranscribeOptions};
 
+use super::c64::Kernal;
 use super::file::{looks_like_psid, PsidFile};
 use crate::song::SidSong;
 
@@ -61,6 +62,10 @@ pub struct ImportOptions {
     pub measure: bool,
     /// Recognise a tune GoatTracker made and unpack its song data (default true); false transcribes every tune.
     pub gt_unpack: bool,
+    /// The stand-in KERNAL the tune runs on. The default, `Kernal::Extended`, also runs the tunes whose
+    /// interrupt handlers end in the middle of the real KERNAL's (`$EA34`, `$EA7B`); `Kernal::Daw` is the
+    /// DAW's own, which refuses them.
+    pub kernal: Kernal,
 }
 
 impl Default for ImportOptions {
@@ -70,6 +75,7 @@ impl Default for ImportOptions {
             max_seconds: None,
             measure: true,
             gt_unpack: true,
+            kernal: Kernal::default(),
         }
     }
 }
@@ -166,16 +172,17 @@ fn unpacked(file: &PsidFile, opts: &ImportOptions) -> Option<ImportResult> {
     if !u.exact {
         // Not the file's bytes again (an option GoatTracker's packer has and ours does not): kept
         // only when it plays like the file.
-        let trace = capture::capture_sid(
+        let trace = capture::capture_sid_with(
             file,
             &capture::CaptureOptions {
                 subsong: 0,
                 max_ticks: None,
                 max_seconds: Some(120.0),
             },
+            opts.kernal,
         )
         .ok()?;
-        let m = fidelity::measure_fidelity(&trace, &u.song, 0, 3000).ok()?;
+        let m = fidelity::measure_fidelity(&trace, &u.song, 0, 3000, opts.kernal).ok()?;
         if m.score < UNPACKED_FIDELITY {
             return None;
         }
@@ -208,6 +215,7 @@ pub fn import_file(file: &PsidFile, opts: &ImportOptions) -> Result<ImportResult
         &TranscribeOptions {
             subsongs: opts.subsongs.clone(),
             max_seconds: opts.max_seconds,
+            kernal: opts.kernal,
         },
     )
     .map_err(|f| f.reason)?;
@@ -240,7 +248,7 @@ pub fn import_file(file: &PsidFile, opts: &ImportOptions) -> Result<ImportResult
     let start = t.reports.iter().find(|r| r.gt_subsong == Some(0));
     if opts.measure {
         if let Some(trace) = start.and_then(|s| s.trace.as_ref()) {
-            match fidelity::measure_fidelity(trace, &t.song, 0, 3000) {
+            match fidelity::measure_fidelity(trace, &t.song, 0, 3000, opts.kernal) {
                 Ok(f) => fidelity = Some(f),
                 Err(e) => warnings.push(format!("the fidelity could not be measured: {e}")),
             }

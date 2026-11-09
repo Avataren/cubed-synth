@@ -5,7 +5,7 @@
 //! cargo run --release -p cubed-sid --example psid_import -- list.txt out.json [import|start|capture|gt] [max_seconds] [shard shards]
 //!
 //! `list.txt` has one `.sid` path per line. `import` (the default) imports every subsong, `start`
-//! only the start song, `capture` records only the start song's register trace, `gt` only the GoatTracker unpack. With `shard n`
+//! only the start song, `capture` records only the start song's register trace, `gt` only the GoatTracker unpack. `KERNAL_DAW=1` runs the tunes on the DAW's stand-in KERNAL. With `shard n`
 //! only every `shards`-th tune from the n-th is done, to run several at once.
 
 use cubed_sid::psid::import::capture::{capture_sid, CaptureOptions};
@@ -114,7 +114,13 @@ fn run(file: &PsidFile, mode: &str, max_seconds: Option<f64>) -> Value {
         let Ok(trace) = trace else {
             return json!({"ok": false, "reason": "capture failed"});
         };
-        return match cubed_sid::psid::import::fidelity::measure_fidelity(&trace, &u.song, 0, 3000) {
+        return match cubed_sid::psid::import::fidelity::measure_fidelity(
+            &trace,
+            &u.song,
+            0,
+            3000,
+            cubed_sid::psid::Kernal::default(),
+        ) {
             Err(e) => json!({"ok": false, "reason": e}),
             Ok(f) => json!({"ok": true, "score": f.score, "filter": f.filter, "offset": f.offset,
                 "voiceOffsets": f.voice_offsets, "frames": f.frames, "ticks": trace.ticks,
@@ -162,6 +168,11 @@ fn run(file: &PsidFile, mode: &str, max_seconds: Option<f64>) -> Value {
             None
         },
         max_seconds,
+        kernal: if std::env::var_os("KERNAL_DAW").is_some() {
+            cubed_sid::psid::Kernal::Daw
+        } else {
+            cubed_sid::psid::Kernal::default()
+        },
         ..Default::default()
     };
     match import_file(file, &opts) {
