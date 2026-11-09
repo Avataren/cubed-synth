@@ -20,12 +20,19 @@ use crate::{
 /// The callback renders at most this many frames between ring checks.
 const CHUNK: usize = 1024;
 
-/// Sizes for [`NativeHost::open`]; the sample rate is the device's.
+/// Sizes for [`NativeHost::open`], and what to ask the device for.
 #[derive(Clone, Copy, Debug)]
 pub struct HostConfig {
     pub max_voices: usize,
     pub max_buses: usize,
     pub max_clips: usize,
+    /// The sample rate to ask the device for, in Hz. `None` is the device's own; a rate it cannot run
+    /// falls back to that too (see [`NativeHost::sample_rate`] for the one that opened).
+    pub sample_rate: Option<u32>,
+    /// The output buffer to ask for, in frames: the less, the less delay and the less room for a busy
+    /// moment. `None` is the device's default; a size outside what the device supports is brought inside
+    /// it, and one it refuses falls back to the default.
+    pub buffer_frames: Option<u32>,
     /// Commands that can wait for the next callback.
     pub command_capacity: usize,
     /// Events and released objects that can wait for the next `poll`.
@@ -39,6 +46,8 @@ impl Default for HostConfig {
             max_voices: mixer.max_voices,
             max_buses: mixer.max_buses,
             max_clips: mixer.max_clips,
+            sample_rate: None,
+            buffer_frames: None,
             command_capacity: 4096,
             return_capacity: 4096,
         }
@@ -222,14 +231,144 @@ pub struct NativeHost {
     shared: Arc<Shared>,
     sample_rate: u32,
     device_name: String,
+    /// The fixed buffer the stream was opened with, in frames (`None`: the device's default).
+    buffer_frames: Option<u32>,
     /// The taps the host has switched on (see `enable_tap`).
     taps: TapSet,
 }
 
+/// What the default output device can run, for a settings page to offer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputCapabilities {
+    pub device_name: String,
+    /// The rate the device runs at unless asked otherwise.
+    pub default_rate: u32,
+    /// The common rates the device runs, ascending, with its default among them.
+    pub rates: Vec<u32>,
+    /// The smallest and largest output buffer it accepts, in frames, when it says.
+    pub buffer_frames: Option<(u32, u32)>,
+}
+
+/// The sample rates a settings page offers, when the device can run them.
+const COMMON_RATES: [u32; 11] = [
+    8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000,
+];
+
+/// The common rates inside any of the `ranges` (min, max inclusive), and `default`, ascending.
+fn rates_within(ranges: &[(u32, u32)], default: u32) -> Vec<u32> {
+    let mut rates: Vec<u32> = COMMON_RATES
+        .iter()
+        .copied()
+        .filter(|rate| ranges.iter().any(|(min, max)| min <= rate && rate <= max))
+        .collect();
+    rates.push(default);
+    rates.sort_unstable();
+    rates.dedup();
+    rates
+}
+
+/// The buffer to open with: `want` frames brought inside the device's range, or the default.
+fn buffer_for(want: Option<u32>, supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    match (want.filter(|frames| *frames > 0), supported) {
+        (Some(frames), cpal::SupportedBufferSize::Range { min, max }) => {
+            cpal::BufferSize::Fixed(frames.clamp(*min, *max))
+        }
+        (Some(frames), cpal::SupportedBufferSize::Unknown) => cpal::BufferSize::Fixed(frames),
+        (None, _) => cpal::BufferSize::Default,
+    }
+}
+
+/// Whether the stream builder below handles samples of this format.
+fn handled(format: cpal::SampleFormat) -> bool {
+    matches!(
+        format,
+        cpal::SampleFormat::F32
+            | cpal::SampleFormat::I16
+            | cpal::SampleFormat::U16
+            | cpal::SampleFormat::I32
+    )
+}
+
+/// The configuration to open: the device's default, or the same shape (channels and sample format when it
+/// has them, else any it can handle) at the rate `want` when the device runs that.
+fn choose_config(
+    device: &cpal::Device,
+    default: cpal::SupportedStreamConfig,
+    want: Option<u32>,
+) -> cpal::SupportedStreamConfig {
+    let Some(want) = want else { return default };
+    if default.sample_rate() == want {
+        return default;
+    }
+    let Ok(ranges) = device.supported_output_configs() else {
+        return default;
+    };
+    let mut other_format = None;
+    for range in ranges {
+        if range.min_sample_rate() > want
+            || want > range.max_sample_rate()
+            || range.channels() != default.channels()
+        {
+            continue;
+        }
+        if range.sample_format() == default.sample_format() {
+            return range.with_sample_rate(want);
+        }
+        if other_format.is_none() && handled(range.sample_format()) {
+            other_format = Some(range.with_sample_rate(want));
+        }
+    }
+    other_format.unwrap_or(default)
+}
+
+/// What the default output device runs, without opening it.
+pub fn output_capabilities() -> Result<OutputCapabilities, String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or("no audio output device")?;
+    let device_name = device
+        .description()
+        .map(|d| d.to_string())
+        .unwrap_or_else(|_| "unknown device".to_string());
+    let default = device
+        .default_output_config()
+        .map_err(|e| format!("cannot query {device_name}: {e}"))?;
+    let mut ranges = Vec::new();
+    let mut buffers: Option<(u32, u32)> = None;
+    if let Ok(configs) = device.supported_output_configs() {
+        for range in
+            configs.filter(|r| r.channels() == default.channels() && handled(r.sample_format()))
+        {
+            ranges.push((range.min_sample_rate(), range.max_sample_rate()));
+            if let cpal::SupportedBufferSize::Range { min, max } = range.buffer_size() {
+                buffers =
+                    Some(buffers.map_or((*min, *max), |(lo, hi)| (lo.min(*min), hi.max(*max))));
+            }
+        }
+    }
+    let default_rate = default.sample_rate();
+    Ok(OutputCapabilities {
+        device_name,
+        default_rate,
+        rates: rates_within(&ranges, default_rate),
+        buffer_frames: buffers,
+    })
+}
+
 impl NativeHost {
-    /// Opens the default output device at its own sample rate and starts a
-    /// mixer on it with only the master bus.
+    /// Opens the default output device and starts a mixer on it with only the master bus: at the rate
+    /// and with the buffer the config asks for when the device allows them, at its own otherwise.
     pub fn open(config: HostConfig) -> Result<NativeHost, String> {
+        let wanted = config.buffer_frames.filter(|frames| *frames > 0);
+        match Self::open_with(&config, wanted) {
+            // A device that refuses the buffer size still plays, with its own.
+            Err(error) if wanted.is_some() => Self::open_with(&config, None).map_err(|_| error),
+            result => result,
+        }
+    }
+
+    fn open_with(config: &HostConfig, buffer: Option<u32>) -> Result<NativeHost, String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -238,15 +377,21 @@ impl NativeHost {
             .description()
             .map(|d| d.to_string())
             .unwrap_or_else(|_| "unknown device".to_string());
-        let supported = device
+        let default = device
             .default_output_config()
             .map_err(|e| format!("cannot query {device_name}: {e}"))?;
+        let supported = choose_config(&device, default, config.sample_rate);
         let sample_rate = supported.sample_rate();
         let channels = supported.channels();
+        let buffer_size = buffer_for(buffer, supported.buffer_size());
+        let fixed = match buffer_size {
+            cpal::BufferSize::Fixed(frames) => Some(frames),
+            cpal::BufferSize::Default => None,
+        };
         let stream_config = cpal::StreamConfig {
             channels,
             sample_rate,
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size,
         };
 
         let mixer = Mixer::new(MixerConfig {
@@ -324,8 +469,14 @@ impl NativeHost {
             shared,
             sample_rate,
             device_name,
+            buffer_frames: fixed,
             taps: TapSet::new(max_buses),
         })
+    }
+
+    /// The fixed buffer the stream was opened with, in frames; `None` when it runs on the device's own.
+    pub fn buffer_frames(&self) -> Option<u32> {
+        self.buffer_frames
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -452,5 +603,60 @@ impl Analysis for NativeHost {
 
     fn levels(&self, bus: BusId) -> Option<BusMeter> {
         self.meter(bus)
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn the_rates_offered_are_the_common_ones_the_device_runs_and_its_default() {
+        // A device that runs 44.1 kHz up to 96 kHz, and nothing else.
+        let rates = rates_within(&[(44_100, 96_000)], 48_000);
+        assert_eq!(rates, vec![44_100, 48_000, 88_200, 96_000]);
+        // An odd default is offered too, once.
+        assert_eq!(
+            rates_within(&[(48_000, 48_000)], 47_999),
+            vec![47_999, 48_000]
+        );
+        assert_eq!(rates_within(&[], 48_000), vec![48_000]);
+        // Two ranges (a device with a gap between them).
+        assert_eq!(
+            rates_within(&[(8_000, 16_000), (44_100, 48_000)], 44_100),
+            vec![8_000, 11_025, 16_000, 44_100, 48_000]
+        );
+    }
+
+    #[test]
+    fn a_requested_buffer_is_brought_inside_the_devices_range() {
+        let range = cpal::SupportedBufferSize::Range { min: 64, max: 2048 };
+        assert!(matches!(
+            buffer_for(Some(512), &range),
+            cpal::BufferSize::Fixed(512)
+        ));
+        assert!(matches!(
+            buffer_for(Some(16), &range),
+            cpal::BufferSize::Fixed(64)
+        ));
+        assert!(matches!(
+            buffer_for(Some(99_999), &range),
+            cpal::BufferSize::Fixed(2048)
+        ));
+        // A device that does not say gets what was asked, and is retried on its default if it refuses.
+        let unknown = cpal::SupportedBufferSize::Unknown;
+        assert!(matches!(
+            buffer_for(Some(256), &unknown),
+            cpal::BufferSize::Fixed(256)
+        ));
+        // Nothing asked, or nothing sensible (0): the device's own.
+        assert!(matches!(
+            buffer_for(None, &range),
+            cpal::BufferSize::Default
+        ));
+        assert!(matches!(
+            buffer_for(Some(0), &range),
+            cpal::BufferSize::Default
+        ));
     }
 }
