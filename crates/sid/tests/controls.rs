@@ -1022,6 +1022,14 @@ fn every_voice_has_a_loop_of_its_own_and_a_refused_one_changes_nothing() {
         [0, 1].into(),
         "voice 2 reads entry 0 once, then loops entry 1"
     );
+    // The song's own loop being set or cleared (what a transport's `Loop` control does) leaves them be.
+    p.set_loop(None);
+    p.set_loop_rows(Some((100, 200)));
+    p.set_loop(None);
+    assert_eq!(
+        (p.voice_loop(0), p.voice_loop(2)),
+        (Some((0, 0)), Some((1, 1)))
+    );
     // A whole-song loop works beside them.
     let mut q = player(&s);
     assert!(q.set_voice_loop(2, Some((1, 1))));
@@ -1081,4 +1089,45 @@ fn a_voice_loop_over_a_shared_tempo_command_is_approximate_but_stays_in_range() 
     }
     assert_eq!(seen, [0, 1].into());
     assert_eq!(p.status().order[2], 1);
+}
+
+/// A real GoatTracker song (its orderlists have repeats, transposes, voices of different lengths and a
+/// one-row voice): a voice's loop set before it has reached the range, or after, holds it there.
+#[test]
+fn a_voice_loop_holds_on_a_real_goattracker_song() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/goattracker/gts5_basics.sng");
+    let s = SidDoc::from_bytes(&std::fs::read(path).unwrap())
+        .unwrap()
+        .song()
+        .clone();
+    // Voice 0: entries (pattern, transpose, repeat) (0,3,1) (1,3,4) (0,-11,16) (1,0,1); voice 1 has two.
+    assert_eq!(s.order_rows(0, 0, 1, 1), Some((4, 16)));
+    for (voice, orders, hold) in [(0usize, (1usize, 1usize), 1u8), (1, (0, 0), 0)] {
+        let mut p = player(&s);
+        assert!(p.set_voice_loop(voice, Some(orders)));
+        let mut seen = std::collections::BTreeSet::new();
+        for f in 0..6000 {
+            p.frame();
+            if f > 200 {
+                seen.insert(p.status().order[voice]);
+            }
+        }
+        assert_eq!(seen, [hold].into(), "voice {voice} holds entry {hold}");
+        assert_eq!(p.voice_loop(voice), Some(orders));
+    }
+    // Set while it plays, before the range (it is at order 0) and then past it: it ends up in the range.
+    let mut p = player(&s);
+    for _ in 0..4 {
+        p.frame();
+    }
+    assert!(p.set_voice_loop(0, Some((1, 1))));
+    let mut late = std::collections::BTreeSet::new();
+    for f in 0..6000 {
+        p.frame();
+        if f > 200 {
+            late.insert(p.status().order[0]);
+        }
+    }
+    assert_eq!(late, [1].into());
 }

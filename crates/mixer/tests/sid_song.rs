@@ -468,6 +468,9 @@ fn a_voice_loops_its_own_entries_while_the_others_play_on_by_wire() {
         voice: 9,
         range: Some((0, 0)),
     });
+    // The song's own loop settings (a transport's `loop = false` / `"song"`) do not clear a voice's.
+    rig.control(SongControl::Loop(SongLoop::None));
+    rig.control(SongControl::Looped(true));
     rig.control(SongControl::Play);
     let mut orders = Vec::new();
     let mut rows0 = std::collections::BTreeSet::new();

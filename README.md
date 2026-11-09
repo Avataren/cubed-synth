@@ -543,7 +543,10 @@ first row and put back at every end, so the repeats are that moment again, regis
 replaying anything; a loop set after the voice has gone past the range replays the song silently up to the range's start once (the
 cost of a seek). What the voices share is **not** put back and plays on (**approximate** where a song uses it inside the range):
 the filter (program, cutoff and routing, which any voice's instrument starts), funktempo's two row lengths, and a tempo command
-(F `$01`-`$7F`) another voice sets for all, which the looped voice, put back to the tempo it had, no longer follows. (`pattern` is the pattern
+(F `$01`-`$7F`) another voice sets for all, which the looped voice, put back to the tempo it had, no longer follows. A voice loop
+does not keep the song alive: a transport that is not looped (`Looped(false)`) still stops at the first wrap of **any** voice's
+orderlist (a voice with a one-row pattern wraps at once), so play a song whose voice is looped with `Looped(true)`; and the
+song's own `Loop` controls (`Loop(None)` included) leave the voices' loops alone. (`pattern` is the pattern
 number, `speed` the frames per row, `tempo` the timer's Hz, 50 x the speed multiplier, `rows` the song row of the reference voice;
 `SONG_MAX_VOICES` is the voices a status can carry.) The preview is the player's audition on voice 0 (held until
 `PreviewOff`, or for `duration` frames; over a playing song voice 0 is taken for it; a note is MIDI, 12 is C-0). `levels` are the
