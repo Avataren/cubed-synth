@@ -436,6 +436,7 @@ fn song_fields(control: &SongControl) -> (u8, u16, u16, u16, f32, u32) {
             0,
         ),
         // Encoded with a tag of its own.
+        SongControl::SeekVoice { voice, order, row } => (18, order, row, voice as u16, 0.0, 0),
         SongControl::SetCell(_) | SongControl::SetInstrument(_) => unreachable!(),
     }
 }
@@ -494,6 +495,11 @@ fn song_control(
             row: (a >> 8) as u8,
             left: b as u8,
             right: (b >> 8) as u8,
+        },
+        18 => SongControl::SeekVoice {
+            voice: c.min(255) as u8,
+            order: a,
+            row: b,
         },
         // The tag is known; the kind is from a newer sender.
         _ => return Err(WireError::UnknownTag(tag::SONG_CONTROL)),
@@ -1290,6 +1296,11 @@ mod tests {
                 row: 254,
                 left: 0xff,
                 right: 0x12,
+            },
+            SongControl::SeekVoice {
+                voice: 2,
+                order: 255,
+                row: 4095,
             },
         ];
         let instrument = SongInstrument {

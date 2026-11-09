@@ -4,10 +4,12 @@
 //! A song is three voices (the channels) with an orderlist each over one pool of patterns.
 //! `SidSongPlayer` has no pause, so **stopped is its preview mode** (the sequencer is off, the notes
 //! die away, the position stays, and auditions play on any voice); playing leaves it and the voices
-//! read their rows again. Seeking, the status and the loops refer to **voice 0**'s orderlist
-//! (`Seek { order, row }` is voice 0 reading row `row` of the pattern at orderlist position `order`;
-//! `Loop` repeats rows of voice 0's entries; the status is voice 0's position: the other voices'
-//! places are not reported yet, a song whose voices keep step shows them in the same rows).
+//! read their rows again. The three voices run on orderlists of their own, so each has its own
+//! position: the status carries every voice's (`SongStatus::voices`: orderlist position, pattern and
+//! row, as the voice last started them) next to the old fields, which stay voice 0's. `Seek { order,
+//! row }` is voice 0 reading row `row` of the pattern at orderlist position `order`, and
+//! `SeekVoice { voice, order, row }` is the same for any voice (the others stand where the song has
+//! them when that voice gets there). `Loop` repeats rows of voice 0's entries.
 //!
 //! The preview (`PreviewOn`) is the player's audition on voice 0, held until `PreviewOff` or for
 //! `duration` frames; over a playing song voice 0 is taken for it. Note numbers are MIDI (the song's
@@ -27,9 +29,10 @@ use cubed_sid::player::{SidLoop, SidSongPlayer};
 use cubed_sid::song::{Instrument, LiveEdit, Row, SidSong, TableKind, TableRow};
 
 use super::player::{SongPlayer, CHUNK};
-use crate::song::{SongControl, SongLoop, SongStatus};
+use crate::song::{SongControl, SongLoop, SongStatus, VoicePos, SONG_MAX_VOICES};
 
-/// The voice the preview plays on, and whose position the song reports.
+/// The voice the preview plays on, whose position the song's old status fields report, and
+/// that `Seek` and `Loop` refer to.
 const VOICE: usize = 0;
 /// MIDI note 12 is the note table's index 0 (C-0).
 const MIDI_OF_INDEX_0: u8 = 12;
@@ -68,6 +71,23 @@ impl SidPlayer {
 
     fn playing(&self) -> bool {
         !self.player.preview()
+    }
+
+    /// Moves `voice` to `order` and `row` of its orderlist, also while stopped: the replay needs
+    /// the sequencer, which preview mode (stopped) switches off. A place the song does not have
+    /// leaves everything as it was.
+    fn seek_voice(&mut self, voice: usize, order: u16, row: u16) {
+        let subsong = self.player.subsong();
+        let stopped = self.player.preview();
+        if stopped {
+            self.player.set_preview(false);
+        }
+        let _ = self
+            .player
+            .seek(subsong, voice, order as usize, row as usize);
+        if stopped {
+            self.player.set_preview(true);
+        }
     }
 
     fn set_masks(&mut self, f: impl FnOnce(u8, u8) -> (u8, u8)) {
@@ -122,19 +142,9 @@ impl SongPlayer for SidPlayer {
                     self.preview_left = 0;
                 }
             }
-            SongControl::Seek { order, row } => {
-                let subsong = self.player.subsong();
-                // The replay needs the sequencer, which preview mode (stopped) switches off.
-                let stopped = self.player.preview();
-                if stopped {
-                    self.player.set_preview(false);
-                }
-                let _ = self
-                    .player
-                    .seek(subsong, VOICE, order as usize, row as usize);
-                if stopped {
-                    self.player.set_preview(true);
-                }
+            SongControl::Seek { order, row } => self.seek_voice(VOICE, order, row),
+            SongControl::SeekVoice { voice, order, row } => {
+                self.seek_voice(voice as usize, order, row)
             }
             SongControl::Loop(repeat) => match repeat {
                 SongLoop::None => self.player.set_loop(None),
@@ -244,6 +254,15 @@ impl SongPlayer for SidPlayer {
 
     fn status(&self) -> SongStatus {
         let s = self.player.status();
+        let mut voices = [VoicePos::default(); SONG_MAX_VOICES];
+        for (c, v) in voices.iter_mut().enumerate().take(3) {
+            *v = VoicePos {
+                order: s.order[c] as u16,
+                pattern: s.pattern[c] as u16,
+                row: s.row[c] as u16,
+                valid: true,
+            };
+        }
         SongStatus {
             playing: !s.preview,
             preview: s.audition != 0,
@@ -256,6 +275,7 @@ impl SongPlayer for SidPlayer {
             rows: s.song_row as u32,
             frames: s.frames,
             version: 0,
+            voices,
         }
     }
 

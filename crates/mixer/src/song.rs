@@ -26,6 +26,13 @@ pub const SONG_LEVEL_SLOTS: usize = SONG_MAX_CHANNELS + 1;
 pub const SONG_SCOPE_FRAMES: usize = 512;
 /// `u32`s in a song's status as the worklet posts it (see [`SongStatus::to_words`]).
 pub const SONG_STATUS_WORDS: usize = 12;
+/// Voices whose own positions a status carries at most ([`SongStatus::voices`]): what the widest
+/// format that has them needs (a SID song has three, each with its own orderlist).
+pub const SONG_MAX_VOICES: usize = 3;
+/// `u32`s per voice in a song's voice words (see [`SongStatus::voice_words`]).
+pub const SONG_VOICE_WORD_STRIDE: usize = 2;
+/// `u32`s in a song's voice words, as the worklet posts them next to the status words.
+pub const SONG_VOICE_WORDS: usize = SONG_MAX_VOICES * SONG_VOICE_WORD_STRIDE;
 
 /// What a module's transport repeats.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,6 +59,16 @@ pub enum SongControl {
     /// Moves to `order` and `row`, from a clean state; works while stopped (the
     /// position moves, and `Play` starts there). Out of range clamps.
     Seek {
+        order: u16,
+        row: u16,
+    },
+    /// Moves one voice to `order` and `row` of its own order list, from a clean state (a SID
+    /// song, whose three voices each have an order list of their own: voice `voice` is about to
+    /// read row `row` of the pattern at its position `order`, and the other voices stand where the
+    /// song has them at that moment). `SeekVoice { voice: 0, .. }` is `Seek`. Works while stopped.
+    /// Wire kind 18. Formats whose channels share one position ignore it.
+    SeekVoice {
+        voice: u8,
         order: u16,
         row: u16,
     },
@@ -169,6 +186,21 @@ pub struct SongCell {
     pub param: u8,
 }
 
+/// Where one voice of a song is, for a format whose voices each have a position of their own (a SID
+/// song: every voice has its own order list, so its own pattern and row at any time).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VoicePos {
+    /// Position in the voice's order list.
+    pub order: u16,
+    /// The pattern at that position.
+    pub pattern: u16,
+    /// The row playing, or the row a stopped song will start at.
+    pub row: u16,
+    /// Whether the song reports this voice (false for every voice of a format that has no
+    /// positions of its own, and for the slots past the song's last voice).
+    pub valid: bool,
+}
+
 /// Where a module song's transport is, as the player last published it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SongStatus {
@@ -196,6 +228,9 @@ pub struct SongStatus {
     /// Changes whenever anything shown has moved and stays put while all is still,
     /// so a poster can skip a quiet song.
     pub version: u32,
+    /// Each voice's own position, for a format that has them (SID: `order`, `pattern` and `row`
+    /// above are voice 0's, which `voices[0]` repeats); all `valid == false` otherwise.
+    pub voices: [VoicePos; SONG_MAX_VOICES],
 }
 
 impl SongStatus {
@@ -222,6 +257,38 @@ impl SongStatus {
         ]
     }
 
+    /// The voices' positions as the worklet posts them, next to [`to_words`](Self::to_words)'s
+    /// words (a separate array in the `'songpos'` message, so a page that does not know it reads
+    /// the message as before): per voice two words, `pattern << 16 | order` and `valid << 16 | row`.
+    pub fn voice_words(&self) -> [u32; SONG_VOICE_WORDS] {
+        let mut words = [0u32; SONG_VOICE_WORDS];
+        for (k, v) in self.voices.iter().enumerate() {
+            words[k * SONG_VOICE_WORD_STRIDE] = (v.pattern as u32) << 16 | v.order as u32;
+            words[k * SONG_VOICE_WORD_STRIDE + 1] = (v.valid as u32) << 16 | v.row as u32;
+        }
+        words
+    }
+
+    /// Takes the voices' positions from [`voice_words`](Self::voice_words)'s words (as many voices
+    /// as `words` holds; the rest are not reported). Returns whether `words` was long enough for
+    /// one voice.
+    pub fn set_voice_words(&mut self, words: &[u32]) -> bool {
+        self.voices = [VoicePos::default(); SONG_MAX_VOICES];
+        for (k, v) in self.voices.iter_mut().enumerate() {
+            let at = k * SONG_VOICE_WORD_STRIDE;
+            let Some(&[first, second]) = words.get(at..at + SONG_VOICE_WORD_STRIDE) else {
+                break;
+            };
+            *v = VoicePos {
+                order: first as u16,
+                pattern: (first >> 16) as u16,
+                row: second as u16,
+                valid: second >> 16 & 1 != 0,
+            };
+        }
+        words.len() >= SONG_VOICE_WORD_STRIDE
+    }
+
     /// The status, and (channels, alive, scopes on), from [`to_words`](Self::to_words)'s
     /// words; `None` if there are too few.
     pub fn from_words(words: &[u32]) -> Option<(SongStatus, usize, bool, bool)> {
@@ -239,6 +306,7 @@ impl SongStatus {
                 rows: w[7],
                 frames: w[8] as u64 | (w[9] as u64) << 32,
                 version: w[10],
+                voices: [VoicePos::default(); SONG_MAX_VOICES],
             },
             (w[11] as usize).min(SONG_MAX_CHANNELS),
             w[0] & 4 != 0,
@@ -310,9 +378,17 @@ impl WebSong {
     /// the channels' then the preview's; shorter is padded with 0). A malformed
     /// entry is ignored; returns whether it was taken.
     pub fn update_status(&mut self, status: &[u32], levels: &[f32]) -> bool {
-        let Some((status, channels, alive, scopes_on)) = SongStatus::from_words(status) else {
+        self.update_status_voices(status, levels, &[])
+    }
+
+    /// [`update_status`](Self::update_status) with the song's voice words (what
+    /// [`SongStatus::voice_words`] made, `'songpos'`'s `voices`; empty from a worklet that does not
+    /// post them: no voice is then reported).
+    pub fn update_status_voices(&mut self, status: &[u32], levels: &[f32], voices: &[u32]) -> bool {
+        let Some((mut status, channels, alive, scopes_on)) = SongStatus::from_words(status) else {
             return false;
         };
+        status.set_voice_words(voices);
         self.status = status;
         self.channels = channels;
         self.alive = alive;
@@ -362,6 +438,21 @@ impl WebSongs {
     /// had (it has not moved); one reported gone reads `alive() == false` until
     /// [`forget`](Self::forget). Returns how many entries were taken.
     pub fn update_positions(&mut self, sources: &[u32], status: &[u32], levels: &[f32]) -> usize {
+        self.update_positions_voices(sources, status, levels, &[])
+    }
+
+    /// [`update_positions`](Self::update_positions) with the message's `voices`: for each song in
+    /// `sources` its voice words ([`SONG_VOICE_WORDS`] of them, `voices.len() / sources.len()` each
+    /// as the worklet posted them: a longer entry is read as far as this build knows voices, a
+    /// shorter one reports fewer). Empty `voices` (a worklet that posts none) reports no voice.
+    pub fn update_positions_voices(
+        &mut self,
+        sources: &[u32],
+        status: &[u32],
+        levels: &[f32],
+        voices: &[u32],
+    ) -> usize {
+        let stride = voices.len().checked_div(sources.len()).unwrap_or(0);
         let mut taken = 0;
         for (i, &source) in sources.iter().enumerate() {
             let (Some(words), Some(slots)) = (
@@ -378,7 +469,8 @@ impl WebSongs {
                 self.songs.resize_with(source + 1, || None);
             }
             let song = self.songs[source].get_or_insert_with(WebSong::new);
-            taken += song.update_status(words, slots) as usize;
+            let own = voices.get(i * stride..(i + 1) * stride).unwrap_or(&[]);
+            taken += song.update_status_voices(words, slots, own) as usize;
         }
         taken
     }
@@ -491,6 +583,7 @@ mod tests {
             rows: 99_999,
             frames: 0x1_2345_6789,
             version: 7,
+            voices: Default::default(),
         };
         let words = s.to_words(8, true, false);
         assert_eq!(words.len(), SONG_STATUS_WORDS);
@@ -499,6 +592,66 @@ mod tests {
         let (_, channels, alive, scopes) = SongStatus::from_words(&words).unwrap();
         assert_eq!((channels, alive, scopes), (32, false, true));
         assert_eq!(SongStatus::from_words(&words[..5]), None);
+    }
+
+    #[test]
+    fn the_voices_positions_round_trip_through_their_words_and_reach_the_page() {
+        let mut s = SongStatus {
+            playing: true,
+            ..Default::default()
+        };
+        s.voices[0] = VoicePos {
+            order: 3,
+            pattern: 40,
+            row: 17,
+            valid: true,
+        };
+        s.voices[2] = VoicePos {
+            order: 65_535,
+            pattern: 65_000,
+            row: 65_535,
+            valid: true,
+        };
+        let words = s.voice_words();
+        assert_eq!(words.len(), SONG_VOICE_WORDS);
+        let mut back = SongStatus::default();
+        assert!(back.set_voice_words(&words));
+        assert_eq!(back.voices, s.voices);
+        assert!(!back.voices[1].valid);
+        // The status words do not carry them (a page that predates them reads the message as before).
+        let (plain, ..) = SongStatus::from_words(&s.to_words(3, true, false)).unwrap();
+        assert_eq!(plain.voices, [VoicePos::default(); SONG_MAX_VOICES]);
+        // Fewer words report fewer voices; none report none.
+        assert!(back.set_voice_words(&words[..SONG_VOICE_WORD_STRIDE]));
+        assert!(back.voices[0].valid && !back.voices[2].valid);
+        assert!(!back.set_voice_words(&[]));
+        assert_eq!(back.voices, [VoicePos::default(); SONG_MAX_VOICES]);
+
+        // On the page: a message with voices for two songs, then one without (an older worklet).
+        let mut web = WebSongs::new();
+        let (a, b) = (s, SongStatus::default());
+        let status = [a.to_words(3, true, false), b.to_words(4, true, false)].concat();
+        let levels = vec![0.0f32; 2 * SONG_LEVEL_SLOTS];
+        let voices = [a.voice_words(), b.voice_words()].concat();
+        assert_eq!(
+            web.update_positions_voices(&[5, 6], &status, &levels, &voices),
+            2
+        );
+        assert_eq!(web.get(5).unwrap().status().voices, a.voices);
+        assert_eq!(web.get(6).unwrap().status().voices, b.voices);
+        // A longer entry (a build with more voices) is read as far as this one knows voices.
+        let mut wider = Vec::new();
+        for song in [&a, &b] {
+            wider.extend(song.voice_words());
+            wider.extend([7u32; 4]);
+        }
+        web.update_positions_voices(&[5, 6], &status, &levels, &wider);
+        assert_eq!(web.get(5).unwrap().status().voices, a.voices);
+        // None at all: no voice is reported, the rest of the status is.
+        assert_eq!(web.update_positions(&[5], &status, &levels), 1);
+        let song = web.get(5).unwrap();
+        assert!(song.status().voices.iter().all(|v| !v.valid));
+        assert!(song.status().playing);
     }
 
     #[test]

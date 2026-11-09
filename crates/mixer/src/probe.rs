@@ -8,12 +8,18 @@
 //! written with plain stores and read with plain loads: neither side locks, waits or
 //! allocates (the probe is built, rings included, off the audio thread). The position is
 //! packed into one word, so a reader always sees a row, a tick and a tempo that belong
-//! together. It is `cubed_tracker::Probe`'s design for songs that are not modules.
+//! together; each voice's own position (a SID song's three voices run on their own order lists) is a
+//! word of its own, so a reader sees every voice's row and pattern together, though not necessarily
+//! from the same block as another voice's. It is `cubed_tracker::Probe`'s design for songs that are
+//! not modules.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::song::{SongReader, SongStatus, SONG_LEVEL_SLOTS, SONG_MAX_CHANNELS, SONG_SCOPE_FRAMES};
+use crate::song::{
+    SongReader, SongStatus, VoicePos, SONG_LEVEL_SLOTS, SONG_MAX_CHANNELS, SONG_MAX_VOICES,
+    SONG_SCOPE_FRAMES,
+};
 
 const POS_ORDER: u32 = 0;
 const POS_PATTERN: u32 = 12;
@@ -24,12 +30,21 @@ const POS_TEMPO: u32 = 52;
 const POS_PLAYING: u32 = 61;
 const POS_PREVIEW: u32 = 62;
 
+// A voice's own position, one word each: order, pattern and row (16 bits each) and a valid flag.
+const VOICE_ORDER: u32 = 0;
+const VOICE_PATTERN: u32 = 16;
+const VOICE_ROW: u32 = 32;
+const VOICE_VALID: u32 = 48;
+
 /// A song's position, levels and channel scopes, readable from any thread. See the module
 /// docs.
 pub struct SongProbe {
     /// Order, pattern and row (12 bits each), tick, speed (8), tempo (9), and the transport
     /// flags.
     position: AtomicU64,
+    /// Each voice's own order, pattern and row (16 bits each) and valid flag (0 where the format
+    /// has none).
+    voices: [AtomicU64; SONG_MAX_VOICES],
     /// Rows started (low 32 bits) and the version (high 32).
     counters: AtomicU64,
     frames: AtomicU64,
@@ -52,6 +67,7 @@ impl SongProbe {
         let zeros32 = |n: usize| (0..n).map(|_| AtomicU32::new(0)).collect::<Box<[_]>>();
         Arc::new(SongProbe {
             position: AtomicU64::new(0),
+            voices: std::array::from_fn(|_| AtomicU64::new(0)),
             counters: AtomicU64::new(0),
             frames: AtomicU64::new(0),
             channels,
@@ -86,9 +102,17 @@ impl SongProbe {
         put(s.playing as u64, POS_PLAYING, 1);
         put(s.preview as u64, POS_PREVIEW, 1);
         let old = self.position.swap(p, Ordering::Relaxed);
+        let mut voices_moved = false;
+        for (cell, v) in self.voices.iter().zip(&s.voices) {
+            let word = (v.order as u64) << VOICE_ORDER
+                | (v.pattern as u64) << VOICE_PATTERN
+                | (v.row as u64) << VOICE_ROW
+                | (v.valid as u64) << VOICE_VALID;
+            voices_moved |= cell.swap(word, Ordering::Relaxed) != word;
+        }
         let c = self.counters.load(Ordering::Relaxed);
         let (mut rows, mut version) = (c as u32, (c >> 32) as u32);
-        let moved = old != p || rows != s.rows;
+        let moved = old != p || rows != s.rows || voices_moved;
         rows = s.rows;
         if moved {
             version = version.wrapping_add(1);
@@ -156,6 +180,15 @@ impl SongReader for SongProbe {
             rows: c as u32,
             frames: self.frames.load(Ordering::Relaxed),
             version: (c >> 32) as u32,
+            voices: std::array::from_fn(|i| {
+                let w = self.voices[i].load(Ordering::Relaxed);
+                VoicePos {
+                    order: (w >> VOICE_ORDER) as u16,
+                    pattern: (w >> VOICE_PATTERN) as u16,
+                    row: (w >> VOICE_ROW) as u16,
+                    valid: w >> VOICE_VALID & 1 == 1,
+                }
+            }),
         }
     }
 
@@ -256,6 +289,7 @@ mod tests {
             rows: 77,
             frames: 0,
             version: 0,
+            voices: Default::default(),
         };
         probe.publish_position(&s);
         let back = probe.status();
@@ -266,6 +300,46 @@ mod tests {
         assert_eq!(back.version, 1, "a change bumps the version");
         probe.publish_position(&s);
         assert_eq!(probe.status().version, 1, "the same state does not");
+    }
+
+    #[test]
+    fn each_voices_own_position_is_published_and_moves_the_version() {
+        let probe = SongProbe::new(3);
+        let mut s = SongStatus {
+            playing: true,
+            order: 1,
+            pattern: 2,
+            row: 3,
+            ..Default::default()
+        };
+        probe.publish_position(&s);
+        assert_eq!(
+            probe.status().voices,
+            [VoicePos::default(); SONG_MAX_VOICES]
+        );
+        let v = probe.status().version;
+        s.voices[0] = VoicePos {
+            order: 1,
+            pattern: 2,
+            row: 3,
+            valid: true,
+        };
+        s.voices[1] = VoicePos {
+            order: 40_000,
+            pattern: 65_535,
+            row: 255,
+            valid: true,
+        };
+        probe.publish_position(&s);
+        assert_eq!(probe.status().voices, s.voices);
+        assert_eq!(probe.status().version, v + 1, "a voice that moved is news");
+        // Only voice 1 moves: voice 0 (the one the position word holds) stays put.
+        s.voices[1].row = 7;
+        probe.publish_position(&s);
+        assert_eq!(probe.status().voices[1].row, 7);
+        assert_eq!(probe.status().version, v + 2);
+        probe.publish_position(&s);
+        assert_eq!(probe.status().version, v + 2, "the same voices do not");
     }
 
     #[test]

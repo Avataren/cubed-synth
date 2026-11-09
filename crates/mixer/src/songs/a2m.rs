@@ -160,7 +160,8 @@ impl SongPlayer for A2mPlayer {
             | SongControl::Scopes(_)
             | SongControl::SetOrder { .. }
             | SongControl::SetRestart(_)
-            | SongControl::SetTableRow { .. } => {}
+            | SongControl::SetTableRow { .. }
+            | SongControl::SeekVoice { .. } => {}
         }
     }
 
@@ -178,6 +179,7 @@ impl SongPlayer for A2mPlayer {
             rows: s.rows,
             frames: s.frames,
             version: 0,
+            voices: Default::default(),
         }
     }
 

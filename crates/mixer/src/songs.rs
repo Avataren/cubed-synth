@@ -495,7 +495,8 @@ impl ModuleSong {
             | SongControl::Timing { .. }
             | SongControl::SetOrder { .. }
             | SongControl::SetRestart(_)
-            | SongControl::SetTableRow { .. } => {}
+            | SongControl::SetTableRow { .. }
+            | SongControl::SeekVoice { .. } => {}
         }
     }
 }
@@ -537,6 +538,7 @@ impl From<cubed_tracker::Status> for SongStatus {
             rows: s.rows,
             frames: s.frames,
             version: s.version,
+            voices: Default::default(),
         }
     }
 }

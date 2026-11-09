@@ -848,6 +848,24 @@ fn mixer_sid_song_control() {
         SongControl::Scopes(false),
         SongControl::Scopes(true),
         SongControl::Seek { order: 1, row: 4 },
+        // Each voice by its own place: playing, stopped, and a place that is not there.
+        SongControl::SeekVoice {
+            voice: 2,
+            order: 0,
+            row: 9,
+        },
+        SongControl::Stop,
+        SongControl::SeekVoice {
+            voice: 1,
+            order: 0,
+            row: 5,
+        },
+        SongControl::SeekVoice {
+            voice: 7,
+            order: 3,
+            row: 99,
+        },
+        SongControl::Play,
     ];
     let encoded: Vec<Vec<u8>> = controls
         .iter()
