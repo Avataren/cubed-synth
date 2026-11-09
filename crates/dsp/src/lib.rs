@@ -20,6 +20,7 @@ pub mod seed;
 pub mod traits;
 pub mod utils;
 pub mod voice;
+pub mod wav;
 
 pub use automation::{AutomationFrame, ConnectionUpdate};
 pub use graph::AudioGraph;
