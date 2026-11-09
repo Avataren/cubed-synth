@@ -22,10 +22,25 @@
 //!
 //! [`PatchDoc::apply`] runs the same operations from a JSON description
 //! (`{"op": "connect", ...}`), for hosts that talk JSON.
+//!
+//! The patch's embedded audio (`audioAssets`) is edited too: a sampler's sample
+//! (`load_sample`, `clear_sample`, `set_sample`) and a wavetable oscillator's table of
+//! frames (`set_wavetable`, `wavetable_preset`, `wavetable_from_harmonics`, ...), kept
+//! in the DAW's own encoding so it reads the patch back (see the `samples` and
+//! `wavetables` modules). What they only read is [`PatchDoc::query`]'s (`sample_peaks`,
+//! `wavetable_preview`, ...), which never changes the sound and so is not an `apply`.
+//! An opt-in history ([`PatchDoc::apply`]'s `set_history`, `undo`, `redo`) moves what an
+//! operation replaced (an asset can be megabytes) into its undo step and back.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde_json::{json, Map, Value};
+
+mod assets;
+mod history;
+mod samples;
+mod wavetables;
 
 use crate::catalog::{
     self, effect_spec, node_spec, number, NodeSpec, StateShape, EFFECTS, EFFECT_ID_BASE,
@@ -104,9 +119,27 @@ pub struct BankEntry {
 }
 
 /// A patch document. See the module docs.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct PatchDoc {
     root: Value,
+    /// The embedded audio decoded, for the reads of a sample or a table.
+    decoded: RefCell<assets::Decoded>,
+    /// Undo and redo, if switched on (`set_history`).
+    history: history::History,
+}
+
+/// A clone is the document alone: no history (it can hold megabytes) and no decoded audio.
+impl Clone for PatchDoc {
+    fn clone(&self) -> PatchDoc {
+        PatchDoc::with_root(self.root.clone())
+    }
+}
+
+/// Documents are equal when their JSON is.
+impl PartialEq for PatchDoc {
+    fn eq(&self, other: &PatchDoc) -> bool {
+        self.root == other.root
+    }
 }
 
 type Res<T> = Result<T, String>;
@@ -114,23 +147,29 @@ type Res<T> = Result<T, String>;
 impl PatchDoc {
     // ----- making and reading ---------------------------------------------
 
+    fn with_root(root: Value) -> PatchDoc {
+        PatchDoc {
+            root,
+            decoded: RefCell::default(),
+            history: history::History::default(),
+        }
+    }
+
     /// A new playable patch: one oscillator through an amp envelope to the voice
     /// mixer, the eight effects in the default chain, eight voices.
     pub fn new(name: &str) -> PatchDoc {
-        let mut doc = PatchDoc {
-            root: json!({
-                "metadata": {"id": format!("patch_{}", NodeId::new().0.simple()), "name": name, "version": 1},
-                "synthState": {
-                    "layout": {
-                        "voiceCount": 8,
-                        "canonicalVoice": {"id": 0, "nodes": {}, "connections": []},
-                        "globalNodes": {},
-                    },
-                    "macros": {"values": [0, 0, 0, 0], "routes": []},
+        let mut doc = PatchDoc::with_root(json!({
+            "metadata": {"id": format!("patch_{}", NodeId::new().0.simple()), "name": name, "version": 1},
+            "synthState": {
+                "layout": {
+                    "voiceCount": 8,
+                    "canonicalVoice": {"id": 0, "nodes": {}, "connections": []},
+                    "globalNodes": {},
                 },
-                "audioAssets": {},
-            }),
-        };
+                "macros": {"values": [0, 0, 0, 0], "routes": []},
+            },
+            "audioAssets": {},
+        }));
         for system in [
             "global_frequency",
             "glide",
@@ -194,7 +233,7 @@ impl PatchDoc {
             return Err("not a patch: there is no synthState".into());
         }
         normalize(&mut root)?;
-        Ok(PatchDoc { root })
+        Ok(PatchDoc::with_root(root))
     }
 
     /// One patch of a bank file (`{metadata, patches: [..]}`).
@@ -547,10 +586,21 @@ impl PatchDoc {
         if let Some(routes) = self.routes_mut_if_any() {
             routes.retain(|r| r["targetId"].as_str() != Some(id));
         }
-        // Its embedded assets (`sample_<id>`, `impulse_response_<id>`, ...).
-        if let Some(assets) = self.root["audioAssets"].as_object_mut() {
-            let suffix = format!("_{id}");
-            assets.retain(|key, _| !key.ends_with(&suffix));
+        // Its embedded assets (`sample_<id>`, `impulse_response_<id>`, `wavetable_<id>`),
+        // kept for an undo if the history is on.
+        let suffix = format!("_{id}");
+        let owned: Vec<String> = self.root["audioAssets"]
+            .as_object()
+            .map(|assets| {
+                assets
+                    .keys()
+                    .filter(|key| key.ends_with(&suffix))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for key in owned {
+            self.put_asset(&key, None);
         }
         // The chain.
         if spec.is_some_and(|s| s.is_effect()) {
@@ -1179,11 +1229,41 @@ impl PatchDoc {
     /// - `{"op": "set_instrument_gain", "value": 1}`, `{"op": "set_voices", "count": 8}`
     /// - `{"op": "move_effect", "from": 0, "to": 2}`
     /// - `{"op": "set_editor", "editor": {..}}`, `{"op": "set_name", "name": ..}`
+    ///
+    /// Samples and wavetables (see the `samples` and `wavetables` modules for the fields):
+    ///
+    /// - `load_sample`, `clear_sample`, `set_sample` (a sampler's sample, root note, loop,
+    ///   gain, tuning)
+    /// - `set_wavetable`, `wavetable_preset`, `wavetable_from_keyframes`,
+    ///   `wavetable_from_harmonics`, `set_frame`, `insert_frame`, `copy_frame`,
+    ///   `delete_frame`, `interpolate_frames`, `wavetable_warp`, `normalize_wavetable`,
+    ///   `clear_wavetable`, `set_frame_position` (a wavetable oscillator's table)
+    ///
+    /// History (off until `set_history`): `{"op": "set_history", "steps": 100}`,
+    /// `{"op": "undo"}`, `{"op": "redo"}`. Any operation may carry a `"group": "<key>"`: an
+    /// operation in the same group as the one before it (a drag) joins its undo step.
+    ///
+    /// What only reads is not run here (a host would take it for a change and rebuild the
+    /// synth): see [`query`](Self::query).
     pub fn apply(&mut self, op: &Value) -> Res<Value> {
         let name = op
             .get("op")
             .and_then(Value::as_str)
             .ok_or("an operation needs an 'op'")?;
+        match name {
+            "undo" => return self.undo(),
+            "redo" => return self.redo(),
+            "set_history" => return self.set_history(op),
+            _ if READS.contains(&name) => {
+                return Err(format!("'{name}' only reads: ask for it with query"))
+            }
+            _ => {}
+        }
+        let group = op.get("group").and_then(Value::as_str);
+        self.record(name, group, |doc| doc.apply_op(name, op))
+    }
+
+    fn apply_op(&mut self, name: &str, op: &Value) -> Res<Value> {
         match name {
             "add_node" => {
                 let id = self.add_node(str_field(op, "type")?)?;
@@ -1278,10 +1358,94 @@ impl PatchDoc {
                 self.set_name(str_field(op, "name")?);
                 Ok(json!({}))
             }
+            "load_sample" => self.op_load_sample(op),
+            "clear_sample" => self.op_clear_sample(op),
+            "set_sample" => self.op_set_sample(op),
+            "set_wavetable" => self.op_set_wavetable(op),
+            "wavetable_preset" => self.op_wavetable_preset(op),
+            "wavetable_from_keyframes" => self.op_wavetable_from_keyframes(op),
+            "wavetable_from_harmonics" => self.op_wavetable_from_harmonics(op),
+            "set_frame" => self.op_set_frame(op),
+            "insert_frame" => self.op_insert_frame(op),
+            "copy_frame" => self.op_copy_frame(op),
+            "delete_frame" => self.op_delete_frame(op),
+            "interpolate_frames" => self.op_interpolate_frames(op),
+            "wavetable_warp" => self.op_wavetable_warp(op),
+            "normalize_wavetable" => self.op_normalize_wavetable(op),
+            "clear_wavetable" => self.op_clear_wavetable(op),
+            "set_frame_position" => self.op_set_frame_position(op),
             other => Err(format!("unknown operation '{other}'")),
         }
     }
+
+    /// Answers a question about the document as JSON, changing nothing (so a host
+    /// need not rebuild a playing synth for it):
+    ///
+    /// - `{"query": "sample_info", "node": ..}`, `"sample_peaks"`, `"sample_wav"`
+    /// - `"wavetable_info"`, `"wavetable"`, `"wavetable_preview"`, `"wavetable_harmonics"`,
+    ///   `"wavetable_presets"`
+    /// - `"history"`
+    ///
+    /// The name is the `"query"` field; `"op"` is accepted for it as well.
+    pub fn query(&self, question: &Value) -> Res<Value> {
+        let name = question
+            .get("query")
+            .or_else(|| question.get("op"))
+            .and_then(Value::as_str)
+            .ok_or("a question needs a 'query'")?;
+        match name {
+            "sample_info" => self.q_sample_info(question),
+            "sample_peaks" => self.q_sample_peaks(question),
+            "sample_wav" => self.q_sample_wav(question),
+            "wavetable_info" => self.q_wavetable_info(question),
+            "wavetable" => self.q_wavetable(question),
+            "wavetable_preview" => self.q_wavetable_preview(question),
+            "wavetable_harmonics" => self.q_wavetable_harmonics(question),
+            "wavetable_presets" => Ok(wavetables::presets_json()),
+            "history" => Ok(self.history_json()),
+            other if OPS.contains(&other) => {
+                Err(format!("'{other}' changes the document: run it with apply"))
+            }
+            other => Err(format!("unknown query '{other}'")),
+        }
+    }
 }
+
+/// The names `query` answers: `apply` refuses them.
+const READS: &[&str] = &[
+    "sample_info",
+    "sample_peaks",
+    "sample_wav",
+    "wavetable_info",
+    "wavetable",
+    "wavetable_preview",
+    "wavetable_harmonics",
+    "wavetable_presets",
+    "history",
+];
+
+/// The operations of the audio assets (for the message `query` gives for one).
+const OPS: &[&str] = &[
+    "load_sample",
+    "clear_sample",
+    "set_sample",
+    "set_wavetable",
+    "wavetable_preset",
+    "wavetable_from_keyframes",
+    "wavetable_from_harmonics",
+    "set_frame",
+    "insert_frame",
+    "copy_frame",
+    "delete_frame",
+    "interpolate_frames",
+    "wavetable_warp",
+    "normalize_wavetable",
+    "clear_wavetable",
+    "set_frame_position",
+    "undo",
+    "redo",
+    "set_history",
+];
 
 // ---------------------------------------------------------------------------
 // helpers

@@ -248,6 +248,12 @@ pub fn encode_wav_f32(samples: &[f32], rate: u32) -> Vec<u8> {
     out
 }
 
+/// How many bytes base64 text of this length (padded) decodes to.
+pub fn base64_decoded_len(text: &str) -> usize {
+    let padding = text.bytes().rev().take(2).filter(|b| *b == b'=').count();
+    (text.len() / 4 * 3).saturating_sub(padding)
+}
+
 pub fn base64_encode(bytes: &[u8]) -> String {
     BASE64.encode(bytes)
 }

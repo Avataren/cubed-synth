@@ -743,7 +743,7 @@ pub fn resample_cycle(frame: &[f32], to: usize) -> Vec<f32> {
     }
     // The shorter length's own Nyquist bin: split between the two mirrors going up, dropped
     // going down (it cannot be told from its alias).
-    if keep % 2 == 0 && n < to {
+    if keep.is_multiple_of(2) && n < to {
         let half = spectrum[n / 2] * 0.5;
         out[n / 2] = half;
         out[to - n / 2] = half;
