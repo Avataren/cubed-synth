@@ -6,7 +6,8 @@
 // checks the samples: a 0.25 DC clip on bus 1 (the bus at -6 dB, so 0.125),
 // then silence once it ends; and telemetry with meters and an Ended event.
 // Then an AHX song sent as a file, played through a low-pass effect, and a
-// MOD module.
+// MOD module. The equaliser effect (kind 9, 52 parameters) is compared with the
+// browser's own BiquadFilterNode chain set up as the DAW's equaliser is.
 // Puts the outcome in `window.result` for test/run.mjs.
 const RATE = 48000;
 const CLIP_FRAMES = 12000;
@@ -665,6 +666,125 @@ async function psidControlled() {
   return results;
 }
 
+// The command SetInsertParam (wire tag 23).
+function insertParam(bus, slot, param, value) {
+  const v = new DataView(new ArrayBuffer(9));
+  v.setUint8(0, 23); v.setUint16(1, bus, true); v.setUint8(3, slot); v.setUint8(4, param);
+  v.setFloat32(5, value, true);
+  return new Uint8Array(v.buffer);
+}
+
+// The equaliser's parameters (cubed_mixer::eq): bypass, graphic, then per band freq_hz,
+// gain_db, q, enabled, type (0 low shelf, 1 peaking, 2 high shelf).
+const EQ_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+const EQ_TYPES = ['lowshelf', 'peaking', 'peaking', 'peaking', 'peaking', 'peaking', 'peaking', 'peaking', 'peaking', 'highshelf'];
+function eqParams(gains, graphic) {
+  const p = new Float32Array(52);
+  p[1] = graphic ? 1 : 0;
+  EQ_FREQS.forEach((f, i) => {
+    const at = 2 + i * 5;
+    p[at] = f; p[at + 1] = gains[i]; p[at + 2] = i === 0 || i === 9 ? Math.SQRT1_2 : 0.7;
+    p[at + 3] = 1; p[at + 4] = i === 0 ? 0 : i === 9 ? 2 : 1;
+  });
+  return p;
+}
+
+// A second of deterministic white noise at -12 dB.
+function noise() {
+  const x = new Float32Array(RATE);
+  let s = 12345;
+  for (let i = 0; i < x.length; i++) {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    x[i] = (s / 4294967296 - 0.5) * 0.5;
+  }
+  return x;
+}
+
+// What the browser's BiquadFilterNodes make of the noise: the DAW's EqStage chain (Q 0.7,
+// the band gains `applied` that eqEffectiveGains solved for the curve).
+async function webAudioEq(input, applied) {
+  const context = new OfflineAudioContext(1, input.length, RATE);
+  const buffer = context.createBuffer(1, input.length, RATE);
+  buffer.copyToChannel(input, 0);
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  let cursor = source;
+  EQ_FREQS.forEach((f, i) => {
+    const band = context.createBiquadFilter();
+    band.type = EQ_TYPES[i];
+    band.frequency.value = f;
+    band.Q.value = 0.7;
+    band.gain.value = applied[i];
+    cursor.connect(band);
+    cursor = band;
+  });
+  cursor.connect(context.destination);
+  source.start();
+  return (await context.startRendering()).getChannelData(0);
+}
+
+// The mixer's equaliser in the worklet, the noise on bus 1. `setup` sends the effect (and
+// commands) to the node.
+async function mixerEq(input, setup) {
+  const context = new OfflineAudioContext(2, input.length, RATE);
+  const { node, ready } = await mixerNode(context, () => {});
+  node.port.postMessage({ type: 'clip', id: 0, sampleRate: RATE, left: input });
+  // The bus first (an insert needs it), then the effect, then the sound.
+  const bus = new Uint8Array(setBus(1, 0));
+  node.port.postMessage({ type: 'commands', bytes: bus.buffer }, [bus.buffer]);
+  setup(node);
+  const start = new Uint8Array(play(7, 0, 1));
+  node.port.postMessage({ type: 'commands', bytes: start.buffer }, [start.buffer]);
+  await ready;
+  return (await context.startRendering()).getChannelData(0);
+}
+
+function relativeError(got, want, from, to) {
+  let err = 0, power = 0;
+  for (let i = from; i < to; i++) { err += (got[i] - want[i]) ** 2; power += want[i] ** 2; }
+  return Math.sqrt(err / power);
+}
+
+async function eq() {
+  const input = noise();
+  const cases = [];
+  const smile = [6.71241939999613, 3.4320321166851233, 0.313019567677686, 0.8710019050656773, -2.4826074454791067, -2.493567118462061, 0.9086891863390868, 0.283986617284437, 3.868368043893052, 8.378222048881364];
+  const loFi = [-17.1528073197077, -7.081136355870035, -1.0676520903369457, 0.6700156696212223, 0.9973428247664018, 1.7958891429935155, 2.197705407129952, -0.45962255298510596, -8.808606952945626, -20.097156262225038];
+  const mixed = [-12, 9, -7, 3, 0, 12, -4, 8, -9, 5];
+  // The DAW's smile preset (5 4 2 0 -3 -3 0 2 4 5) in graphic mode, sent whole.
+  cases.push({ name: 'smile, graphic', applied: smile, from: 4800,
+    setup: (node) => node.port.postMessage({ type: 'effect', bus: 1, slot: 0, kind: 9,
+      params: eqParams([5, 4, 2, 0, -3, -3, 0, 2, 4, 5], true) }) });
+  // The lo-fi preset: only bypass and graphic sent (the rest are the defaults), the gains set
+  // by SetInsertParam commands, which the equaliser glides to.
+  cases.push({ name: 'lo-fi, graphic, by commands', applied: loFi, from: 24000,
+    setup: (node) => {
+      node.port.postMessage({ type: 'effect', bus: 1, slot: 0, kind: 9, params: new Float32Array([0, 1]) });
+      const gains = [-12, -9, -4, 0, 2, 3, 2, -3, -9, -12];
+      const bytes = new Uint8Array(gains.flatMap((g, i) => [...insertParam(1, 0, 3 + i * 5, g)]));
+      node.port.postMessage({ type: 'commands', bytes: bytes.buffer }, [bytes.buffer]);
+    } });
+  // Raw band gains, no fit.
+  cases.push({ name: 'parametric, raw gains', applied: mixed, from: 4800,
+    setup: (node) => node.port.postMessage({ type: 'effect', bus: 1, slot: 0, kind: 9, params: eqParams(mixed, false) }) });
+  const results = [];
+  for (const c of cases) {
+    const want = await webAudioEq(input, c.applied);
+    const got = await mixerEq(input, c.setup);
+    const first = got.findIndex((s) => s !== 0);
+    const shifted = got.subarray(first);
+    const n = Math.min(shifted.length, want.length) - 1;
+    results.push({
+      name: c.name, first,
+      // How far the mixer is from the browser's filters, and how far the filters are from the
+      // untouched noise (a comparison that would pass for a dry signal means nothing).
+      error: relativeError(shifted, want, c.from, n),
+      effect: relativeError(input, want, c.from, n),
+    });
+  }
+  return { ok: results.every((r) => r.first >= 0 && r.first < 256 && r.error < 2e-3 && r.effect > 0.2), results };
+}
+
 async function run() {
   const clips = await clip();
   const songs = await song();
@@ -679,10 +799,11 @@ async function run() {
   const ahx = await ahxControlled();
   const sid = await sidControlled();
   const psid = await psidControlled();
+  const equaliser = await eq();
   return {
     ok: clips.ok && songs.ok && modules.ok && synths.ok && synthEdits.ok && tapped.ok && swapped.ok
-      && bigSwapped.ok && controlled.ok && adlib.ok && ahx.ok && sid.ok && psid.ok,
-    clips, songs, modules, synths, synthEdits, tapped, swapped, bigSwapped, controlled, adlib, ahx, sid, psid,
+      && bigSwapped.ok && controlled.ok && adlib.ok && ahx.ok && sid.ok && psid.ok && equaliser.ok,
+    clips, songs, modules, synths, synthEdits, tapped, swapped, bigSwapped, controlled, adlib, ahx, sid, psid, equaliser,
   };
 }
 
