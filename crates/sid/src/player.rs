@@ -637,6 +637,20 @@ impl SidSongPlayer {
         self.ref_channel
     }
 
+    /// Shows, for every voice that is about to start its next row, that row as its place (what
+    /// `status` reports): after a seek the voices stand at the places they will read, and a stopped
+    /// song's position is where it will start. Playing on, the first frame sets the same places.
+    fn show_next_places(&mut self) {
+        for ch in &mut self.channels {
+            if ch.tick == 1 {
+                ch.play_order = ch.order;
+                ch.play_pattern = ch.pattern;
+                ch.play_row = ch.row;
+                ch.row_tick = 0;
+            }
+        }
+    }
+
     /// Plays one frame without the chip: the sequencer, the voices' state and the
     /// tables move on, no register is written (a seek's replay).
     fn replay_frame(&mut self) {
@@ -653,6 +667,7 @@ impl SidSongPlayer {
         self.reset_sequencer(self.subsong);
         let voice = self.ref_channel;
         self.replay_until(|p| p.rows[voice] >= row);
+        self.show_next_places();
         self.samples_to_frame = 0.0;
         self.loop_boundary();
     }
@@ -682,7 +697,9 @@ impl SidSongPlayer {
     /// where the song has them at that moment. The chip keeps running: notes that
     /// sounded carry on until a row retriggers them. Nothing is allocated; the
     /// replay costs about a microsecond a frame of the song before the place. On
-    /// error nothing moved. A loop stays set; preview mode and auditions stay.
+    /// error nothing moved. A loop stays set; preview mode and auditions stay. The status then
+    /// shows each voice that stands at the start of a row at that row (the sought voice at
+    /// `order` and `row`), also while the song is stopped.
     pub fn seek(
         &mut self,
         subsong: usize,
@@ -716,6 +733,7 @@ impl SidSongPlayer {
             self.restore(&before);
             return Err(SeekError::TooFar);
         }
+        self.show_next_places();
         self.samples_to_frame = 0.0;
         self.loop_boundary();
         Ok(())
