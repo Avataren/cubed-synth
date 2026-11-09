@@ -343,6 +343,7 @@ pub extern "C" fn cw_prepare_song(
         subsong: subsong as usize,
         looped: looped != 0,
         stereo_separation: (separation >= 0.0).then_some(separation),
+        ahx_hifi: true,
     };
     match prepare_song(s, source, format, options) {
         Ok(()) => 1,
@@ -386,7 +387,8 @@ pub extern "C" fn cw_prepare_start(seconds: f64) {
 /// 4 S3M, 5 XM (the formats `cubed_mixer::songs::open_controlled_song` puts under control;
 /// the others are refused); `separation` as for `cw_prepare_song`, for modules. `flags` bit 0 opens it stopped and
 /// under transport control (no sound until a `SongControl::Play`; its voice never
-/// ends by itself). Play it with a `PlaySource` command, steer it with
+/// ends by itself); bit 1 plays an AHX or HVL song on the replayer's own oscillators (the reference render,
+/// which aliases) instead of the band-limited ones that are the default. Play it with a `PlaySource` command, steer it with
 /// `SourceEvent::Song` commands (wire tag 30), and read it with `cw_songs_prepare`.
 /// Returns 1 on success; on failure 0, with the reason at `cw_error`.
 #[no_mangle]
@@ -406,6 +408,7 @@ pub extern "C" fn cw_prepare_module(
         subsong: subsong as usize,
         looped: looped != 0,
         stereo_separation: (separation >= 0.0).then_some(separation),
+        ahx_hifi: flags & 2 == 0,
     };
     match prepare_module(s, source, format, options, flags & 1 != 0) {
         Ok(()) => 1,
@@ -449,6 +452,7 @@ fn prepare_module(
         subsong: options.subsong,
         looped: options.looped,
         stereo_separation: options.stereo_separation,
+        ahx_hifi: options.ahx_hifi,
     };
     // A PSID tune is run to where it starts, here and not on the audio thread.
     let start = std::mem::take(&mut s.prepare_start);
@@ -657,6 +661,7 @@ struct SongOptions {
     subsong: usize,
     looped: bool,
     stereo_separation: Option<f32>,
+    ahx_hifi: bool,
 }
 
 #[cfg(feature = "songs")]
@@ -681,6 +686,7 @@ fn prepare_song(
         subsong: options.subsong,
         looped: options.looped,
         stereo_separation: options.stereo_separation,
+        ahx_hifi: options.ahx_hifi,
     };
     let song = open_song(format, &s.file, rate, options)?;
     s.mixer
@@ -1654,6 +1660,48 @@ mod tests {
         )));
         cw_process(128);
         assert_eq!(cw_voices(), 2);
+    }
+
+    /// An AHX song followed through `cw_prepare_module`: the default is the band-limited oscillators, and
+    /// `flags` bit 1 asks for the replayer's own; both prepare, and they do not render the same signal.
+    #[cfg(feature = "songs")]
+    #[test]
+    fn an_ahx_song_is_hifi_unless_the_flag_asks_for_the_reference() {
+        use cubed_mixer::{PlaySource, SongControl, SourceEvent, SourceId};
+        let song = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ahx/tests/fixtures/songs/a_new_beginning.ahx"
+        ))
+        .unwrap();
+        let render = |flags: u32| -> Vec<f32> {
+            let _turn = exports();
+            cw_init(48_000.0, 0, 0, 0, 3, 4);
+            send(Command::SetBus(BusId(2), BusSettings::default()));
+            let at = cw_file_buffer(song.len() as u32);
+            // SAFETY: cw_file_buffer made room for the file.
+            unsafe { std::ptr::copy_nonoverlapping(song.as_ptr(), at, song.len()) };
+            assert_eq!(cw_prepare_module(0, 0, 0, 1, -1.0, 1 | flags), 1);
+            send(Command::PlaySource(PlaySource::new(
+                VoiceId(1),
+                SourceId(0),
+                BusId(2),
+            )));
+            send(Command::SourceEvent {
+                voice: VoiceId(1),
+                event: SourceEvent::Song(SongControl::Play),
+            });
+            let mut out = Vec::new();
+            for _ in 0..200 {
+                cw_process(128);
+                // SAFETY: cw_process filled 128 frames at the left output.
+                let left = unsafe { std::slice::from_raw_parts(cw_left(), 128) };
+                out.extend_from_slice(left);
+            }
+            out
+        };
+        let (hifi, reference) = (render(0), render(2));
+        assert!(hifi.iter().any(|s| s.abs() > 0.01) && reference.iter().any(|s| s.abs() > 0.01));
+        assert_ne!(hifi, reference, "the flag chooses the oscillators");
     }
 
     /// A module file into `cw_file_buffer`.

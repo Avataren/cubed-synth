@@ -170,7 +170,7 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
             (message.subsong ?? 0) >>> 0,
             message.looped === false ? 0 : 1,
             separation,
-            message.stopped ? 1 : 0,
+            (message.stopped ? 1 : 0) | (message.hifi === false ? 2 : 0),
           ) === 1;
           this.songsOn = x.cw_song_count() > 0;
         } else {

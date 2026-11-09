@@ -112,6 +112,30 @@ fn peak(x: &[f32]) -> f32 {
 
 const SONG: &str = "a_new_beginning.ahx";
 
+/// The same song rendered with the band-limited oscillators (`ahx_hifi`, the default) and with the replayer's
+/// own: both play, they are not the same signal, and the options default to hi-fi.
+#[test]
+fn the_hifi_option_chooses_the_band_limited_oscillators() {
+    assert!(SongOptions::default().ahx_hifi, "hi-fi is the default");
+    let render = |hifi: bool| {
+        let options = SongOptions {
+            ahx_hifi: hifi,
+            ..SongOptions::default()
+        };
+        let mut rig = rig_of(
+            open_controlled_song(SongFormat::Ahx, &fixture(SONG), RATE, options, false).unwrap(),
+        );
+        rig.run(1.5)
+    };
+    let (hifi, reference) = (render(true), render(false));
+    assert!(energy(&hifi) > 1.0 && energy(&reference) > 1.0);
+    let difference: Vec<f32> = hifi.iter().zip(&reference).map(|(a, b)| a - b).collect();
+    assert!(
+        energy(&difference) > 1e-3 * energy(&reference),
+        "hi-fi renders the reference's signal"
+    );
+}
+
 #[test]
 fn a_song_opened_stopped_is_silent_until_played_and_keeps_its_voice() {
     let mut rig = rig(SONG, true);

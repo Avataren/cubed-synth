@@ -81,6 +81,11 @@ pub struct SongOptions {
     /// plays the module's own: 0.75 for MODs written for the Amiga's
     /// hard-panned channels, 1 otherwise.
     pub stereo_separation: Option<f32>,
+    /// AHX and HVL: play through `cubed_ahx`'s band-limited ("hi-fi") oscillators instead of the replayer's
+    /// own, which read their wave tables nearest-neighbour and so alias on high notes (as the original
+    /// does). On by default; off is the reference render byte for byte. The tables the song needs are built
+    /// while the player is built, never on the audio thread.
+    pub ahx_hifi: bool,
 }
 
 impl Default for SongOptions {
@@ -89,6 +94,7 @@ impl Default for SongOptions {
             subsong: 0,
             looped: true,
             stereo_separation: None,
+            ahx_hifi: true,
         }
     }
 }
@@ -227,7 +233,8 @@ pub fn open_ahx(
     options: SongOptions,
     stopped: bool,
 ) -> Result<Box<dyn Source>, String> {
-    let mut player = AhxSongPlayer::new(song, sample_rate, options.subsong)?;
+    let mut player =
+        AhxSongPlayer::with_hifi(song, sample_rate, options.subsong, options.ahx_hifi)?;
     if !stopped {
         player.control(SongControl::Play);
     }

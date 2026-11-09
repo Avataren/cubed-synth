@@ -40,10 +40,24 @@ pub struct AhxSongPlayer {
 }
 
 impl AhxSongPlayer {
-    /// A paused player at the start of `song` (subsong `subsong`; 0 is the main song). Plays
-    /// its first moments to warm up: make it off the audio thread.
+    /// A paused player at the start of `song` (subsong `subsong`; 0 is the main song), on the
+    /// replayer's own oscillators (the reference render). Plays its first moments to warm up: make
+    /// it off the audio thread.
     pub fn new(song: Song, sample_rate: f32, subsong: usize) -> Result<AhxSongPlayer, String> {
+        Self::with_hifi(song, sample_rate, subsong, false)
+    }
+
+    /// [`new`](Self::new) with the band-limited ("hi-fi") oscillators when `hifi` is set: every
+    /// table the song walks through is built here, before the warm-up, so the audio thread never
+    /// builds one. Building takes a moment longer for a long song.
+    pub fn with_hifi(
+        song: Song,
+        sample_rate: f32,
+        subsong: usize,
+        hifi: bool,
+    ) -> Result<AhxSongPlayer, String> {
         let mut player = AhxPlayer::from_song(song, sample_rate.round() as u32, STEREO_MODE)?;
+        player.set_hifi(hifi);
         player.set_levels(true);
         player.play();
         let (mut left, mut right) = ([0.0; CHUNK], [0.0; CHUNK]);
