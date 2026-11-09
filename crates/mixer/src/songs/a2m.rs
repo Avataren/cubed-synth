@@ -161,7 +161,8 @@ impl SongPlayer for A2mPlayer {
             | SongControl::SetOrder { .. }
             | SongControl::SetRestart(_)
             | SongControl::SetTableRow { .. }
-            | SongControl::SeekVoice { .. } => {}
+            | SongControl::SeekVoice { .. }
+            | SongControl::VoiceLoop { .. } => {}
         }
     }
 

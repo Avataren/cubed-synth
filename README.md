@@ -408,6 +408,7 @@ source.song_reader().unwrap();`, then `PrepareSource` and `PlaySource` as for an
 enum SongControl {
     Play, Stop, Seek { order: u16, row: u16 },
     SeekVoice { voice: u8, order: u16, row: u16 },    // SID: a seek by one voice's own place (wire kind 18)
+    VoiceLoop { voice: u8, range: Option<(u16, u16)> }, // SID: orderlist entries first..=last of one voice looped alone, None clears (wire kind 19)
     Loop(SongLoop),                                   // None | Pattern { order } | Range { order, row0, row1 }
     Mute { channel: u8, on: bool }, Solo { channel: u8, on: bool },
     MuteMask(u32), SoloMask(u32),                     // every channel at once, a bit each
@@ -437,7 +438,7 @@ batch): tag 30, 24 bytes, little endian: `u8 tag, u64 voice, u8 kind, u16 a, u16
 u32 frames`. Kinds: 0 Play, 1 Stop, 2 Seek (a order, b row), 3 Loop none, 4 Loop pattern (a order), 5 Loop
 range (a order, b row0, c row1), 6 Mute (a channel, b on), 7 Solo (a, b), 8 MuteMask (frames), 9 SoloMask
 (frames), 10 PreviewOn (a instrument, b note, value velocity, frames duration), 11 PreviewOff, 12 Looped
-(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order), 17 SetTableRow (a table | row << 8, b left | right << 8), 18 SeekVoice (a order, b row, c voice). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
+(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order), 17 SetTableRow (a table | row << 8, b left | right << 8), 18 SeekVoice (a order, b row, c voice), 19 VoiceLoop (a first, b last, c voice | 0x100 when a range is set). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
 number, u8 fm[11], u8 panning, i8 finetune, u8 voice_type`. Tag 31, 21 bytes: `u8 tag, u64 voice, u16 pattern, u16 row, u8 channel, u8 note
 (0 none, 255 key off, else MIDI; Adlib: the file's note byte), u16 period (Adlib: `effect2 << 8 | param2`), u8
 instrument, u8 volume, u8 effect, u8 param` (SetCell). An
@@ -533,7 +534,16 @@ row it will start; `valid` is true for the three voices). `Seek { order, row }`,
 `row` and `tick` stay **voice 0**'s: voice 0 reads row `row` of the pattern at its orderlist position `order`, a range loop repeats
 rows of voice 0's entry. `SeekVoice { voice, order, row }` is the same for any voice (`Seek` is `voice: 0`): the song is replayed to
 the moment that voice reads that row, so the other voices stand where the song has them then (voices that keep step with it show the
-same row), not where they were; stopped or playing, and a place the song does not have moves nothing. (`pattern` is the pattern
+same row), not where they were; stopped or playing, and a place the song does not have moves nothing.
+`VoiceLoop { voice, range: Some((first, last)) }` repeats orderlist entries `first..=last` (0-based, all their repeats) of that
+voice alone while the other voices play on (`None` clears it; a range the voice does not have changes nothing); each voice has a
+loop of its own, beside the song's `Loop`, which sends every voice back. It is `SidSongPlayer::set_voice_loop`: the voice's own
+state (its row and repeat, tempo, note, effects, and its wave, pulse and vibrato tables) is copied when it first reads the range's
+first row and put back at every end, so the repeats are that moment again, register for register (**exact**), without
+replaying anything; a loop set after the voice has gone past the range replays the song silently up to the range's start once (the
+cost of a seek). What the voices share is **not** put back and plays on (**approximate** where a song uses it inside the range):
+the filter (program, cutoff and routing, which any voice's instrument starts), funktempo's two row lengths, and a tempo command
+(F `$01`-`$7F`) another voice sets for all, which the looped voice, put back to the tempo it had, no longer follows. (`pattern` is the pattern
 number, `speed` the frames per row, `tempo` the timer's Hz, 50 x the speed multiplier, `rows` the song row of the reference voice;
 `SONG_MAX_VOICES` is the voices a status can carry.) The preview is the player's audition on voice 0 (held until
 `PreviewOff`, or for `duration` frames; over a playing song voice 0 is taken for it; a note is MIDI, 12 is C-0). `levels` are the
@@ -1008,6 +1018,7 @@ these):
 |---|---|
 | `seek(subsong, voice, order, row) -> Result<(), SeekError>` | Moves to the moment `voice` is about to read `row` of the pattern at orderlist position `order` (its first play): the song is replayed silently from the top, so the tempo, the other voices (they are where the song has them at that moment), the tables and the filter are right; the chip keeps running, so sounding notes carry on until a row retriggers them. About 0.02 us a frame replayed (a 5-minute song's end in 0.4 ms, release); `SEEK_MAX_FRAMES` bounds it. A place that does not exist, or is too far, moves nothing. `seek_row(song_row)` is the same by song row; both keep loops, masks and auditions |
 | `set_loop(SidLoop {voice, start, end})`, `loop_orders(voice, first, last)`, `set_loop_rows`, `set_loop(None)` | Repeats a range of one voice's rows (`SidSong::order_rows` gives the rows of orderlist entries): at `end` every voice goes back to where it was when `voice` reached `start`, from a copy of the sequencer taken when the player first passes `start`, so a repeat is free and exact, tempo and tables included. A loop set inside or past its range replays to its start once. It does not move the playhead: seek first |
+| `set_voice_loop(voice, Some((first, last)))`, `set_voice_loop(voice, None)`, `voice_loop(voice)` | Repeats orderlist entries `first..=last` of ONE voice while the others play on; each voice has its own, and `set_loop` works beside them. The voice's own state (row, repeat, tempo, note, effects, wave, pulse and vibrato tables) is copied when it first reads the range's first row and put back at its end: exact. The filter, funktempo and a tempo command another voice sets for all are shared and not put back: approximate where a song uses them inside the range. A loop set inside or past the range jumps back at the end of the voice's next row (one silent replay of the song's start to the range's, once). `frame()` takes the loops' jumps as `render` does |
 | `set_mute_solo(mute, solo)` | Masks of the three voices, a bit each; with any solo only soloed voices are heard (a voice both soloed and muted is not); muted voices read 0 in the taps and peaks; the song keeps playing all three |
 | `audition_on(voice, instrument, note)` / `audition_off(voice)`, `set_preview(bool)` | Plays instrument `instrument` (1-based) at note table index `note` (0 = C-0 .. 92 = G#7) on a voice, as a song note: envelope, first-frame wave and its wave, pulse, filter and speed tables running, vibrato after its delay, then released by `audition_off`. In preview mode the sequencer is off and any voices can be auditioned at once (a chord): no song needed. Over a playing song the voice is taken (its rows are not read, its counter runs on) until `audition_off` |
 | `status() -> SidStatus` | Per voice the orderlist position, pattern, row and tick (frames played of the row, 0 on its first) of the row it started last; the tempo (frames per row of the reference voice), `song_row` / `song_rows` (counted for the reference voice, `ref_voice()`), subsong, loop / preview / audition / mute / solo, frames played |

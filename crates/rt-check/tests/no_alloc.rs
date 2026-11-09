@@ -866,6 +866,28 @@ fn mixer_sid_song_control() {
             row: 99,
         },
         SongControl::Play,
+        // A voice's own loop: set, one that is not there, cleared; set again past its range.
+        SongControl::VoiceLoop {
+            voice: 1,
+            range: Some((0, 0)),
+        },
+        SongControl::VoiceLoop {
+            voice: 1,
+            range: Some((9, 12)),
+        },
+        SongControl::Seek { order: 0, row: 3 },
+        SongControl::VoiceLoop {
+            voice: 1,
+            range: None,
+        },
+        SongControl::VoiceLoop {
+            voice: 2,
+            range: Some((0, 0)),
+        },
+        SongControl::VoiceLoop {
+            voice: 2,
+            range: None,
+        },
     ];
     let encoded: Vec<Vec<u8>> = controls
         .iter()

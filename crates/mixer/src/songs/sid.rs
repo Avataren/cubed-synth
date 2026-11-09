@@ -9,7 +9,9 @@
 //! row, as the voice last started them) next to the old fields, which stay voice 0's. `Seek { order,
 //! row }` is voice 0 reading row `row` of the pattern at orderlist position `order`, and
 //! `SeekVoice { voice, order, row }` is the same for any voice (the others stand where the song has
-//! them when that voice gets there). `Loop` repeats rows of voice 0's entries.
+//! them when that voice gets there). `Loop` repeats rows of voice 0's entries (and every voice goes
+//! back with it); `VoiceLoop { voice, range }` repeats entries of one voice's orderlist alone while
+//! the others play on (see `SidSongPlayer::set_voice_loop` for what is exact).
 //!
 //! The preview (`PreviewOn`) is the player's audition on voice 0, held until `PreviewOff` or for
 //! `duration` frames; over a playing song voice 0 is taken for it. Note numbers are MIDI (the song's
@@ -170,6 +172,11 @@ impl SongPlayer for SidPlayer {
                     }
                 }
             },
+            SongControl::VoiceLoop { voice, range } => {
+                let _ = self
+                    .player
+                    .set_voice_loop(voice as usize, range.map(|(a, b)| (a as usize, b as usize)));
+            }
             SongControl::Mute { channel, on } => {
                 let bit = 1u8.checked_shl(channel as u32).unwrap_or(0);
                 self.set_masks(|m, s| (if on { m | bit } else { m & !bit }, s));

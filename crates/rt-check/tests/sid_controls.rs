@@ -139,6 +139,18 @@ fn the_sid_controls_do_not_allocate() {
                 })),
                 17 => player.set_loop_rows(Some((4, 9))),
                 19 => player.set_loop(None),
+                // Loops of one voice alone: one set while the voice is before, inside or past
+                // its range (the last one replays the song's start to the range's, in a block
+                // of its own, with nothing allocated), one with no such entries, and all cleared.
+                14 => assert!(player.set_voice_loop(0, Some((1, 1)))),
+                15 => assert!(player.set_voice_loop(2, Some((0, 0)))),
+                16 => assert!(!player.set_voice_loop(1, Some((0, 7)))),
+                18 => assert!(player.set_voice_loop(1, Some((0, 1)))),
+                20 => {
+                    for v in 0..3 {
+                        assert!(player.set_voice_loop(v, None));
+                    }
+                }
                 21 => {
                     player.set_preview(true);
                     assert!(player.audition_on(1, 2, 40));

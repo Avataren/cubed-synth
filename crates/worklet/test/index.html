@@ -307,7 +307,7 @@ async function bigSwap() {
 // followed, seeked while stopped, looped, previewed, muted, played and stopped by
 // wire commands; the page reads 'songpos' and 'songscope' messages.
 const SONG = { play: 0, stop: 1, seek: 2, loopNone: 3, loopPattern: 4, loopRange: 5, mute: 6, solo: 7,
-  muteMask: 8, soloMask: 9, previewOn: 10, previewOff: 11, looped: 12, scopes: 13, seekVoice: 18 };
+  muteMask: 8, soloMask: 9, previewOn: 10, previewOff: 11, looped: 12, scopes: 13, seekVoice: 18, voiceLoop: 19 };
 function songCommand(voice, kind, ...rest) {
   const v = new DataView(new ArrayBuffer(24));
   v.setUint8(0, 30); v.setBigUint64(1, BigInt(voice), true); v.setUint8(9, kind);
@@ -615,6 +615,14 @@ async function sidControlled() {
   send(songCommand(5, SONG.seekVoice, 0, 9, 2));
   const voiceSeeked = await waitFor((p) => p.voices[2].row === 9 && p.voices[2].pattern === 2, 3000, positions.length);
   const othersStayed = !!voiceSeeked && voiceSeeked.voices[0].row === 9 && voiceSeeked.voices[1].row === 9 && !voiceSeeked.playing;
+  // A loop of one voice's entries (kind 19: a first, b last, c voice | 0x100 when set): voice 2 loops its entry 0 (the
+  // fixture's lists have one entry each, so this shows the kind decodes and the song plays on, no more), then clears it.
+  send(songCommand(5, SONG.voiceLoop, 0, 0, 2 | 0x100), songCommand(5, SONG.play));
+  const markLoop = positions.length;
+  await sleep(700);
+  const looping = positions.slice(markLoop);
+  const loopHeld = looping.length > 3 && new Set(looping.map((p) => p.voices[2].row)).size >= 6 && looping.every((p) => p.voices[2].order === 0);
+  send(songCommand(5, SONG.voiceLoop, 0, 0, 2), songCommand(5, SONG.stop));
   send(stop(5, 0));
   await sleep(100);
   send(setBus(3, 0));
@@ -626,7 +634,7 @@ async function sidControlled() {
     seeked: !!seeked, moved: rows.length >= 3 && during.some((p) => p.playing && p.playing),
     loud: loudest > 0.001, previewed, stopped: !!stopped, gone: !!gone,
     voicesReported: !!first && first.voices.every((v, k) => v.valid && v.pattern === k && v.row === 0 && v.order === 0),
-    voicesTogether: voices, voicesApart: apart, voiceSeeked: !!voiceSeeked, othersWhereTheSongHasThem: othersStayed,
+    voicesTogether: voices, voicesApart: apart, voiceSeeked: !!voiceSeeked, othersWhereTheSongHasThem: othersStayed, voiceLoop: loopHeld,
   };
   results.ok = Object.values(results.checks).every(Boolean);
   return results;

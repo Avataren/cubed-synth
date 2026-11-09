@@ -437,6 +437,12 @@ fn song_fields(control: &SongControl) -> (u8, u16, u16, u16, f32, u32) {
         ),
         // Encoded with a tag of its own.
         SongControl::SeekVoice { voice, order, row } => (18, order, row, voice as u16, 0.0, 0),
+        // `c`: the voice, plus 0x100 when a range is set (`a` first, `b` last).
+        SongControl::VoiceLoop { voice, range } => {
+            let (first, last) = range.unwrap_or((0, 0));
+            let on = if range.is_some() { 0x100 } else { 0 };
+            (19, first, last, voice as u16 | on, 0.0, 0)
+        }
         SongControl::SetCell(_) | SongControl::SetInstrument(_) => unreachable!(),
     }
 }
@@ -500,6 +506,10 @@ fn song_control(
             voice: c.min(255) as u8,
             order: a,
             row: b,
+        },
+        19 => SongControl::VoiceLoop {
+            voice: c as u8,
+            range: (c & 0x100 != 0).then_some((a, b)),
         },
         // The tag is known; the kind is from a newer sender.
         _ => return Err(WireError::UnknownTag(tag::SONG_CONTROL)),
@@ -1301,6 +1311,18 @@ mod tests {
                 voice: 2,
                 order: 255,
                 row: 4095,
+            },
+            SongControl::VoiceLoop {
+                voice: 2,
+                range: Some((3, 65535)),
+            },
+            SongControl::VoiceLoop {
+                voice: 1,
+                range: Some((0, 0)),
+            },
+            SongControl::VoiceLoop {
+                voice: 0,
+                range: None,
             },
         ];
         let instrument = SongInstrument {

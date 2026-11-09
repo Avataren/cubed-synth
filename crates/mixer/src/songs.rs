@@ -496,7 +496,8 @@ impl ModuleSong {
             | SongControl::SetOrder { .. }
             | SongControl::SetRestart(_)
             | SongControl::SetTableRow { .. }
-            | SongControl::SeekVoice { .. } => {}
+            | SongControl::SeekVoice { .. }
+            | SongControl::VoiceLoop { .. } => {}
         }
     }
 }

@@ -75,6 +75,15 @@ pub enum SongControl {
     /// Repeats a pattern or a range of rows (see [`SongLoop`]); it does not move
     /// the playhead, so seek first.
     Loop(SongLoop),
+    /// Repeats entries `first..=last` of one voice's order list (SID: each voice has its own,
+    /// 0-based) while the other voices play on; `None` clears that voice's loop. A voice has a
+    /// loop of its own, beside the song's (`Loop`, which moves every voice). Entries the song
+    /// does not have change nothing. Wire kind 19. Formats whose channels share one order list
+    /// ignore it.
+    VoiceLoop {
+        voice: u8,
+        range: Option<(u16, u16)>,
+    },
     Mute {
         channel: u8,
         on: bool,

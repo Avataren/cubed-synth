@@ -505,7 +505,8 @@ fn a_song_that_is_not_one_is_refused_in_every_controlled_format() {
     // format are an error, not a silent voice.
     for format in [SongFormat::A2m, SongFormat::Ahx, SongFormat::Sid] {
         assert!(
-            open_controlled_song(format, b"not a song", RATE, SongOptions::default(), true).is_err(),
+            open_controlled_song(format, b"not a song", RATE, SongOptions::default(), true)
+                .is_err(),
             "{format:?}"
         );
     }

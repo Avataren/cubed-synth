@@ -450,3 +450,59 @@ fn a_voice_is_seeked_by_its_own_place_while_stopped_or_playing_and_by_wire() {
         );
     }
 }
+
+#[test]
+fn a_voice_loops_its_own_entries_while_the_others_play_on_by_wire() {
+    let mut rig = rig_of(open_sid(staggered_song(), RATE, SongOptions::default(), true).unwrap());
+    // Voice 1 has two entries (patterns 1 and 3); loop the second. Voices 0 and 2 have one each.
+    rig.control_by_wire(SongControl::VoiceLoop {
+        voice: 1,
+        range: Some((1, 1)),
+    });
+    // A range the voice does not have is refused and changes nothing.
+    rig.control_by_wire(SongControl::VoiceLoop {
+        voice: 1,
+        range: Some((1, 5)),
+    });
+    rig.control_by_wire(SongControl::VoiceLoop {
+        voice: 9,
+        range: Some((0, 0)),
+    });
+    rig.control(SongControl::Play);
+    let mut orders = Vec::new();
+    let mut rows0 = std::collections::BTreeSet::new();
+    for _ in 0..100 {
+        rig.run(0.05);
+        let s = rig.reader.status();
+        orders.push(s.voices[1].order);
+        rows0.insert(s.voices[0].row);
+    }
+    assert!(
+        orders.contains(&0),
+        "voice 1 starts on its first entry: {orders:?}"
+    );
+    let first_loop = orders
+        .iter()
+        .position(|&o| o == 1)
+        .expect("and reaches the second");
+    assert!(
+        orders[first_loop..].iter().all(|&o| o == 1),
+        "then stays in it: {orders:?}"
+    );
+    assert_eq!(
+        rows0.len(),
+        4,
+        "voice 0 plays all its rows round and round: {rows0:?}"
+    );
+    // Cleared, voice 1 goes on to the end of its list and round again.
+    rig.control_by_wire(SongControl::VoiceLoop {
+        voice: 1,
+        range: None,
+    });
+    let mut orders = std::collections::BTreeSet::new();
+    for _ in 0..80 {
+        rig.run(0.05);
+        orders.insert(rig.reader.status().voices[1].order);
+    }
+    assert_eq!(orders.len(), 2, "{orders:?}");
+}

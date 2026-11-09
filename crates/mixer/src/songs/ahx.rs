@@ -151,7 +151,8 @@ impl SongPlayer for AhxSongPlayer {
             | SongControl::SetInstrument(_)
             | SongControl::Timing { .. }
             | SongControl::SetTableRow { .. }
-            | SongControl::SeekVoice { .. } => {}
+            | SongControl::SeekVoice { .. }
+            | SongControl::VoiceLoop { .. } => {}
         }
     }
 
