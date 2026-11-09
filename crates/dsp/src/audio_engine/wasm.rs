@@ -79,7 +79,9 @@ fn import_wav_hound_reader<R: std::io::Read>(
         // Generate a mipmapped bank using our dynamic method.
         let bank = generate_mipmapped_bank_dynamic(cycle_samples, base_size, sample_rate)?;
         // Wrap the bank in your collection’s expected type (for example, MipmappedWavetable).
-        let mipmapped = MipmappedWavetable { bank };
+        let mipmapped = MipmappedWavetable {
+            bank: Arc::new(bank),
+        };
         collection.add_wavetable(mipmapped);
     }
 

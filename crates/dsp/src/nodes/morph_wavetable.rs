@@ -1,7 +1,11 @@
 // morph_wavetable.rs
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::collections::VecDeque;
+use std::hash::Hasher;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 use web_sys::console;
 
@@ -13,7 +17,7 @@ fn log_console(message: &str) {
 #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
 fn log_console(_message: &str) {}
 
-use super::{Waveform, WavetableBank};
+use super::{generate_mipmapped_bank_dynamic, Waveform, Wavetable, WavetableBank};
 // Import the FFT-based mipmapping types (adjust the module path as needed)
 
 /// Cubic interpolation helper. Assumes the samples slice is cyclic.
@@ -36,9 +40,11 @@ pub fn cubic_interp(samples: &[f32], pos: f32) -> f32 {
     a * frac * frac * frac + b * frac * frac + c * frac + d
 }
 
-/// A mipmapped wavetable that contains a bank of band-limited tables.
+/// A mipmapped wavetable that contains a bank of band-limited tables. The bank
+/// is shared: a frame that has been built once is built again by nothing
+/// (see [`mipmapped_frame`]).
 pub struct MipmappedWavetable {
-    pub bank: WavetableBank,
+    pub bank: Arc<WavetableBank>,
 }
 
 /// A collection of mipmapped wavetables used for morphing between different waveforms.
@@ -178,5 +184,143 @@ pub fn generate_mipmapped_bank(
         "Generated mipmapped bank for {:?} waveform",
         waveform
     ));
-    MipmappedWavetable { bank }
+    MipmappedWavetable {
+        bank: Arc::new(bank),
+    }
+}
+
+/// How much built frames the cache keeps (their samples and mip levels), in bytes.
+#[cfg(target_arch = "wasm32")]
+const FRAME_CACHE_BYTES: usize = 24 << 20;
+#[cfg(not(target_arch = "wasm32"))]
+const FRAME_CACHE_BYTES: usize = 96 << 20;
+
+struct CachedFrame {
+    samples: Vec<f32>,
+    rate: f32,
+    bank: Arc<WavetableBank>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct FrameCache {
+    frames: FxHashMap<u64, CachedFrame>,
+    order: VecDeque<u64>,
+    bytes: usize,
+}
+
+static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// How many frames [`mipmapped_frame`] has found built and how many it has built.
+pub fn frame_cache_stats() -> (u64, u64) {
+    (
+        CACHE_HITS.load(Ordering::Relaxed),
+        CACHE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+fn frame_cache() -> &'static Mutex<FrameCache> {
+    static CACHE: OnceLock<Mutex<FrameCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(FrameCache::default()))
+}
+
+fn frame_key(samples: &[f32], rate: f32) -> u64 {
+    let mut hasher = FxHasher::default();
+    hasher.write_u32(rate.to_bits());
+    hasher.write_usize(samples.len());
+    for s in samples {
+        hasher.write_u32(s.to_bits());
+    }
+    hasher.finish()
+}
+
+/// The mip levels of one cycle of a wavetable (`samples`, a power of two or
+/// not, at engine rate `rate`), as [`generate_mipmapped_bank_dynamic`] builds
+/// them. Building one costs a forward FFT and an inverse one for every level
+/// (a dozen), so a bank is kept (up to a few tens of MB across all frames, the
+/// oldest dropped first) and handed out again to any engine that asks for the
+/// same cycle: a wavetable of 256 frames in which one frame was edited builds
+/// that frame only when the patch is built again.
+///
+/// A cycle with nothing above the DC offset in it (a silent frame) is a silent
+/// table: the DAW's loader refuses such a patch, this plays it as silence.
+pub fn mipmapped_frame(samples: &[f32], rate: f32) -> Result<MipmappedWavetable, String> {
+    let key = frame_key(samples, rate);
+    {
+        let cache = frame_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.frames.get(&key) {
+            if hit.rate == rate && hit.samples == samples {
+                CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                return Ok(MipmappedWavetable {
+                    bank: hit.bank.clone(),
+                });
+            }
+        }
+    }
+    CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    let size = samples.len();
+    let bank = match generate_mipmapped_bank_dynamic(samples.to_vec(), size, rate) {
+        Ok(bank) => bank,
+        Err(e) if e.to_string().contains("No significant harmonics") => WavetableBank {
+            tables: vec![Wavetable {
+                samples: vec![0.0; size + 1],
+                table_size: size,
+                top_freq_hz: f32::MAX,
+            }],
+        },
+        Err(e) => return Err(e.to_string()),
+    };
+    let bytes = size * 4
+        + bank
+            .tables
+            .iter()
+            .map(|t| t.samples.len() * 4)
+            .sum::<usize>();
+    let bank = Arc::new(bank);
+    let mut cache = frame_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = cache.frames.remove(&key) {
+        cache.bytes -= old.bytes;
+        cache.order.retain(|k| *k != key);
+    }
+    cache.bytes += bytes;
+    cache.order.push_back(key);
+    cache.frames.insert(
+        key,
+        CachedFrame {
+            samples: samples.to_vec(),
+            rate,
+            bank: bank.clone(),
+            bytes,
+        },
+    );
+    while cache.bytes > FRAME_CACHE_BYTES && cache.order.len() > 1 {
+        if let Some(oldest) = cache.order.pop_front() {
+            if let Some(gone) = cache.frames.remove(&oldest) {
+                cache.bytes -= gone.bytes;
+            }
+        }
+    }
+    Ok(MipmappedWavetable { bank })
+}
+
+/// A collection of the frames of one wavetable (a cycle each; their count
+/// and the oscillator's `wave_index` morph along them), at engine rate `rate`.
+pub fn collection_from_frames(
+    frames: &[&[f32]],
+    rate: f32,
+) -> Result<WavetableMorphCollection, String> {
+    let mut collection = WavetableMorphCollection::new();
+    for frame in frames {
+        collection.add_wavetable(mipmapped_frame(frame, rate)?);
+    }
+    Ok(collection)
+}
+
+/// Bytes the frame cache holds now (for tests and diagnostics).
+pub fn frame_cache_bytes() -> usize {
+    frame_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bytes
 }

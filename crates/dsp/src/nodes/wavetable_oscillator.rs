@@ -635,7 +635,8 @@ impl WavetableOscillator {
                 }
             }
         };
-        let max_wt_index = collection.num_tables() as f32 - 1.0001;
+        // A table of one frame has nowhere to morph to (and `clamp` panics for max < min).
+        let max_wt_index = (collection.num_tables() as f32 - 1.0001).max(0.0);
         let base_detune_factor = self.cent_ratio.powf(self.target_detune);
         let sr_recip = self.sample_rate_recip;
         let semitone_ratio = self.semitone_ratio;

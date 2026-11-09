@@ -293,6 +293,10 @@ impl AudioEngine {
         self.connect_from_canonical_voice(canonical_voice)?;
         self.apply_patch_states(&patch, canonical_voice)?;
         self.import_audio_assets(&patch.audio_assets)?;
+        // A sample comes with its own `SampleData`, which has not got the node's root note yet.
+        for sampler in patch.synth_state.samplers.values() {
+            self.apply_sampler_state(sampler)?;
+        }
         self.apply_patch_macros(&patch.synth_state);
         self.build_live(patch);
 
@@ -419,8 +423,11 @@ impl AudioEngine {
                     })?;
                     self.import_wave_impulse(effect, &data)?;
                 }
-                // The wasm engine does not import wavetables from patches either.
-                "wavetable" => {}
+                "wavetable" => self.import_wavetable(
+                    parse_node_id(&node_id)?,
+                    &data,
+                    crate::wavetable_edit::FRAME_SIZE,
+                )?,
                 other => eprintln!("Unknown audio asset type: {other}"),
             }
         }
@@ -445,6 +452,41 @@ impl AudioEngine {
             sampler.set_sample_data(data.clone());
         }
         self.sampler_data.insert(sampler_id, data);
+        Ok(())
+    }
+
+    /// Loads a WAV as the wavetable of an oscillator node (in every voice): the
+    /// file is cut into frames of `base_size` samples (the DAW's is 2,048, up to
+    /// 256 of them), each is mipmapped for the engine's rate, and the node's
+    /// `wave_index` morphs along them. The mip levels of a frame that was built
+    /// before (an earlier engine, an earlier edit of the same patch) are not
+    /// built again, so putting a wavetable back after one frame changed costs
+    /// the frame's FFTs and a decode, not 256 frames' worth.
+    pub fn import_wavetable(
+        &mut self,
+        oscillator_id: NodeId,
+        wav: &[u8],
+        base_size: usize,
+    ) -> Result<(), String> {
+        let (table, _) = crate::wavetable_edit::Table::from_wav(wav, base_size)?;
+        let frames: Vec<&[f32]> = (0..table.frames()).map(|i| table.frame(i)).collect();
+        let collection =
+            crate::nodes::morph_wavetable::collection_from_frames(&frames, self.sample_rate)?;
+        let name = format!("wt_{oscillator_id}");
+        for voice in &mut self.voices {
+            let node = voice
+                .graph
+                .get_node_mut(oscillator_id)
+                .ok_or("Node not found")?;
+            let osc = node
+                .as_any_mut()
+                .downcast_mut::<WavetableOscillator>()
+                .ok_or("Node is not a WavetableOscillator")?;
+            osc.set_current_wavetable(&name);
+        }
+        self.wavetable_synthbank
+            .borrow_mut()
+            .add_collection(name, collection);
         Ok(())
     }
 
@@ -866,6 +908,10 @@ impl AudioEngine {
             voice.graph.delete_node(node_id);
         }
         self.sampler_data.remove(&node_id);
+        self.wavetable_synthbank
+            .borrow_mut()
+            .collections
+            .remove(&format!("wt_{node_id}"));
         Ok(())
     }
 
@@ -890,6 +936,10 @@ impl AudioEngine {
     ) -> Result<(), String> {
         // Use the same creation order as wasm to ensure consistency
         self.sampler_data.clear();
+        self.wavetable_synthbank
+            .borrow_mut()
+            .collections
+            .retain(|name, _| name == "default");
         for_each_node_in_creation_order(canonical_voice, |node_type, patch_node| {
             let id = parse_node_id(&patch_node.id)?;
 
