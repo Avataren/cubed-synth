@@ -847,3 +847,238 @@ fn a_baked_tempo_plays_as_the_start_tempo_did() {
     }
     assert!(compared > 200, "{compared} frames compared");
 }
+
+/// `song()` without its tempo change: nothing a voice does reaches the others, so a loop of
+/// one voice is exact.
+fn song_even() -> SidSong {
+    let mut d = SidDoc::from_song(song()).unwrap();
+    ok(
+        &mut d,
+        json!({"op": "set_cell", "pattern": 3, "row": 0, "command": 0, "param": 0}),
+    );
+    d.song().clone()
+}
+
+/// The place of every voice, as a frame leaves it.
+type Places = ([u8; 3], [u8; 3], [u8; 3]);
+
+fn places(p: &SidSongPlayer) -> Places {
+    let s = p.status();
+    (s.order, s.row, s.tick)
+}
+
+#[test]
+fn a_voice_loop_repeats_its_range_while_the_others_play_on() {
+    let s = song_even();
+    // Entry 1 of every voice is 16 rows of 6 frames: 96 frames a pass.
+    assert_eq!(s.order_rows(0, 2, 1, 1), Some((16, 32)));
+    let mut looped = player(&s);
+    let mut free = player(&s);
+    assert!(looped.set_voice_loop(2, Some((1, 1))));
+    assert_eq!(looped.voice_loop(2), Some((1, 1)));
+    assert_eq!(looped.voice_loop(0), None);
+    assert!(looped.status().looping);
+    let mut voice2 = Vec::new();
+    let mut orders = [
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    ];
+    for _ in 0..2400 {
+        looped.frame();
+        free.frame();
+        let (a, b) = (looped.status(), free.status());
+        // The other voices play exactly as they do without the loop.
+        for v in 0..2 {
+            assert_eq!(
+                (a.order[v], a.row[v], a.tick[v]),
+                (b.order[v], b.row[v], b.tick[v])
+            );
+            orders[v].insert(a.order[v]);
+        }
+        let c = looped.chip();
+        let regs: Vec<_> = (0..2)
+            .map(|v| {
+                (
+                    c.voice(v).frequency(),
+                    c.voice(v).pulse_width(),
+                    c.voice(v).control(),
+                )
+            })
+            .collect();
+        assert_eq!(regs, {
+            let c = free.chip();
+            (0..2)
+                .map(|v| {
+                    (
+                        c.voice(v).frequency(),
+                        c.voice(v).pulse_width(),
+                        c.voice(v).control(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        voice2.push((a.order[2], a.row[2], a.tick[2], {
+            let v = c.voice(2);
+            (v.frequency(), v.pulse_width(), v.control())
+        }));
+    }
+    assert!(
+        orders.iter().all(|o| o.len() == 2),
+        "voices 0 and 1 run through both entries"
+    );
+    // Voice 2 reads entry 0 once (96 frames), then entry 1 over and over.
+    assert!(voice2[..96].iter().all(|v| v.0 == 0));
+    assert!(
+        voice2[96..].iter().all(|v| v.0 == 1),
+        "never leaves its range"
+    );
+    // From the second time round the passes are the same moment again, register by register.
+    let pass = |k: usize| &voice2[96 * k..96 * (k + 1)];
+    assert_eq!(pass(1), pass(2));
+    assert_eq!(pass(2), pass(5));
+    assert_ne!(
+        pass(1)[..],
+        voice2[..96],
+        "the first pass came from entry 0"
+    );
+    // Clearing it lets the voice go on to its end and round again.
+    assert!(looped.set_voice_loop(2, None));
+    assert_eq!(looped.voice_loop(2), None);
+    assert!(!looped.status().looping);
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..400 {
+        looped.frame();
+        seen.insert(looped.status().order[2]);
+    }
+    assert_eq!(seen.len(), 2, "back to running through both entries");
+}
+
+#[test]
+fn a_voice_loop_set_in_or_past_its_range_goes_back_at_the_next_row_end() {
+    let s = song_even();
+    // Inside: voice 2 is on entry 1, row 5, when its loop of entry 1 is set.
+    let mut p = player(&s);
+    play_to(&mut p, 2, 1, 5);
+    assert!(p.set_voice_loop(2, Some((1, 1))));
+    let mut orders = std::collections::BTreeSet::new();
+    let mut rows = std::collections::BTreeSet::new();
+    for _ in 0..1000 {
+        p.frame();
+        orders.insert(p.status().order[2]);
+        rows.insert(p.status().row[2]);
+    }
+    assert_eq!(orders, [1].into(), "stays on entry 1");
+    assert_eq!(rows.len(), 16, "every row of it comes round");
+    // Past: voice 2 is on entry 1 when a loop of entry 0 is set: back to entry 0 at the next row's end.
+    let mut q = player(&s);
+    play_to(&mut q, 2, 1, 5);
+    assert!(q.set_voice_loop(2, Some((0, 0))));
+    for _ in 0..8 {
+        q.frame();
+    }
+    assert_eq!(q.status().order[2], 0, "jumped back");
+    let mut orders = std::collections::BTreeSet::new();
+    let mut others = std::collections::BTreeSet::new();
+    for _ in 0..1000 {
+        q.frame();
+        orders.insert(q.status().order[2]);
+        others.insert(q.status().order[0]);
+    }
+    assert_eq!(orders, [0].into());
+    assert_eq!(
+        others,
+        [0, 1].into(),
+        "the others were not touched: voice 0 runs through its entries"
+    );
+}
+
+#[test]
+fn every_voice_has_a_loop_of_its_own_and_a_refused_one_changes_nothing() {
+    let s = song_even();
+    let mut p = player(&s);
+    assert!(p.set_voice_loop(0, Some((0, 0))));
+    assert!(p.set_voice_loop(2, Some((1, 1))));
+    assert!(!p.set_voice_loop(3, Some((0, 0))), "no voice 3");
+    assert!(!p.set_voice_loop(1, Some((5, 5))), "no entry 5");
+    assert!(!p.set_voice_loop(1, Some((1, 0))), "first after last");
+    assert_eq!(p.voice_loop(1), None);
+    assert_eq!(p.voice_loop(0), Some((0, 0)));
+    assert!(!p.set_voice_loop(0, Some((0, 9))));
+    assert_eq!(p.voice_loop(0), Some((0, 0)), "kept");
+    let mut o0 = std::collections::BTreeSet::new();
+    let mut o1 = std::collections::BTreeSet::new();
+    let mut o2 = std::collections::BTreeSet::new();
+    for _ in 0..1500 {
+        p.frame();
+        let st = p.status();
+        o0.insert(st.order[0]);
+        o1.insert(st.order[1]);
+        o2.insert(st.order[2]);
+    }
+    assert_eq!(o0, [0].into());
+    assert_eq!(o1.len(), 2, "voice 1 plays on through both entries");
+    assert_eq!(
+        o2,
+        [0, 1].into(),
+        "voice 2 reads entry 0 once, then loops entry 1"
+    );
+    // A whole-song loop works beside them.
+    let mut q = player(&s);
+    assert!(q.set_voice_loop(2, Some((1, 1))));
+    assert!(q.loop_orders(0, 0, 0));
+    for _ in 0..1500 {
+        q.frame();
+        assert!(
+            q.status().order[0] == 0,
+            "the song loop holds voice 0 in entry 0"
+        );
+    }
+}
+
+#[test]
+fn a_seek_keeps_the_voice_loops_and_finds_their_start_again() {
+    let s = song_even();
+    let mut p = player(&s);
+    assert!(p.set_voice_loop(1, Some((1, 1))));
+    // Seeking voice 1 into the middle of its range: the loop stays, its start is replayed once.
+    p.seek(0, 1, 1, 9).unwrap();
+    assert_eq!(p.voice_loop(1), Some((1, 1)));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut rows = std::collections::BTreeSet::new();
+    for _ in 0..800 {
+        p.frame();
+        seen.insert(p.status().order[1]);
+        rows.insert(p.status().row[1]);
+    }
+    assert_eq!(seen, [1].into());
+    assert_eq!(rows.len(), 16);
+    // A stopped (preview) player does not loop; playing on does.
+    let mut q = player(&s);
+    q.set_voice_loop(2, Some((0, 0)));
+    q.set_preview(true);
+    for _ in 0..400 {
+        q.frame();
+    }
+    assert_eq!(places(&q).0, [0; 3], "stopped: nothing moves");
+    q.set_preview(false);
+    for _ in 0..800 {
+        q.frame();
+        assert_eq!(q.status().order[2], 0);
+    }
+}
+
+#[test]
+fn a_voice_loop_over_a_shared_tempo_command_is_approximate_but_stays_in_range() {
+    // song() has voice 0's second pattern set the tempo for all: voice 2's restored state has the
+    // old tempo while the others run at the new one. The loop still holds its range.
+    let s = song();
+    let mut p = player(&s);
+    assert!(p.set_voice_loop(2, Some((1, 1))));
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..3000 {
+        p.frame();
+        seen.insert(p.status().order[2]);
+    }
+    assert_eq!(seen, [0, 1].into());
+    assert_eq!(p.status().order[2], 1);
+}

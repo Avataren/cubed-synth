@@ -142,6 +142,10 @@
 //!     from a copy of the sequencer taken when the player first passes `start`, so a
 //!     repeat costs nothing and plays the moment exactly (`SidSong::order_rows` turns
 //!     orderlist positions into rows);
+//!   - `set_voice_loop(voice, Some((first, last)))`: orderlist entries of ONE voice repeated
+//!     while the other voices play on. Each voice has its own; the voice's own state is
+//!     copied at the range's start and put back at its end (exact), the state the voices
+//!     share (the filter, funktempo, a tempo command for all) is not (approximate there);
 //!   - `set_mute_solo(mute, solo)`, `audition_on(voice, instrument, note)` /
 //!     `audition_off(voice)` (an instrument with its tables running, with no song in
 //!     preview mode, or taking a voice over a playing one), `status()` (per voice the
@@ -321,6 +325,8 @@ pub struct SidSongPlayer {
     /// The sequencer as it stood at the start of the loop's range, so a loop
     /// goes back without replaying the song from the top.
     rewind: Option<Rewind>,
+    /// Per voice, a loop of that voice alone (`set_voice_loop`).
+    voice_loops: [Option<VoiceLoop>; SID_CHANNELS],
     preview: bool,
     /// The voices a note audition holds (`audition_on`): their rows are not read.
     audition: u8,
@@ -347,6 +353,26 @@ pub struct SidLoop {
     pub start: u64,
     /// The row after the last (exclusive).
     pub end: u64,
+}
+
+/// A loop of one voice's orderlist entries (`SidSongPlayer::set_voice_loop`).
+#[derive(Debug, Clone)]
+struct VoiceLoop {
+    /// The orderlist entries looped, first to last, as asked for.
+    first: usize,
+    last: usize,
+    /// Their rows, counted from the top of the subsong, `end` exclusive.
+    start: u64,
+    end: u64,
+    /// The voice as it stood about to read the range's first row.
+    rewind: Option<VoiceRewind>,
+}
+
+/// One voice's own sequencer and effects state at one moment, copied whole.
+#[derive(Debug, Clone)]
+struct VoiceRewind {
+    channel: Channel,
+    rows: u64,
 }
 
 /// Why a seek did not happen.
@@ -474,6 +500,7 @@ impl SidSongPlayer {
             rows: [0; SID_CHANNELS],
             loop_range: None,
             rewind: None,
+            voice_loops: Default::default(),
             preview: false,
             audition: 0,
             audition_seen: 0,
@@ -536,6 +563,9 @@ impl SidSongPlayer {
         self.filter_regs = [0, 0, 0, 15];
         self.rows = [0; SID_CHANNELS];
         self.rewind = None;
+        for l in self.voice_loops.iter_mut().flatten() {
+            l.rewind = None;
+        }
     }
 
     fn snapshot(&self) -> Rewind {
@@ -785,10 +815,141 @@ impl SidSongPlayer {
 
     /// Remembers the sequencer now when it stands at the start of the loop's range.
     fn loop_boundary(&mut self) {
-        let Some(l) = self.loop_range else { return };
-        let v = l.voice as usize;
-        if self.rewind.is_none() && self.rows[v] == l.start && self.channels[v].tick == 1 {
-            self.rewind = Some(self.snapshot());
+        if let Some(l) = self.loop_range {
+            let v = l.voice as usize;
+            if self.rewind.is_none() && self.rows[v] == l.start && self.channels[v].tick == 1 {
+                self.rewind = Some(self.snapshot());
+            }
+        }
+        for v in 0..SID_CHANNELS {
+            self.voice_loop_boundary(v);
+        }
+    }
+
+    /// Remembers voice `v` now when it stands about to read its loop's first row.
+    fn voice_loop_boundary(&mut self, v: usize) {
+        let at = self.rows[v];
+        let ch = &self.channels[v];
+        if let Some(l) = &mut self.voice_loops[v] {
+            if l.rewind.is_none() && at == l.start && ch.tick == 1 {
+                l.rewind = Some(VoiceRewind {
+                    channel: ch.clone(),
+                    rows: at,
+                });
+            }
+        }
+    }
+
+    /// Loops orderlist entries `first..=last` of one voice alone (`None` clears it): the voice
+    /// goes back to the start of its range at the end of it, while the other voices play on.
+    /// The ranges are those of the subsong playing (`SidSong::order_rows`); `false` (nothing
+    /// changed) when the voice or the entries do not exist. Each voice has a loop of its own, and
+    /// a whole-song loop (`set_loop`) works beside them.
+    ///
+    /// The voice's own state (its row and repeat, tempo, note, effects, wave, pulse and vibrato
+    /// tables) is copied when it first reads the range's first row and put back at every end, so
+    /// its repeats play that moment again exactly. What the voices share is not put back and goes
+    /// on: the filter (its program, cutoff and routing, which any voice's instrument can start),
+    /// funktempo's two row lengths, and a tempo another voice sets for all (command F). A song
+    /// whose looped voice leaves those alone in its range loops exactly; otherwise the loop is
+    /// approximate there (the filter sweep does not restart with the voice, for one). Set while
+    /// the voice is inside or past the range, it jumps back at the end of its next row (one
+    /// silent replay of the song's start to the range's, once).
+    pub fn set_voice_loop(&mut self, voice: usize, orders: Option<(usize, usize)>) -> bool {
+        if voice >= SID_CHANNELS {
+            return false;
+        }
+        let Some((first, last)) = orders else {
+            self.voice_loops[voice] = None;
+            return true;
+        };
+        match self.song.order_rows(self.subsong, voice, first, last) {
+            Some((start, end)) if end > start => {
+                self.voice_loops[voice] = Some(VoiceLoop {
+                    first,
+                    last,
+                    start,
+                    end,
+                    rewind: None,
+                });
+                self.voice_loop_boundary(voice);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The orderlist entries (first, last) a voice's own loop repeats, if one is set.
+    pub fn voice_loop(&self, voice: usize) -> Option<(usize, usize)> {
+        self.voice_loops
+            .get(voice)?
+            .as_ref()
+            .map(|l| (l.first, l.last))
+    }
+
+    /// Voice `v` as it stands about to read row `start` of its orderlist, found by replaying the
+    /// song silently from the top (everything else is put back as it was): the voice loop's
+    /// first visit, when the loop was set after the voice had passed it. `None` when the
+    /// replay does not get there (`SEEK_MAX_FRAMES`).
+    fn replay_to_voice_start(&mut self, v: usize, start: u64) -> Option<VoiceRewind> {
+        let before = self.snapshot();
+        let global = self.rewind.take();
+        let loops = self.voice_loops.clone();
+        let ended = self.rows_ended;
+        self.reset_sequencer(self.subsong);
+        let reached = self.replay_until(|p| p.rows[v] >= start);
+        let found =
+            (reached && self.rows[v] == start && self.channels[v].tick == 1).then(|| VoiceRewind {
+                channel: self.channels[v].clone(),
+                rows: start,
+            });
+        self.restore(&before);
+        self.rewind = global;
+        self.voice_loops = loops;
+        self.rows_ended = ended;
+        found
+    }
+
+    /// The voice loops' work after a frame in which the voices in `ended` (a bit each) finished
+    /// a row: a voice that finished its range's last row goes back to the range's first.
+    fn voice_loops_step(&mut self, ended: u8) {
+        for v in 0..SID_CHANNELS {
+            if ended & (1 << v) == 0 {
+                continue;
+            }
+            let Some((start, end)) = self.voice_loops[v].as_ref().map(|l| (l.start, l.end)) else {
+                continue;
+            };
+            if self.rows[v] < end {
+                self.voice_loop_boundary(v);
+                continue;
+            }
+            let rewind = match self.voice_loops[v].as_ref().and_then(|l| l.rewind.clone()) {
+                Some(r) => Some(r),
+                None => {
+                    // Not seen the start yet (the loop was set inside or past its range).
+                    let r = self.replay_to_voice_start(v, start);
+                    if let (Some(l), Some(r)) = (self.voice_loops[v].as_mut(), &r) {
+                        l.rewind = Some(r.clone());
+                    }
+                    r
+                }
+            };
+            match rewind {
+                Some(r) => {
+                    let ch = &mut self.channels[v];
+                    // What the display shows now (see `frame_with_loop`).
+                    let shown = (ch.play_order, ch.play_pattern, ch.play_row, ch.row_tick);
+                    *ch = r.channel;
+                    if ch.tick == 1 {
+                        (ch.play_order, ch.play_pattern, ch.play_row, ch.row_tick) = shown;
+                    }
+                    self.rows[v] = r.rows;
+                }
+                // Too far into the song to find: the loop is given up rather than tried again
+                // at every row.
+                None => self.voice_loops[v] = None,
+            }
         }
     }
 
@@ -979,7 +1140,7 @@ impl SidSongPlayer {
             tempo: self.tempo(),
             preview: self.preview,
             audition: self.audition,
-            looping: self.loop_range.is_some(),
+            looping: self.loop_range.is_some() || self.voice_loops.iter().any(Option::is_some),
             looped: self.looped,
             mute: self.mute,
             solo: self.solo,
@@ -1155,9 +1316,10 @@ impl SidSongPlayer {
     /// loop's start (so `song_row` never reports the row past it).
     fn frame_with_loop(&mut self) {
         self.frame_core(true);
+        let ended = self.rows_ended;
         if let Some(l) = self.loop_range {
             let v = l.voice as usize;
-            if !self.preview && self.rows_ended & (1 << v) != 0 {
+            if !self.preview && ended & (1 << v) != 0 {
                 if self.rows[v] >= l.end {
                     let carried = self.samples_to_frame;
                     // What the display shows now: a voice that is about to start its row
@@ -1192,16 +1354,20 @@ impl SidSongPlayer {
                 }
             }
         }
+        if !self.preview && ended != 0 {
+            self.voice_loops_step(ended);
+        }
         if let Some(p) = &self.probe {
             p.publish(&self.status(), &self.peaks);
         }
     }
 
-    /// Plays one frame: sequencer, effects, tables, register writes, and
-    /// the writes are applied on return (for a caller that does not render).
-    /// `render` uses `frame_core`, whose writes stay spaced (`write_registers`).
+    /// Plays one frame: sequencer, effects, tables, register writes (and the loops'
+    /// jumps back), and the writes are applied on return (for a caller that does not
+    /// render). `render` plays its frames the same way, but its writes stay spaced
+    /// (`write_registers`).
     pub fn frame(&mut self) {
-        self.frame_core(true);
+        self.frame_with_loop();
         self.chip.flush_writes();
     }
 
