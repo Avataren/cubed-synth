@@ -86,6 +86,12 @@ pub struct SongOptions {
     /// does). On by default; off is the reference render byte for byte. The tables the song needs are built
     /// while the player is built, never on the audio thread.
     pub ahx_hifi: bool,
+    /// SID songs and PSID tunes: the chip they play on, as `SongControl::SidChip`'s `model`
+    /// (`SID_CHIP_OWN`, the song's own, by default; `SID_CHIP_6581`, `SID_CHIP_8580`).
+    pub sid_model: u8,
+    /// SID songs and PSID tunes: which 6581, as `SongControl::SidChip`'s `revision` (an index of
+    /// `SID_REVISIONS`; 0, the default, is R3).
+    pub sid_revision: u8,
 }
 
 impl Default for SongOptions {
@@ -95,8 +101,32 @@ impl Default for SongOptions {
             looped: true,
             stereo_separation: None,
             ahx_hifi: true,
+            sid_model: crate::song::SID_CHIP_OWN,
+            sid_revision: 0,
         }
     }
+}
+
+/// `SongControl::SidChip`'s codes as `cubed_sid`'s choice: the model (`None`, the song's own) and the
+/// 6581 revision (`None`, the default). Codes it does not know are the defaults.
+pub fn sid_chip(
+    model: u8,
+    revision: u8,
+) -> (
+    Option<cubed_sid::SidModel>,
+    Option<cubed_sid::revision::DieRevision>,
+) {
+    use crate::song::{SID_CHIP_6581, SID_CHIP_8580, SID_REVISIONS};
+    let model = match model {
+        SID_CHIP_6581 => Some(cubed_sid::SidModel::Sid6581),
+        SID_CHIP_8580 => Some(cubed_sid::SidModel::Sid8580),
+        _ => None,
+    };
+    let revision = SID_REVISIONS
+        .get(revision as usize)
+        .filter(|name| !name.is_empty())
+        .and_then(|name| cubed_sid::revision::DieRevision::from_name(name));
+    (model, revision)
 }
 
 /// A song ready to play at `sample_rate`. Build it off the audio thread: it
@@ -191,7 +221,15 @@ pub fn open_controlled_song_at(
         }
         // A `.sid` (PSID, RSID: a C64 program) or a `.asid` (cubed-synth's own SID songs).
         SongFormat::Sid if cubed_sid::psid::looks_like_psid(bytes) => {
-            open_psid_at(bytes, sample_rate, Some(options.subsong), start, stopped)
+            let mut player = PsidSongPlayer::new(bytes, sample_rate, Some(options.subsong), start)?;
+            player.control(SongControl::SidChip {
+                model: options.sid_model,
+                revision: options.sid_revision,
+            });
+            if !stopped {
+                player.control(SongControl::Play);
+            }
+            Ok(Box::new(PlayerSong::new(player, stopped, true)))
         }
         SongFormat::Sid => {
             let song = SidSong::parse(bytes).map_err(|e| e.to_string())?;
@@ -251,6 +289,10 @@ pub fn open_sid(
     stopped: bool,
 ) -> Result<Box<dyn Source>, String> {
     let mut player = SidPlayer::new(song, sample_rate, options.subsong)?;
+    player.control(SongControl::SidChip {
+        model: options.sid_model,
+        revision: options.sid_revision,
+    });
     if !stopped {
         player.control(SongControl::Play);
     }
@@ -389,8 +431,11 @@ impl SidSongSource {
         let song = SidSong::parse(bytes).map_err(|e| e.to_string())?;
         let model = song.model;
         // Its buffers are sized when it is built: no warm-up needed.
-        let player = SidSongPlayer::with_model(song, model, sample_rate as f64, options.subsong)
-            .map_err(|e| e.to_string())?;
+        let mut player =
+            SidSongPlayer::with_model(song, model, sample_rate as f64, options.subsong)
+                .map_err(|e| e.to_string())?;
+        let (model, revision) = sid_chip(options.sid_model, options.sid_revision);
+        player.set_chip(model, revision);
         Ok(SidSongSource {
             player,
             looped: options.looped,
@@ -405,6 +450,14 @@ impl Source for SidSongSource {
             r.copy_from_slice(l);
         });
         self.looped || !self.player.looped()
+    }
+
+    /// A song played as music takes one control: another chip.
+    fn event(&mut self, event: crate::source::SourceEvent) {
+        if let crate::source::SourceEvent::Song(SongControl::SidChip { model, revision }) = event {
+            let (model, revision) = sid_chip(model, revision);
+            self.player.set_chip(model, revision);
+        }
     }
 }
 
@@ -505,7 +558,8 @@ impl ModuleSong {
             | SongControl::SetRestart(_)
             | SongControl::SetTableRow { .. }
             | SongControl::SeekVoice { .. }
-            | SongControl::VoiceLoop { .. } => {}
+            | SongControl::VoiceLoop { .. }
+            | SongControl::SidChip { .. } => {}
         }
     }
 }

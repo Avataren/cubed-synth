@@ -1131,3 +1131,25 @@ fn a_voice_loop_holds_on_a_real_goattracker_song() {
     }
     assert_eq!(late, [1].into());
 }
+
+#[test]
+fn set_chip_switches_the_model_and_the_6581_revision_and_none_goes_back_to_the_songs() {
+    use cubed_sid::revision::{DieRevision, SID6581_REVISION};
+    use cubed_sid::SidModel;
+    let song = song();
+    let own = song.model;
+    let mut p = SidSongPlayer::with_model(song, own, RATE, 0).unwrap();
+    let other = if own == SidModel::Sid6581 {
+        SidModel::Sid8580
+    } else {
+        SidModel::Sid6581
+    };
+    p.set_chip(Some(other), None);
+    assert_eq!(p.chip().model(), other);
+    p.set_chip(Some(SidModel::Sid6581), Some(DieRevision::R2));
+    assert_eq!(p.chip().model(), SidModel::Sid6581);
+    assert_eq!(p.chip().profile().revision, DieRevision::R2);
+    p.set_chip(None, None);
+    assert_eq!(p.chip().model(), own);
+    assert_eq!(p.chip().profile().revision, SID6581_REVISION);
+}

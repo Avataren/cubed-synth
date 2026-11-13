@@ -10,8 +10,11 @@
 //   {type: 'commands', bytes: ArrayBuffer}  cubed_mixer::wire commands
 //   {type: 'clip', id, sampleRate, left: Float32Array, right?: Float32Array}
 //   {type: 'song', source, format (0 AHX/HVL, 1 A2M, 2 SID, 3 MOD, 4 S3M, 5 XM), bytes: ArrayBuffer,
-//    subsong, looped, separation?, stopped?, follow?, start?}  prepares source slot `source` for a
-//    PlaySource command; separation (0-1) is a module's stereo width. For a module
+//    subsong, looped, separation?, stopped?, follow?, start?, sidModel?, sidRevision?}  prepares source
+//    slot `source` for a PlaySource command; separation (0-1) is a module's stereo width; sidModel
+//    (0 the song's own, 1 6581, 2 8580) and sidRevision (0 the default 6581, R3; 1 gt, 2 r2, 3 r3, 4 r4,
+//    5 r4ar) the chip a SID song or PSID tune plays on (kept for the songs after, until a message
+//    names them again; a playing song changes chip with SongControl::SidChip). For a module
 //    (3, 4, 5), an Adlib song (1), a SID song (2) or an AHX/HVL song (0), `stopped` opens it under live control and stopped (silent until a
 //    SongControl 'Play' command, its voice never ends by itself) and `follow` (also
 //    implied by `stopped`) makes the worklet post its position, levels and channel
@@ -22,6 +25,10 @@
 //    params: Float32Array}  the effect's parameters in the order of
 //    `EffectKind::params()`, as many as cw_effect_param_count() (52 since the equaliser,
 //    kind 9; the other effects have at most 6); those left out are the effect's defaults
+//   {type: 'quiet', on}  the page is hidden (on) or shown again (off): while quiet the worklet posts no
+//    'taps', 'songpos' or 'songscope' (nothing draws them), and 'telemetry' only with events or about once a
+//    second, so a hidden page that the browser freezes does not wake to a backlog of messages. Songs keep
+//    playing; the first 'songpos' after it reports every song that moved meanwhile.
 //   {type: 'tap', bus, enable}  switches the analysis tap of a bus on or off
 //    (the bus must exist); answered by {type: 'tap', bus, enable, ok}
 //   {type: 'synth', source, bytes: ArrayBuffer (the patch JSON, UTF-8), oneShot,
@@ -79,6 +86,8 @@
 // Telemetry goes out every this many render quanta (about 21 ms at 48 kHz),
 // and at once when there are events.
 const TELEMETRY_BLOCKS = 8;
+// While the page is hidden ('quiet'): about once a second.
+const QUIET_TELEMETRY_BLOCKS = 375;
 const METER_FIELDS = 5;
 const TAP_FRAMES = 2048;
 const TAP_HZ = 40;
@@ -93,13 +102,16 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
     this.tapsOn = false;
     this.songsOn = false;
     this.warming = false;
+    this.quiet = false;
     this.tapEvery = 1;
     this.songEvery = 1;
     this.port.onmessage = (event) => this.receive(event.data);
   }
 
   receive(message) {
-    if (message.type === 'init') {
+    if (message.type === 'quiet') {
+      this.quiet = !!message.on;
+    } else if (message.type === 'init') {
       this.init(message);
     } else if (this.exports) {
       this.handle(message);
@@ -158,6 +170,10 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         const at = x.cw_file_buffer(bytes.length);
         new Uint8Array(x.memory.buffer, at, bytes.length).set(bytes);
         const separation = typeof message.separation === 'number' ? message.separation : -1;
+        // The chip SID songs play on (a wasm built before the choice has no export).
+        if (x.cw_prepare_chip && (typeof message.sidModel === 'number' || typeof message.sidRevision === 'number')) {
+          x.cw_prepare_chip((message.sidModel ?? 0) >>> 0, (message.sidRevision ?? 0) >>> 0);
+        }
         // The formats that can be put under live control: AHX/HVL, A2M, SID, MOD, S3M and XM (all of them).
         const module = (message.format >= 3 && message.format <= 5) || message.format <= 2;
         let ok;
@@ -285,7 +301,7 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
 
     this.blocks += 1;
     const eventBytes = x.cw_events_len();
-    if (eventBytes > 0 || this.blocks % TELEMETRY_BLOCKS === 0) {
+    if (eventBytes > 0 || this.blocks % (this.quiet ? QUIET_TELEMETRY_BLOCKS : TELEMETRY_BLOCKS) === 0) {
       const events = new Uint8Array(memory, x.cw_events(), eventBytes).slice();
       x.cw_clear_events();
       const meters = new Float32Array(memory, x.cw_meters(), x.cw_meter_count() * METER_FIELDS).slice();
@@ -302,6 +318,7 @@ class CubedMixerProcessor extends AudioWorkletProcessor {
         [events.buffer, meters.buffer],
       );
     }
+    if (this.quiet) return true;
     if (this.tapsOn && this.blocks % this.tapEvery === 0) this.postTaps(x);
     if (this.songsOn && this.blocks % this.songEvery === 0) this.postSongs(x);
     return true;

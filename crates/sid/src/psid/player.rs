@@ -29,6 +29,7 @@ use super::c64::Kernal;
 use super::file::{PsidError, PsidFile, PsidSidModel};
 use super::runner::{EndReason, PsidRunner};
 use crate::chip::{Chip, ALL_VOICES};
+use crate::revision::{DieRevision, SID6581_REVISION};
 use crate::{SidError, SidModel};
 
 /// The cycles a stretch of audio spans, at most (a stretch is whole samples).
@@ -53,6 +54,9 @@ pub struct PsidOptions {
     /// The chip to play on; the file's own when `None`, and a 6581 when the
     /// file says nothing (or "either"), as HVSC's players do.
     pub model: Option<SidModel>,
+    /// Which 6581 a 6581 chip is (its filter, DC and volume DAC); the default
+    /// revision (`SID6581_REVISION`) when `None`. An 8580 ignores it.
+    pub revision: Option<DieRevision>,
     /// The stand-in KERNAL (see [`Kernal`]): the DAW's plus two entries of the real
     /// handler by default.
     pub kernal: Kernal,
@@ -83,6 +87,19 @@ fn model_of(tag: PsidSidModel, fallback: SidModel) -> SidModel {
     }
 }
 
+/// The model the file names for chip `i`: the first's tag, else a 6581; a later chip's own
+/// tag, else the first's.
+fn own_model(file: &PsidFile, i: usize) -> SidModel {
+    let first = model_of(file.sid_model, SidModel::Sid6581);
+    match i {
+        0 => first,
+        i => file
+            .extra_models
+            .get(i - 1)
+            .map_or(first, |tag| model_of(*tag, first)),
+    }
+}
+
 pub struct PsidPlayer {
     file: PsidFile,
     runner: PsidRunner,
@@ -91,6 +108,8 @@ pub struct PsidPlayer {
     subsong: usize,
     /// The model the user chose (kept across a restart), if any.
     chosen_model: Option<SidModel>,
+    /// The 6581 revision the user chose (kept across a restart), if any.
+    chosen_revision: Option<DieRevision>,
     kernal: Kernal,
     /// Time in cycles from the start of playback: where the runner has been run to.
     cycle: u64,
@@ -123,8 +142,14 @@ impl PsidPlayer {
             .subsong
             .unwrap_or_else(|| file.start_subsong())
             .min(file.songs as usize - 1);
-        let (runner, chips) =
-            Self::build(&file, subsong, sample_rate, options.model, options.kernal)?;
+        let (runner, chips) = Self::build(
+            &file,
+            subsong,
+            sample_rate,
+            options.model,
+            options.revision,
+            options.kernal,
+        )?;
         let cps = runner.clock_hz() as f64 / sample_rate;
         let stretch_samples = ((STRETCH_CYCLES / cps) as usize).clamp(1, MAX_STRETCH_SAMPLES);
         let mut player = PsidPlayer {
@@ -134,6 +159,7 @@ impl PsidPlayer {
             sample_rate,
             subsong,
             chosen_model: options.model,
+            chosen_revision: options.revision,
             kernal: options.kernal,
             cycle: 0,
             frames: 0,
@@ -152,22 +178,21 @@ impl PsidPlayer {
         subsong: usize,
         sample_rate: f64,
         model: Option<SidModel>,
+        revision: Option<DieRevision>,
         kernal: Kernal,
     ) -> Result<(PsidRunner, Vec<Chip>), PsidError> {
         let runner = PsidRunner::with_kernal(file, subsong, kernal)?;
-        let first = model.unwrap_or_else(|| model_of(file.sid_model, SidModel::Sid6581));
         let mut chips = Vec::with_capacity(runner.sid_count());
         for i in 0..runner.sid_count() {
-            let m = if i == 0 {
-                first
-            } else {
-                // The user's choice is for every chip; the file's tag for each, else the first's.
-                model.unwrap_or_else(|| model_of(file.extra_models[i - 1], first))
-            };
+            // The user's choice is for every chip; the file's tag for each otherwise.
+            let m = model.unwrap_or_else(|| own_model(file, i));
             let mut chip = Chip::with_sample_rate(m, sample_rate).map_err(|e| match e {
                 SidError::UnsupportedSampleRate(r) => PsidError::SampleRate(r),
                 SidError::ModelNotImplemented { .. } => PsidError::SampleRate(sample_rate),
             })?;
+            if let Some(revision) = revision {
+                chip.set_profile(revision.profile());
+            }
             chip.set_clock_hz(runner.clock_hz() as f64);
             chip.reserve_writes(CHIP_WRITE_ROOM);
             chips.push(chip);
@@ -289,12 +314,31 @@ impl PsidPlayer {
         }
     }
 
+    /// Play every chip as `model` (`None`: the model the file names for it, a 6581
+    /// when it names none) and every 6581 as `revision` (`None`: the default,
+    /// `SID6581_REVISION`), from the next sample on: the tune's notes keep sounding.
+    /// Kept across a restart. Allocates nothing: fine between audio blocks.
+    pub fn set_chip(&mut self, model: Option<SidModel>, revision: Option<DieRevision>) {
+        self.chosen_model = model;
+        self.chosen_revision = revision;
+        let profile = revision.unwrap_or(SID6581_REVISION).profile();
+        for (i, chip) in self.chips.iter_mut().enumerate() {
+            let _ = chip.set_model(model.unwrap_or_else(|| own_model(&self.file, i)));
+            chip.set_profile(profile);
+        }
+    }
+
+    /// The 6581 revision chosen ([`set_chip`](Self::set_chip), the options), if any.
+    pub fn chosen_revision(&self) -> Option<DieRevision> {
+        self.chosen_revision
+    }
+
     // --- Restarting and seeking (run the tune: not for the audio thread) -----
 
     /// Start again, on `subsong` (0-based; the same one when `None`): the tune's
     /// init runs again, so call it off the audio thread. The chips are new (their
-    /// model and 6581 revision as the options chose; a revision set with
-    /// [`chip_mut`](PsidPlayer::chip_mut) is not kept).
+    /// model and 6581 revision as the options or [`set_chip`](PsidPlayer::set_chip)
+    /// chose; a revision set with [`chip_mut`](PsidPlayer::chip_mut) is not kept).
     pub fn restart(&mut self, subsong: Option<usize>) -> Result<(), PsidError> {
         let subsong = subsong
             .unwrap_or(self.subsong)
@@ -304,6 +348,7 @@ impl PsidPlayer {
             subsong,
             self.sample_rate,
             self.chosen_model,
+            self.chosen_revision,
             self.kernal,
         )?;
         self.runner = runner;

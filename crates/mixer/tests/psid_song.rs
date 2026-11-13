@@ -205,3 +205,47 @@ fn a_tune_with_two_sids_plays_and_a_bad_file_says_why() {
     // A subsong that does not exist is clamped, as the player does.
     assert!(open_psid_at(&tune("arp.sid"), RATE, Some(99), 0.0, true).is_ok());
 }
+
+#[test]
+fn a_tune_plays_on_the_chip_it_is_opened_on_or_switched_to_mid_tune() {
+    use cubed_mixer::{SID_CHIP_8580, SID_CHIP_OWN};
+    let open = |options: SongOptions| {
+        let mut rig = rig_of(
+            open_controlled_song(SongFormat::Sid, &tune("arp.sid"), RATE, options, true).unwrap(),
+        );
+        rig.control(SongControl::Play);
+        rig
+    };
+    let on_8580 = SongOptions {
+        sid_model: SID_CHIP_8580,
+        ..SongOptions::default()
+    };
+    let own = open(SongOptions::default()).run(1.0);
+    let opened_8580 = open(on_8580).run(1.0);
+    assert_ne!(own, opened_8580);
+    // A switch before the first block is opening on it.
+    let mut switched = open(SongOptions::default());
+    switched.control(SongControl::SidChip {
+        model: SID_CHIP_8580,
+        revision: 0,
+    });
+    assert_eq!(switched.run(1.0), opened_8580);
+    // Mid-tune: the place is kept and the tune plays on.
+    let mut mid = open(SongOptions::default());
+    let first = mid.run(0.5);
+    assert_eq!(first, own[..first.len()]);
+    mid.control(SongControl::SidChip {
+        model: SID_CHIP_8580,
+        revision: 0,
+    });
+    let rest = mid.run(0.5);
+    assert_ne!(rest, own[first.len()..]);
+    assert!(mid.reader.status().playing);
+    // Back to its own chip.
+    mid.control(SongControl::SidChip {
+        model: SID_CHIP_OWN,
+        revision: 0,
+    });
+    mid.run(0.1);
+    assert!(mid.reader.status().playing);
+}

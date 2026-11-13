@@ -147,6 +147,10 @@ impl SongPlayer for PsidSongPlayer {
                 self.solo = mask;
                 self.player.set_mute_solo(self.mute, self.solo);
             }
+            SongControl::SidChip { model, revision } => {
+                let (model, revision) = crate::songs::sid_chip(model, revision);
+                self.player.set_chip(model, revision);
+            }
             // A seek and a start run the tune's code: not on the audio thread. The rest is not a
             // tune's.
             _ => {}

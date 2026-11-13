@@ -170,7 +170,8 @@ impl SongPlayer for AhxSongPlayer {
             | SongControl::Timing { .. }
             | SongControl::SetTableRow { .. }
             | SongControl::SeekVoice { .. }
-            | SongControl::VoiceLoop { .. } => {}
+            | SongControl::VoiceLoop { .. }
+            | SongControl::SidChip { .. } => {}
         }
     }
 

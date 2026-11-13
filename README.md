@@ -351,6 +351,9 @@ which would need cross-origin isolation); `WebAnalysis` parses it (`update_taps(
 frames, data)`, and `update_meters(meters)` for the telemetry message's meters) and implements
 the same trait over the latest message. Switch a tap on with the processor's `{type: 'tap',
 bus, enable}` message (`cw_set_tap`); call `WebAnalysis::forget(bus)` when switching one off.
+A page that is hidden sends `{type: 'quiet', on: true}` (and `false` when it is shown): the worklet
+then posts no taps, song positions or scopes and telemetry only with events or about once a second,
+so a background tab the browser freezes does not wake to a backlog of messages.
 `levels` is the existing bus meter (peak falling 24 dB a second, RMS over 300 ms): the UI does
 its own peak hold.
 
@@ -421,6 +424,7 @@ enum SongControl {
     SetOrder { order, channel, pattern, transpose },  // AHX/HVL: a position's track and transpose for a channel
     SetRestart(u16),                                  // AHX/HVL: where the song starts over
     SetTableRow { table, row, left, right },          // SID: a row of a step table (wire kind 17)
+    SidChip { model: u8, revision: u8 },              // SID and PSID: play on another chip now (wire kind 20)
 }
 trait SongReader: Send + Sync {                       // natively: the song's probe; on the web: WebSong
     fn status(&self) -> SongStatus;                   // as Player::status, plus `version` and `voices` (SID: each voice's own order, pattern, row)
@@ -438,7 +442,7 @@ batch): tag 30, 24 bytes, little endian: `u8 tag, u64 voice, u8 kind, u16 a, u16
 u32 frames`. Kinds: 0 Play, 1 Stop, 2 Seek (a order, b row), 3 Loop none, 4 Loop pattern (a order), 5 Loop
 range (a order, b row0, c row1), 6 Mute (a channel, b on), 7 Solo (a, b), 8 MuteMask (frames), 9 SoloMask
 (frames), 10 PreviewOn (a instrument, b note, value velocity, frames duration), 11 PreviewOff, 12 Looped
-(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order), 17 SetTableRow (a table | row << 8, b left | right << 8), 18 SeekVoice (a order, b row, c voice), 19 VoiceLoop (a first, b last, c voice | 0x100 when a range is set). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
+(b on), 13 Scopes (b on), 14 Timing (a tempo, b speed), 15 SetOrder (a order, b channel | pattern << 8, c transpose as a byte), 16 SetRestart (a order), 17 SetTableRow (a table | row << 8, b left | right << 8), 18 SeekVoice (a order, b row, c voice), 19 VoiceLoop (a first, b last, c voice | 0x100 when a range is set), 20 SidChip (a model, b revision). Tag 32, 24 bytes, SetInstrument: `u8 tag, u64 voice, u8
 number, u8 fm[11], u8 panning, i8 finetune, u8 voice_type`. Tag 31, 21 bytes: `u8 tag, u64 voice, u16 pattern, u16 row, u8 channel, u8 note
 (0 none, 255 key off, else MIDI; Adlib: the file's note byte), u16 period (Adlib: `effect2 << 8 | param2`), u8
 instrument, u8 volume, u8 effect, u8 param` (SetCell). An
@@ -554,8 +558,17 @@ voices' peaks (the taps), then 0; the scopes are the voices' own signals before 
 row: `pattern` is the pattern number, `note` 1-93 / 126 off / 127 on, `effect` the command), `SetInstrument` (the ten bytes in
 `fm`: attack/decay, sustain/release, first wave, gate timer, flags (bit 0 hard restart, bit 1 no gate off), vibrato delay, the
 wave, pulse, filter and speed pointers) and `SetTableRow`; a pattern's length, the orderlists, the instrument list, a table's
-length, the start tempo, the speed multiplier and the chip model are a new song. The chip's output carries a constant offset
+length, the start tempo, the speed multiplier and the song's own chip model are a new song. The chip's output carries a constant offset
 while its volume register is up, silence included.
+
+**Another chip.** `SidChip { model, revision }` plays a SID song or a PSID tune on another chip from the next block on, its
+notes sounding on and its place kept (it allocates nothing): `model` is `SID_CHIP_OWN` (0, the chip the song names; a tune
+that names none plays on a 6581), `SID_CHIP_6581` (1) or `SID_CHIP_8580` (2), and `revision` which 6581 plays, an index of
+`SID_REVISIONS` (`["", "gt", "r2", "r3", "r4", "r4ar"]`: 0 is the default, R3; `gt` is GoatTracker's reSID filter, not a chip;
+`sid_revision_code(name)` gives the index). An 8580 has no revision. `SongOptions::sid_model` and `sid_revision` choose the
+chip a song opens on (every SID path: `open_song`, `open_controlled_song`, `open_sid`), and the worklet's `'song'` message
+takes `sidModel` and `sidRevision` (`cw_prepare_chip`), kept for the songs after. Underneath: `SidSongPlayer::set_chip` and
+`PsidPlayer::set_chip` (every chip of a tune; `PsidOptions::revision` at the start; kept across a restart).
 
 **PSID and RSID.** A tune is a program (`cubed_sid::psid::PsidPlayer` runs its 6510 code in step with the audio), so it plays
 and stops and that is all: `Play`, `Stop` (silent, the CPU does not run, the position stays), `Mute`/`Solo` by voice (bit `i`

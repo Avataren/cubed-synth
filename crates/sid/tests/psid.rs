@@ -943,3 +943,40 @@ fn compare_with_oracle(
     }
     None
 }
+
+#[test]
+fn set_chip_switches_every_chip_and_its_6581_revision_and_a_restart_keeps_them() {
+    use cubed_sid::revision::{DieRevision, SID6581_REVISION};
+    // Two SIDs, so every chip is switched.
+    let mut p = PsidPlayer::new(TWO, RATE, PsidOptions::default()).unwrap();
+    let own: Vec<SidModel> = (0..p.sid_count()).map(|i| p.chip(i).model()).collect();
+    assert!(own.len() >= 2);
+    p.set_chip(Some(SidModel::Sid8580), None);
+    for i in 0..p.sid_count() {
+        assert_eq!(p.chip(i).model(), SidModel::Sid8580);
+    }
+    p.set_chip(Some(SidModel::Sid6581), Some(DieRevision::GtRef));
+    for i in 0..p.sid_count() {
+        assert_eq!(p.chip(i).model(), SidModel::Sid6581);
+        assert_eq!(p.chip(i).profile().revision, DieRevision::GtRef);
+    }
+    p.restart(None).unwrap();
+    assert_eq!(p.chip(0).profile().revision, DieRevision::GtRef);
+    assert_eq!(p.chosen_revision(), Some(DieRevision::GtRef));
+    // None: the file's own models and the default revision again.
+    p.set_chip(None, None);
+    let back: Vec<SidModel> = (0..p.sid_count()).map(|i| p.chip(i).model()).collect();
+    assert_eq!(back, own);
+    assert_eq!(p.chip(0).profile().revision, SID6581_REVISION);
+    // Chosen at the start: the options.
+    let q = PsidPlayer::new(
+        ARP,
+        RATE,
+        PsidOptions {
+            revision: Some(DieRevision::R4),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(q.chip(0).profile().revision, DieRevision::R4);
+}

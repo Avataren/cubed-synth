@@ -162,7 +162,8 @@ impl SongPlayer for A2mPlayer {
             | SongControl::SetRestart(_)
             | SongControl::SetTableRow { .. }
             | SongControl::SeekVoice { .. }
-            | SongControl::VoiceLoop { .. } => {}
+            | SongControl::VoiceLoop { .. }
+            | SongControl::SidChip { .. } => {}
         }
     }
 

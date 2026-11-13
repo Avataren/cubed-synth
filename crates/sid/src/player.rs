@@ -1079,6 +1079,23 @@ impl SidSongPlayer {
         &self.song
     }
 
+    /// Play on `model` (`None`: the song's own, `SidSong::model`) and, on a 6581,
+    /// as `revision` (`None`: the default, `SID6581_REVISION`), from the next sample
+    /// on: the song keeps its place and its notes keep sounding. Allocates nothing:
+    /// fine between audio blocks.
+    pub fn set_chip(
+        &mut self,
+        model: Option<SidModel>,
+        revision: Option<crate::revision::DieRevision>,
+    ) {
+        let _ = self.chip.set_model(model.unwrap_or(self.song.model));
+        self.chip.set_profile(
+            revision
+                .unwrap_or(crate::revision::SID6581_REVISION)
+                .profile(),
+        );
+    }
+
     /// Frames played so far.
     pub fn frames(&self) -> u64 {
         self.frames

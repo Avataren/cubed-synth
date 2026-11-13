@@ -250,6 +250,10 @@ impl SongPlayer for SidPlayer {
                     });
                 }
             }
+            SongControl::SidChip { model, revision } => {
+                let (model, revision) = crate::songs::sid_chip(model, revision);
+                self.player.set_chip(model, revision);
+            }
             // The adapter's, and other formats'.
             SongControl::Looped(_)
             | SongControl::Scopes(_)

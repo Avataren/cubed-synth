@@ -509,3 +509,98 @@ fn a_voice_loops_its_own_entries_while_the_others_play_on_by_wire() {
     }
     assert_eq!(orders.len(), 2, "{orders:?}");
 }
+
+/// The fixture played for a second from the top on the chip `options` name, switched by `switch`
+/// (by wire) before the first block.
+fn played_on(options: SongOptions, switch: Option<SongControl>) -> Vec<f32> {
+    let mut rig =
+        rig_of(open_controlled_song(SongFormat::Sid, &fixture(), RATE, options, false).unwrap());
+    if let Some(control) = switch {
+        rig.control_by_wire(control);
+    }
+    rig.run(1.0)
+}
+
+#[test]
+fn a_song_plays_on_the_chip_it_is_opened_on_or_switched_to() {
+    use cubed_mixer::{SID_CHIP_6581, SID_CHIP_8580};
+    let own = played_on(SongOptions::default(), None);
+    let on_8580 = played_on(
+        SongOptions {
+            sid_model: SID_CHIP_8580,
+            ..SongOptions::default()
+        },
+        None,
+    );
+    // The fixture is a 6581 song: the 8580 sounds otherwise.
+    assert_ne!(own, on_8580);
+    // Naming its own chip changes nothing; switching before the first block is opening on it.
+    assert_eq!(
+        played_on(
+            SongOptions {
+                sid_model: SID_CHIP_6581,
+                ..SongOptions::default()
+            },
+            None
+        ),
+        own
+    );
+    assert_eq!(
+        played_on(
+            SongOptions::default(),
+            Some(SongControl::SidChip {
+                model: SID_CHIP_8580,
+                revision: 0
+            })
+        ),
+        on_8580
+    );
+    // An 8580 has no revision (the revisions differ in the filter, which this song does not use: see
+    // cubed-sid's `set_chip` tests).
+    let gt = cubed_mixer::sid_revision_code("gt").unwrap();
+    assert_eq!(
+        played_on(
+            SongOptions {
+                sid_model: SID_CHIP_8580,
+                sid_revision: gt,
+                ..SongOptions::default()
+            },
+            None
+        ),
+        on_8580
+    );
+}
+
+#[test]
+fn a_chip_switch_mid_song_keeps_the_place_and_changes_only_what_follows() {
+    let open = || {
+        rig_of(
+            open_controlled_song(
+                SongFormat::Sid,
+                &fixture(),
+                RATE,
+                SongOptions::default(),
+                false,
+            )
+            .unwrap(),
+        )
+    };
+    let (mut kept, mut switched) = (open(), open());
+    assert_eq!(kept.run(0.5), switched.run(0.5));
+    switched.control_by_wire(SongControl::SidChip {
+        model: cubed_mixer::SID_CHIP_8580,
+        revision: 0,
+    });
+    let (a, b) = (kept.run(0.5), switched.run(0.5));
+    assert_ne!(a, b);
+    assert!(energy(&b) > 0.0, "the song plays on");
+    let (sa, sb) = (kept.reader.status(), switched.reader.status());
+    assert!(sb.playing);
+    assert_eq!((sa.order, sa.row, sa.frames), (sb.order, sb.row, sb.frames));
+    // And back to its own chip.
+    switched.control(SongControl::SidChip {
+        model: cubed_mixer::SID_CHIP_OWN,
+        revision: 0,
+    });
+    assert!(energy(&switched.run(0.25)) > 0.0);
+}

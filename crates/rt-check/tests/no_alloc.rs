@@ -813,6 +813,19 @@ fn mixer_sid_song_control() {
             left: 0x90,
             right: 0,
         },
+        // Another chip, and back: a model and a 6581 revision.
+        SongControl::SidChip {
+            model: 2,
+            revision: 0,
+        },
+        SongControl::SidChip {
+            model: 1,
+            revision: 1,
+        },
+        SongControl::SidChip {
+            model: 0,
+            revision: 0,
+        },
         SongControl::PreviewOn {
             instrument: 1,
             note: 60,
@@ -961,6 +974,14 @@ fn mixer_psid_song_control() {
             on: true,
         },
         SongControl::SoloMask(0b101),
+        SongControl::SidChip {
+            model: 2,
+            revision: 0,
+        },
+        SongControl::SidChip {
+            model: 1,
+            revision: 4,
+        },
         // What a tune cannot take on the audio thread is ignored, allocating nothing.
         SongControl::Seek { order: 0, row: 3 },
         SongControl::PreviewOn {

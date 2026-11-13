@@ -61,9 +61,10 @@ pub use probe::SongProbe;
 pub use sfx::{Sfx, SfxPreset, SfxWave};
 pub use smooth::MIN_DB;
 pub use song::{
-    SongCell, SongControl, SongInstrument, SongLoop, SongReader, SongStatus, VoicePos, WebSong,
-    WebSongs, SONG_LEVEL_SLOTS, SONG_MAX_CHANNELS, SONG_MAX_VOICES, SONG_SCOPE_FRAMES,
-    SONG_STATUS_WORDS, SONG_VOICE_WORDS, SONG_VOICE_WORD_STRIDE,
+    sid_revision_code, SongCell, SongControl, SongInstrument, SongLoop, SongReader, SongStatus,
+    VoicePos, WebSong, WebSongs, SID_CHIP_6581, SID_CHIP_8580, SID_CHIP_OWN, SID_REVISIONS,
+    SONG_LEVEL_SLOTS, SONG_MAX_CHANNELS, SONG_MAX_VOICES, SONG_SCOPE_FRAMES, SONG_STATUS_WORDS,
+    SONG_VOICE_WORDS, SONG_VOICE_WORD_STRIDE,
 };
 pub use source::{Source, SourceEvent};
 pub use spatial::{Listener, Rolloff, Spatial, SpatialMode};

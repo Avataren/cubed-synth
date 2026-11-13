@@ -443,6 +443,7 @@ fn song_fields(control: &SongControl) -> (u8, u16, u16, u16, f32, u32) {
             let on = if range.is_some() { 0x100 } else { 0 };
             (19, first, last, voice as u16 | on, 0.0, 0)
         }
+        SongControl::SidChip { model, revision } => (20, model as u16, revision as u16, 0, 0.0, 0),
         SongControl::SetCell(_) | SongControl::SetInstrument(_) => unreachable!(),
     }
 }
@@ -510,6 +511,10 @@ fn song_control(
         19 => SongControl::VoiceLoop {
             voice: c as u8,
             range: (c & 0x100 != 0).then_some((a, b)),
+        },
+        20 => SongControl::SidChip {
+            model: a.min(255) as u8,
+            revision: b.min(255) as u8,
         },
         // The tag is known; the kind is from a newer sender.
         _ => return Err(WireError::UnknownTag(tag::SONG_CONTROL)),
@@ -1323,6 +1328,14 @@ mod tests {
             SongControl::VoiceLoop {
                 voice: 0,
                 range: None,
+            },
+            SongControl::SidChip {
+                model: 2,
+                revision: 5,
+            },
+            SongControl::SidChip {
+                model: 0,
+                revision: 0,
             },
         ];
         let instrument = SongInstrument {

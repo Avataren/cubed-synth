@@ -150,6 +150,38 @@ pub enum SongControl {
         left: u8,
         right: u8,
     },
+    /// Plays a SID song or a PSID tune on another chip from the next block on, its notes
+    /// sounding on: `model` is [`SID_CHIP_OWN`] (the song's own), [`SID_CHIP_6581`] or
+    /// [`SID_CHIP_8580`], and `revision` which 6581 (an index of [`SID_REVISIONS`]; 0 is the
+    /// default, R3). Allocates nothing. Wire kind 20. Other formats ignore it.
+    SidChip {
+        model: u8,
+        revision: u8,
+    },
+}
+
+/// [`SongControl::SidChip`]'s `model`: the chip the song names (a PSID tune that names none
+/// plays on a 6581).
+pub const SID_CHIP_OWN: u8 = 0;
+/// [`SongControl::SidChip`]'s `model`: the 6581 (its revision is `revision`).
+pub const SID_CHIP_6581: u8 = 1;
+/// [`SongControl::SidChip`]'s `model`: the 8580.
+pub const SID_CHIP_8580: u8 = 2;
+/// [`SongControl::SidChip`]'s `revision`, by index: the 6581 revisions by `cubed_sid`'s names
+/// (`DieRevision::name`). Index 0, `""`, is the default revision (R3, the most common); `gt`
+/// is not a chip but the filter GoatTracker's playback has, for songs mixed against it.
+pub const SID_REVISIONS: [&str; 6] = ["", "gt", "r2", "r3", "r4", "r4ar"];
+
+/// The code of a 6581 revision called `name` in [`SID_REVISIONS`] (`""` or `"default"` is 0),
+/// or `None` for a name that is not one.
+pub fn sid_revision_code(name: &str) -> Option<u8> {
+    if name == "default" {
+        return Some(0);
+    }
+    SID_REVISIONS
+        .iter()
+        .position(|n| *n == name)
+        .map(|i| i as u8)
 }
 
 /// An instrument as `SongControl::SetInstrument` carries it: what the song loads into a channel

@@ -67,6 +67,9 @@ struct State {
     file: Vec<u8>,
     /// Seconds into a PSID tune the next `cw_prepare_module` starts it (`cw_prepare_start`), then 0.
     prepare_start: f64,
+    /// The chip SID songs and PSID tunes are built on (`cw_prepare_chip`): `SongControl::SidChip`'s
+    /// model and revision codes. Kept for every song after.
+    sid_chip: (u8, u8),
     /// Held notes on their way to `cw_prepare_synth_held`: a note number and a
     /// velocity each.
     held: Vec<f32>,
@@ -165,6 +168,7 @@ pub extern "C" fn cw_init(
         clip_right: Vec::new(),
         file: Vec::new(),
         prepare_start: 0.0,
+        sid_chip: (0, 0),
         held: Vec::new(),
         effect_params: [0.0; MAX_PARAMS],
         error: Vec::new(),
@@ -344,6 +348,7 @@ pub extern "C" fn cw_prepare_song(
         looped: looped != 0,
         stereo_separation: (separation >= 0.0).then_some(separation),
         ahx_hifi: true,
+        sid_chip: s.sid_chip,
     };
     match prepare_song(s, source, format, options) {
         Ok(()) => 1,
@@ -369,6 +374,15 @@ fn forget_song(s: &mut State, source: u32) {
     if let Some(slot) = s.songs.get_mut(source as usize) {
         *slot = None;
     }
+}
+
+/// The chip the SID songs and PSID tunes built from now on play on (`cw_prepare_song` and
+/// `cw_prepare_module`): `model` 0 the song's own, 1 a 6581, 2 an 8580, and `revision` which 6581
+/// (an index of `cubed_mixer::SID_REVISIONS`: 0 the default R3, then gt, r2, r3, r4, r4ar), as
+/// `SongControl::SidChip` has them. A song that plays is switched with that control instead.
+#[no_mangle]
+pub extern "C" fn cw_prepare_chip(model: u32, revision: u32) {
+    state().sid_chip = (model.min(255) as u8, revision.min(255) as u8);
 }
 
 /// Where in the PSID tune the next `cw_prepare_module` starts it, in seconds (the tune's code is run to there
@@ -409,6 +423,7 @@ pub extern "C" fn cw_prepare_module(
         looped: looped != 0,
         stereo_separation: (separation >= 0.0).then_some(separation),
         ahx_hifi: flags & 2 == 0,
+        sid_chip: s.sid_chip,
     };
     match prepare_module(s, source, format, options, flags & 1 != 0) {
         Ok(()) => 1,
@@ -453,6 +468,8 @@ fn prepare_module(
         looped: options.looped,
         stereo_separation: options.stereo_separation,
         ahx_hifi: options.ahx_hifi,
+        sid_model: options.sid_chip.0,
+        sid_revision: options.sid_chip.1,
     };
     // A PSID tune is run to where it starts, here and not on the audio thread.
     let start = std::mem::take(&mut s.prepare_start);
@@ -662,6 +679,8 @@ struct SongOptions {
     looped: bool,
     stereo_separation: Option<f32>,
     ahx_hifi: bool,
+    /// `SongControl::SidChip`'s model and revision codes.
+    sid_chip: (u8, u8),
 }
 
 #[cfg(feature = "songs")]
@@ -687,6 +706,8 @@ fn prepare_song(
         looped: options.looped,
         stereo_separation: options.stereo_separation,
         ahx_hifi: options.ahx_hifi,
+        sid_model: options.sid_chip.0,
+        sid_revision: options.sid_chip.1,
     };
     let song = open_song(format, &s.file, rate, options)?;
     s.mixer
