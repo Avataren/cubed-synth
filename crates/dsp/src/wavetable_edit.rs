@@ -128,11 +128,55 @@ fn interpolate_warp(current: Warp, next: Warp, amount: f64) -> Warp {
     }
 }
 
+/// Above this many sounding harmonics a frame is made with an inverse FFT (`size log size`) rather
+/// than the direct sum (`size` times the harmonics): the same numbers to rounding, and a 256-frame
+/// table of 1024 harmonics in tens of milliseconds instead of over a second.
+const FFT_FROM: usize = 64;
+
 /// `generateWaveformFromHarmonics`: the sum of `amplitude * sin(2 pi (h+1) i / size + phase)`
 /// over the harmonics `h`, for `i` in `0..size`. The sines come from one table
 /// of the cycle (the arguments are whole steps of it plus the phase), which is
-/// what makes 256 frames of 32 harmonics take milliseconds.
+/// what makes 256 frames of 32 harmonics take milliseconds; past [`FFT_FROM`] sounding
+/// harmonics the sum is an inverse FFT.
 pub fn generate_from_harmonics(harmonics: &[Harmonic], size: usize) -> Vec<f64> {
+    if size > 0 && harmonics.iter().filter(|h| h.amplitude != 0.0).count() > FFT_FROM {
+        return harmonics_by_fft(harmonics, size);
+    }
+    harmonics_summed(harmonics, size)
+}
+
+/// The sum as an inverse DFT: harmonic `h` is bin `h + 1` (round the cycle, as the sum's
+/// indices go) holding `amplitude * e^(i phase)`, and the wave is the imaginary part of the
+/// unnormalised inverse transform, `sum_k X_k e^(i 2 pi k t / size)`.
+fn harmonics_by_fft(harmonics: &[Harmonic], size: usize) -> Vec<f64> {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    thread_local! {
+        static INVERSE: RefCell<Option<(usize, Arc<dyn rustfft::Fft<f64>>)>> =
+            const { RefCell::new(None) };
+    }
+    let mut bins = vec![Complex::new(0.0, 0.0); size];
+    for (h, harmonic) in harmonics.iter().enumerate() {
+        if harmonic.amplitude == 0.0 {
+            continue;
+        }
+        let (s, c) = harmonic.phase.sin_cos();
+        bins[(h + 1) % size] += Complex::new(harmonic.amplitude * c, harmonic.amplitude * s);
+    }
+    let fft = INVERSE.with_borrow_mut(|plan| match plan {
+        Some((n, fft)) if *n == size => fft.clone(),
+        _ => {
+            let fft = FftPlanner::<f64>::new().plan_fft_inverse(size);
+            *plan = Some((size, fft.clone()));
+            fft
+        }
+    });
+    fft.process(&mut bins);
+    bins.iter().map(|bin| bin.im).collect()
+}
+
+/// The sum, term by term.
+fn harmonics_summed(harmonics: &[Harmonic], size: usize) -> Vec<f64> {
     let mut wave = vec![0.0; size];
     if size == 0 {
         return wave;
@@ -773,6 +817,30 @@ mod tests {
         for (got, want) in wave.iter().zip(expected) {
             assert!(close(*got, want, 1e-12), "{got} vs {want}");
         }
+    }
+
+    #[test]
+    fn many_harmonics_are_an_fft_that_gives_the_sums_numbers() {
+        // 1024 harmonics (the most an op takes), every amplitude and phase different, and a
+        // count past the frame (harmonics that wrap round the cycle, as the sum's do).
+        for (count, size) in [(1024usize, 2048usize), (300, 2048), (70, 64)] {
+            let harmonics: Vec<Harmonic> = (0..count)
+                .map(|i| h(1.0 / (i as f64 + 1.0), (i as f64 * 0.37).sin() * 3.0))
+                .collect();
+            let fft = harmonics_by_fft(&harmonics, size);
+            let sum = harmonics_summed(&harmonics, size);
+            assert_eq!(fft.len(), sum.len());
+            for (i, (a, b)) in fft.iter().zip(&sum).enumerate() {
+                assert!(close(*a, *b, 1e-10), "{count}/{size} [{i}]: {a} vs {b}");
+            }
+            assert_eq!(generate_from_harmonics(&harmonics, size), fft);
+        }
+        // Few harmonics keep the sum's own numbers.
+        let few = [h(1.0, 0.0), h(0.5, 0.3)];
+        assert_eq!(
+            generate_from_harmonics(&few, 2048),
+            harmonics_summed(&few, 2048)
+        );
     }
 
     #[test]
