@@ -189,9 +189,12 @@ fn command_golden() {
         .iter()
         .map(|(t, ch, inst, c)| format!("{t:.9} {ch} {inst} {c:?}\n"))
         .collect();
+    // Pitches are `x.exp2()`, not `2f64.powf(x)`: LLVM turns the second into `exp2` only in an
+    // optimised build, and libm's `pow` and `exp2` can differ in the last bit, so the log (and this
+    // hash) differed between `cargo test` and `cargo test --release`.
     assert_eq!(
         fnv(text.bytes()),
-        9682250042037348935,
+        10847911266971489097,
         "command log hash changed"
     );
 }

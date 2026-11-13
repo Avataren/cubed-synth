@@ -373,7 +373,7 @@ impl XmVoice {
                 3 => (sawtooth(phase), -1.0),
                 _ => ((2.0 * PI * phase).sin(), -1.0),
             };
-            self.pitch_factor = 2f64.powf(sign * depth * wave / 1200.0);
+            self.pitch_factor = (sign * depth * wave / 1200.0).exp2();
             self.vibrato_phase = self.vibrato_phase.wrapping_add(v.rate);
         }
         self.ticks += 1;

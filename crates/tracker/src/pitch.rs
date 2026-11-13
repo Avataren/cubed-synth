@@ -120,7 +120,7 @@ impl PitchModel {
             PitchModel::Amiga { .. } => AMIGA_CLOCK / (2.0 * period * PAULA_TO_SYNTH_SCALE),
             PitchModel::S3m { .. } => S3M_RATE_NUMERATOR / period / S3M_TO_SYNTH_SCALE,
             PitchModel::Linear => {
-                XM_REFERENCE_RATE * 2f64.powf((XM_REFERENCE_PERIOD - period) / XM_UNITS_PER_OCTAVE)
+                XM_REFERENCE_RATE * ((XM_REFERENCE_PERIOD - period) / XM_UNITS_PER_OCTAVE).exp2()
                     / LINEAR_TO_SYNTH_SCALE
             }
             PitchModel::XmAmiga => {
@@ -170,7 +170,7 @@ impl PitchModel {
             PitchModel::Linear => {
                 self.clamp_period(base - semitones as f64 * XM_UNITS_PER_SEMITONE)
             }
-            PitchModel::XmAmiga => self.clamp_period(base * 2f64.powf(-semitones as f64 / 12.0)),
+            PitchModel::XmAmiga => self.clamp_period(base * (-semitones as f64 / 12.0).exp2()),
         }
     }
 
@@ -185,7 +185,7 @@ impl PitchModel {
                     XM_AMIGA_REFERENCE_NOTE - 12.0 * (period / XM_AMIGA_REFERENCE_PERIOD).log2();
                 let note = crate::effects::js_round(note);
                 self.clamp_period(
-                    XM_AMIGA_REFERENCE_PERIOD * 2f64.powf((XM_AMIGA_REFERENCE_NOTE - note) / 12.0),
+                    XM_AMIGA_REFERENCE_PERIOD * ((XM_AMIGA_REFERENCE_NOTE - note) / 12.0).exp2(),
                 )
             }
             _ => {

@@ -1116,7 +1116,7 @@ impl Player {
             let period = if self.module.flags.linear_frequency {
                 7680.0 - n * 64.0
             } else {
-                1712.0 * 2f64.powf((48.0 - n) / 12.0)
+                1712.0 * ((48.0 - n) / 12.0).exp2()
             };
             step.frequency = Some(self.profile.pitch.frequency_from_period(period));
         }
@@ -1967,7 +1967,7 @@ impl Player {
                 let period = if self.module.flags.linear_frequency {
                     7680.0 - n * 64.0
                 } else {
-                    1712.0 * 2f64.powf((48.0 - n) / 12.0)
+                    1712.0 * ((48.0 - n) / 12.0).exp2()
                 };
                 Some(self.profile.pitch.frequency_from_period(period))
             }
@@ -2319,8 +2319,8 @@ fn sample_rate_per_hz(format: Format, sample: &crate::module::Sample) -> f64 {
             (root - 12.0 * (c2spd / S3M_C2FREQ).log2(), 0.0)
         }
     };
-    let root_hz = 440.0 * 2f64.powf((root_note - 69.0) / 12.0);
-    MOD_SAMPLE_RATE / root_hz * 2f64.powf(detune_cents / 1200.0)
+    let root_hz = 440.0 * ((root_note - 69.0) / 12.0).exp2();
+    MOD_SAMPLE_RATE / root_hz * (detune_cents / 1200.0).exp2()
 }
 
 /// FT2's rates over musical Hz.

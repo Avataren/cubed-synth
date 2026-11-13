@@ -233,7 +233,7 @@ fn natural_rate(format: Format, s: &Sample) -> f64 {
         Format::Mod => PAULA_CLOCK / 428.0,
         Format::S3m => s.c2spd as f64,
         Format::Xm => {
-            XM_BASE_RATE * 2f64.powf((s.relative_note as f64 + s.finetune as f64 / 128.0) / 12.0)
+            XM_BASE_RATE * ((s.relative_note as f64 + s.finetune as f64 / 128.0) / 12.0).exp2()
         }
     }
 }

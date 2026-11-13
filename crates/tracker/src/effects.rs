@@ -281,7 +281,7 @@ pub(crate) struct EffectState {
 }
 
 pub(crate) fn midi_to_frequency(midi: f64) -> f64 {
-    440.0 * 2f64.powf((midi - 69.0) / 12.0)
+    440.0 * ((midi - 69.0) / 12.0).exp2()
 }
 
 fn frequency_to_midi(frequency: f64) -> f64 {
@@ -469,7 +469,7 @@ impl EffectState {
         if let Some(period) = self.current_period {
             self.update_pitch_from_period(period - delta);
         } else {
-            let ratio = 2f64.powf(units / (12.0 * 16.0));
+            let ratio = (units / (12.0 * 16.0)).exp2();
             self.update_pitch_from_frequency(self.current_frequency * ratio);
         }
     }
@@ -488,7 +488,7 @@ impl EffectState {
             };
             self.update_pitch_from_period(next);
         } else {
-            let ratio = 2f64.powf(speed / (12.0 * 16.0));
+            let ratio = (speed / (12.0 * 16.0)).exp2();
             self.update_pitch_from_frequency(self.current_frequency * ratio);
         }
     }
@@ -517,7 +517,7 @@ impl EffectState {
     fn vibrato_frequency(&self, wave: f64) -> f64 {
         let Some(period) = self.current_period else {
             let semitones = wave * self.vibrato_depth / 16.0;
-            return self.current_frequency * 2f64.powf(-semitones / 12.0);
+            return self.current_frequency * (-semitones / 12.0).exp2();
         };
         let pitch = self.profile.pitch;
         if self.profile.st3_vibrato {
@@ -622,7 +622,7 @@ impl EffectState {
             };
             self.update_pitch_from_period(next);
         } else {
-            let ratio = 2f64.powf(self.tone_porta_speed / (12.0 * 16.0));
+            let ratio = (self.tone_porta_speed / (12.0 * 16.0)).exp2();
             let mut next = self.current_frequency;
             if self.current_frequency < self.target_frequency {
                 next *= ratio;
@@ -1092,7 +1092,7 @@ impl EffectState {
                 Some(ExtSub::GlissandoCtrl) => self.glissando = effect.param() != 0,
                 Some(ExtSub::SetFinetune) => {
                     let semitones = (self.profile.finetune_from_nibble)(effect.y & 0x0f);
-                    let ratio = 2f64.powf(semitones / 12.0);
+                    let ratio = (semitones / 12.0).exp2();
                     self.target_frequency *= ratio;
                     self.target_midi = frequency_to_midi(self.target_frequency);
                     self.target_period = Some(
